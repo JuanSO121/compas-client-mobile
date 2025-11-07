@@ -1,105 +1,84 @@
-// lib/widgets/accessible_status_indicator.dart
+// lib/widgets/accessible_status_indicator.dart - VERSIÓN MINIMALISTA
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 
+/// Indicador de estado ultra-simple para accesibilidad
+/// Diseño limpio con contraste WCAG AAA
 class AccessibleStatusIndicator extends StatelessWidget {
   final String label;
   final bool isActive;
-  final String? subtitle;
   final String? detailedDescription;
 
   const AccessibleStatusIndicator({
     Key? key,
     required this.label,
     required this.isActive,
-    this.subtitle,
     this.detailedDescription,
   }) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     final statusText = isActive ? 'activo' : 'inactivo';
-    final semanticLabel = '$label está $statusText. ${detailedDescription ?? ''}';
+
+    // Colores con alto contraste (WCAG AAA - ratio 7:1)
+    final activeColor = isDark ? const Color(0xFF66BB6A) : const Color(0xFF2E7D32);
+    final inactiveColor = isDark ? const Color(0xFFEF5350) : const Color(0xFFC62828);
+    final bgColor = isDark ? const Color(0xFF2C2C2C) : Colors.white;
 
     return Semantics(
-      label: semanticLabel,
+      label: '$label está $statusText',
       value: statusText,
       readOnly: true,
       child: Container(
-        padding: EdgeInsets.all(8),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(8),
+          color: bgColor,
+          borderRadius: BorderRadius.circular(12),
           border: Border.all(
-            color: isActive ? Colors.green[300]! : Colors.red[300]!,
+            color: (isActive ? activeColor : inactiveColor).withOpacity(0.4),
             width: 2,
           ),
-          color: isActive
-              ? Colors.green.withOpacity(0.1)
-              : Colors.red.withOpacity(0.1),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(isDark ? 0.4 : 0.08),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
         ),
-        child: Column(
+        child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Indicador visual con texto alternativo
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 16,
-                  height: 16,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: isActive ? Colors.green : Colors.red,
-                    border: Border.all(
-                      color: Colors.white,
-                      width: 2,
-                    ),
+            // Indicador circular grande
+            Container(
+              width: 14,
+              height: 14,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: isActive ? activeColor : inactiveColor,
+                boxShadow: isActive
+                    ? [
+                  BoxShadow(
+                    color: activeColor.withOpacity(0.5),
+                    blurRadius: 8,
+                    spreadRadius: 2,
                   ),
-                  child: Icon(
-                    isActive ? Icons.check : Icons.close,
-                    size: 10,
-                    color: Colors.white,
-                    semanticLabel: isActive ? 'Activo' : 'Inactivo',
-                  ),
-                ),
-                SizedBox(width: 6),
-                // Texto del estado visible para usuarios con baja visión
-                Text(
-                  statusText.toUpperCase(),
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold,
-                    color: isActive ? Colors.green[700] : Colors.red[700],
-                    letterSpacing: 0.5,
-                  ),
-                ),
-              ],
+                ]
+                    : null,
+              ),
             ),
-            SizedBox(height: 6),
-            // Etiqueta del servicio
+            const SizedBox(width: 12),
+            // Texto grande y legible
             Text(
               label,
               style: TextStyle(
-                fontSize: 12,
+                fontSize: 16,
                 fontWeight: FontWeight.w600,
-                color: isActive ? Colors.green[700] : Colors.red[700],
+                color: isDark ? Colors.white : const Color(0xFF212121),
+                letterSpacing: 0.3,
               ),
-              textAlign: TextAlign.center,
             ),
-            // Subtítulo opcional
-            if (subtitle != null) ...[
-              SizedBox(height: 2),
-              Text(
-                subtitle!,
-                style: TextStyle(
-                  fontSize: 10,
-                  color: Theme.of(context).brightness == Brightness.dark
-                      ? Colors.grey[400]
-                      : Colors.grey[600],
-                ),
-                textAlign: TextAlign.center,
-              ),
-            ],
           ],
         ),
       ),

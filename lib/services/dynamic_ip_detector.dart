@@ -111,6 +111,7 @@ class DynamicIPDetector {
 
     // 3. IPs específicas que pueden funcionar con port forwarding
     allIPs.addAll([
+      '172.16.206.94',
       '172.16.203.38',
       '192.168.1.2',
       '192.168.1.3',

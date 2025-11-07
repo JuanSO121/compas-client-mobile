@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Directorio interno de la app -->
+    <files-path name="files" path="." />
+
+    <!-- Cache de la app -->
+    <cache-path name="cache" path="." />
+
+    <!-- Almacenamiento externo privado de la app -->
+    <external-path name="external" path="." />
+    <external-files-path name="external_files" path="." />
+    <external-cache-path name="external_cache" path="." />
+
+    <!-- Almacenamiento externo compartido (solo lectura en Android 10+) -->
+    <external-media-path name="external_media" path="." />
+</paths>

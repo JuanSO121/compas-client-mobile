@@ -8,7 +8,7 @@ class VoiceCommandResult {
   final bool? robotAction;
   final String? error;
   final double? timestamp;
-  final double? processingTime; // ✅ NUEVO CAMPO
+  final double? processingTime;
 
   VoiceCommandResult({
     required this.success,
@@ -19,7 +19,7 @@ class VoiceCommandResult {
     this.robotAction,
     this.error,
     this.timestamp,
-    this.processingTime, // ✅
+    this.processingTime,
   });
 
   factory VoiceCommandResult.fromJson(Map<String, dynamic> json) {
@@ -32,7 +32,7 @@ class VoiceCommandResult {
       robotAction: json['robot_action'],
       error: json['error'],
       timestamp: json['timestamp']?.toDouble(),
-      processingTime: json['processing_time']?.toDouble(), // ✅
+      processingTime: json['processing_time']?.toDouble(),
     );
   }
 
@@ -46,7 +46,7 @@ class VoiceCommandResult {
       'robot_action': robotAction,
       'error': error,
       'timestamp': timestamp,
-      'processing_time': processingTime, // ✅
+      'processing_time': processingTime,
     };
   }
 

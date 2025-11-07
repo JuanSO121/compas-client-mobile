@@ -1,4 +1,4 @@
-// lib/widgets/accessible_enhanced_voice_button.dart
+// lib/widgets/accessible_enhanced_voice_button.dart - BOTÓN GIGANTE PROFESIONAL
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/semantics.dart';
@@ -20,45 +20,40 @@ class AccessibleEnhancedVoiceButton extends StatefulWidget {
   }) : super(key: key);
 
   @override
-  _AccessibleEnhancedVoiceButtonState createState() => _AccessibleEnhancedVoiceButtonState();
+  _AccessibleEnhancedVoiceButtonState createState() =>
+      _AccessibleEnhancedVoiceButtonState();
 }
 
-class _AccessibleEnhancedVoiceButtonState extends State<AccessibleEnhancedVoiceButton>
+class _AccessibleEnhancedVoiceButtonState
+    extends State<AccessibleEnhancedVoiceButton>
     with TickerProviderStateMixin {
+
   late AnimationController _pulseController;
-  late AnimationController _scaleController;
+  late AnimationController _waveController;
   late Animation<double> _pulseAnimation;
-  late Animation<double> _scaleAnimation;
+  late Animation<double> _waveAnimation;
 
   @override
   void initState() {
     super.initState();
 
     _pulseController = AnimationController(
-      duration: Duration(seconds: 1),
+      duration: const Duration(milliseconds: 1200),
       vsync: this,
     );
 
-    _scaleController = AnimationController(
-      duration: Duration(milliseconds: 150),
+    _waveController = AnimationController(
+      duration: const Duration(milliseconds: 2000),
       vsync: this,
     );
 
-    _pulseAnimation = Tween<double>(
-      begin: 1.0,
-      end: 1.2,
-    ).animate(CurvedAnimation(
-      parent: _pulseController,
-      curve: Curves.easeInOut,
-    ));
+    _pulseAnimation = Tween<double>(begin: 1.0, end: 1.08).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
 
-    _scaleAnimation = Tween<double>(
-      begin: 1.0,
-      end: 0.95,
-    ).animate(CurvedAnimation(
-      parent: _scaleController,
-      curve: Curves.easeInOut,
-    ));
+    _waveAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _waveController, curve: Curves.linear),
+    );
   }
 
   @override
@@ -67,52 +62,40 @@ class _AccessibleEnhancedVoiceButtonState extends State<AccessibleEnhancedVoiceB
 
     if (widget.isRecording && !oldWidget.isRecording) {
       _pulseController.repeat(reverse: true);
-      // Anunciar inicio de grabación
-      SemanticsService.announce(
-        'Grabación iniciada. Hable ahora.',
-        TextDirection.ltr,
-      );
+      _waveController.repeat();
+      SemanticsService.announce('Grabando', TextDirection.ltr);
     } else if (!widget.isRecording && oldWidget.isRecording) {
       _pulseController.stop();
+      _waveController.stop();
       _pulseController.reset();
-      // Anunciar fin de grabación
-      SemanticsService.announce(
-        'Grabación detenida. Procesando audio.',
-        TextDirection.ltr,
-      );
+      _waveController.reset();
+      SemanticsService.announce('Grabación detenida', TextDirection.ltr);
     }
 
     if (widget.isProcessing && !oldWidget.isProcessing) {
-      SemanticsService.announce(
-        'Transcribiendo audio con Whisper. Por favor espere.',
-        TextDirection.ltr,
-      );
+      SemanticsService.announce('Procesando', TextDirection.ltr);
     }
   }
 
   @override
   void dispose() {
     _pulseController.dispose();
-    _scaleController.dispose();
+    _waveController.dispose();
     super.dispose();
   }
 
   void _handleTap() {
     if (!widget.whisperAvailable) {
-      _showAccessibleServiceUnavailableDialog();
+      SemanticsService.announce('Servicio no disponible', TextDirection.ltr);
+      HapticFeedback.vibrate();
       return;
     }
 
     if (widget.isProcessing) {
-      // Informar al usuario que debe esperar
-      SemanticsService.announce(
-        'El sistema está procesando. Por favor espere.',
-        TextDirection.ltr,
-      );
+      SemanticsService.announce('Procesando, espere', TextDirection.ltr);
       return;
     }
 
-    // Feedback háptico diferenciado
     if (widget.isRecording) {
       HapticFeedback.lightImpact();
       widget.onStopRecording?.call();
@@ -122,324 +105,219 @@ class _AccessibleEnhancedVoiceButtonState extends State<AccessibleEnhancedVoiceB
     }
   }
 
-  void _showAccessibleServiceUnavailableDialog() {
-    // Anuncio inmediato para lectores de pantalla
-    SemanticsService.announce(
-      'Servicio de voz no disponible. Abriendo información de diagnóstico.',
-      TextDirection.ltr,
-    );
-
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: Semantics(
-            label: 'Alerta: Servicio No Disponible',
-            child: Row(
-              children: [
-                Icon(Icons.error_outline,
-                    color: Colors.orange,
-                    semanticLabel: 'Icono de advertencia'),
-                SizedBox(width: 8),
-                Expanded(child: Text('Servicio No Disponible')),
-              ],
-            ),
-          ),
-          content: Semantics(
-            label: 'El servicio de transcripción Whisper no está disponible. '
-                'Posibles causas: Servidor FastAPI no ejecutándose, '
-                'Modelo Whisper no cargado, o problemas de conectividad. '
-                'Puede usar comandos de texto mientras tanto.',
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('El servicio de transcripción Whisper no está disponible.'),
-                  SizedBox(height: 12),
-                  Text('Posibles causas:',
-                      style: TextStyle(fontWeight: FontWeight.bold)),
-                  SizedBox(height: 4),
-                  Text('• Servidor FastAPI no está ejecutándose'),
-                  Text('• Modelo Whisper no está cargado'),
-                  Text('• Problemas de conectividad'),
-                  SizedBox(height: 12),
-                  Container(
-                    padding: EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).brightness == Brightness.dark
-                          ? Colors.grey[800]
-                          : Colors.grey[100],
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: Text(
-                      'Puede usar comandos de texto mientras tanto',
-                      style: TextStyle(fontSize: 12, fontStyle: FontStyle.italic),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          actions: [
-            Semantics(
-              label: 'Cerrar diálogo',
-              hint: 'Presione para cerrar esta ventana',
-              child: TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: Text('Entendido'),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  // Métodos para obtener información semántica
   String _getSemanticLabel() {
     if (!widget.whisperAvailable) {
-      return 'Botón de comando de voz deshabilitado. El servicio Whisper no está disponible.';
+      return 'Servicio de voz no disponible';
     } else if (widget.isProcessing) {
-      return 'Procesando comando de voz. El sistema está transcribiendo su audio.';
+      return 'Procesando comando';
     } else if (widget.isRecording) {
-      return 'Grabando comando de voz. Presione para detener la grabación.';
+      return 'Toque para detener grabación';
     } else {
-      return 'Botón de comando de voz. Presione para iniciar grabación.';
-    }
-  }
-
-  String _getSemanticHint() {
-    if (!widget.whisperAvailable) {
-      return 'Presione para ver información sobre por qué el servicio no está disponible';
-    } else if (widget.isProcessing) {
-      return 'Por favor espere mientras se procesa su comando';
-    } else if (widget.isRecording) {
-      return 'Hable ahora y presione nuevamente cuando termine';
-    } else {
-      return 'Mantenga presionado mientras habla o toque para iniciar grabación';
-    }
-  }
-
-  String _getSemanticValue() {
-    if (!widget.whisperAvailable) {
-      return 'Deshabilitado';
-    } else if (widget.isProcessing) {
-      return 'Procesando';
-    } else if (widget.isRecording) {
-      return 'Grabando';
-    } else {
-      return 'Listo';
-    }
-  }
-
-  Color _getButtonColor() {
-    if (!widget.whisperAvailable) {
-      return Colors.grey;
-    } else if (widget.isProcessing) {
-      return Colors.blue;
-    } else if (widget.isRecording) {
-      return Colors.red;
-    } else {
-      return Colors.green;
-    }
-  }
-
-  IconData _getButtonIcon() {
-    if (widget.isProcessing) {
-      return Icons.hourglass_empty;
-    } else if (widget.isRecording) {
-      return Icons.stop;
-    } else {
-      return Icons.mic;
-    }
-  }
-
-  String _getButtonText() {
-    if (!widget.whisperAvailable) {
-      return 'Servicio de Voz No Disponible';
-    } else if (widget.isProcessing) {
-      return 'Transcribiendo Audio...';
-    } else if (widget.isRecording) {
-      return 'Grabando - Presione para Detener';
-    } else {
-      return 'Presionar para Comando de Voz';
+      return 'Toque para grabar comando de voz';
     }
   }
 
   String _getStatusText() {
-    if (!widget.whisperAvailable) {
-      return 'El servicio de reconocimiento de voz está deshabilitado. Use comandos de texto como alternativa.';
-    } else if (widget.isProcessing) {
-      return 'Procesando su comando de voz con Whisper. Este proceso puede tardar unos segundos.';
-    } else if (widget.isRecording) {
-      return 'Grabando su comando de voz. Hable claramente y presione el botón cuando termine.';
-    } else {
-      return 'Listo para recibir comandos de voz. Presione el botón y hable su comando.';
-    }
+    if (!widget.whisperAvailable) return 'No disponible';
+    if (widget.isProcessing) return 'Procesando...';
+    if (widget.isRecording) return 'Grabando';
+    return 'En que puedo Ayudarte?';
+  }
+
+  Color _getButtonColor(ThemeData theme) {
+    if (!widget.whisperAvailable) return Colors.grey.shade400;
+    if (widget.isProcessing) return theme.colorScheme.primary;
+    if (widget.isRecording) return theme.colorScheme.error;
+    return theme.colorScheme.secondary;
+  }
+
+  IconData _getButtonIcon() {
+    if (widget.isProcessing) return Icons.hourglass_empty_rounded;
+    if (widget.isRecording) return Icons.stop_rounded;
+    return Icons.mic_rounded;
   }
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final size = MediaQuery.of(context).size;
+    final buttonSize = size.width * 0.45;
+    final iconSize = buttonSize * 0.35;
+    double safeOpacity = (0.5 + _pulseAnimation.value * 0.5).clamp(0.0, 1.0);
+
     return Semantics(
       label: _getSemanticLabel(),
-      hint: _getSemanticHint(),
-      value: _getSemanticValue(),
       button: true,
-      enabled: widget.whisperAvailable || !widget.isProcessing,
-      focusable: true,
+      enabled: widget.whisperAvailable && !widget.isProcessing,
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          // Botón principal con semántica mejorada
+          // BOTÓN PRINCIPAL GIGANTE
           GestureDetector(
             onTap: _handleTap,
-            child: AnimatedBuilder(
-              animation: Listenable.merge([_pulseAnimation, _scaleAnimation]),
-              builder: (context, child) {
-                return Transform.scale(
-                  scale: _scaleAnimation.value,
-                  child: Container(
-                    width: 120 * _pulseAnimation.value,
-                    height: 120 * _pulseAnimation.value,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: _getButtonColor(),
-                      boxShadow: [
-                        BoxShadow(
-                          color: _getButtonColor().withOpacity(0.3),
-                          blurRadius: 20,
-                          spreadRadius: widget.isRecording ? 10 : 5,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                // Ondas de pulso al grabar
+                if (widget.isRecording)
+                  AnimatedBuilder(
+                    animation: _waveAnimation,
+                    builder: (context, child) {
+                      return Container(
+                        width: buttonSize * (1 + _waveAnimation.value * 0.3),
+                        height: buttonSize * (1 + _waveAnimation.value * 0.3),
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: _getButtonColor(theme).withValues(alpha: safeOpacity),
+                            width: 3,
+                          ),
                         ),
-                      ],
-                    ),
-                    child: Icon(
-                      _getButtonIcon(),
-                      size: 48,
-                      color: Colors.white,
-                      semanticLabel: widget.isRecording
-                          ? 'Botón de detener'
-                          : widget.isProcessing
-                          ? 'Procesando'
-                          : 'Botón de micrófono',
-                    ),
+                      );
+                    },
                   ),
-                );
-              },
+
+                // Botón animado
+                AnimatedBuilder(
+                  animation: widget.isRecording ? _pulseAnimation : const AlwaysStoppedAnimation(1.0),
+                  builder: (context, child) {
+                    return Container(
+                      width: buttonSize * (widget.isRecording ? _pulseAnimation.value : 1.0),
+                      height: buttonSize * (widget.isRecording ? _pulseAnimation.value : 1.0),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _getButtonColor(theme),
+                        boxShadow: [
+                          BoxShadow(
+                              color: _getButtonColor(theme).withValues(
+                                alpha: (0.5 * (1 - _waveAnimation.value)).clamp(0.0, 1.0),
+                              ),
+                            blurRadius: widget.isRecording ? 30 : 20,
+                            spreadRadius: widget.isRecording ? 8 : 4,
+                          ),
+                        ],
+                      ),
+                      child: Center(
+                        child: widget.isProcessing
+                            ? SizedBox(
+                          width: iconSize * 0.8,
+                          height: iconSize * 0.8,
+                          child: const CircularProgressIndicator(
+                            strokeWidth: 5,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                          ),
+                        )
+                            : Icon(
+                          _getButtonIcon(),
+                          size: iconSize,
+                          color: Colors.white,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ],
             ),
           ),
 
-          SizedBox(height: 24),
+          const SizedBox(height: 32),
 
-          // Texto del botón con contraste mejorado
+          // ESTADO DEL BOTÓN
           Semantics(
-            label: 'Estado del botón: ${_getButtonText()}',
+            label: 'Estado: ${_getStatusText()}',
             readOnly: true,
+            liveRegion: true,
             child: Container(
-              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
               decoration: BoxDecoration(
-                color: Theme.of(context).brightness == Brightness.dark
-                    ? Colors.grey[800]
-                    : Colors.grey[100],
+                color: _getButtonColor(theme).withValues(alpha: 0.1),
+
                 borderRadius: BorderRadius.circular(20),
                 border: Border.all(
-                  color: _getButtonColor(),
+                  color: _getButtonColor(theme).withValues(alpha: 0.3),
+
                   width: 2,
                 ),
               ),
               child: Text(
-                _getButtonText(),
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                  color: _getButtonColor(),
-                ),
-                textAlign: TextAlign.center,
-              ),
-            ),
-          ),
-
-          SizedBox(height: 12),
-
-          // Descripción detallada del estado
-          Semantics(
-            label: 'Descripción del estado: ${_getStatusText()}',
-            readOnly: true,
-            child: Container(
-              constraints: BoxConstraints(maxWidth: 280),
-              child: Text(
                 _getStatusText(),
                 style: TextStyle(
-                  fontSize: 14,
-                  color: Theme.of(context).brightness == Brightness.dark
-                      ? Colors.grey[300]
-                      : Colors.grey[600],
-                  height: 1.4,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: _getButtonColor(theme),
+                  letterSpacing: 0.5,
                 ),
                 textAlign: TextAlign.center,
               ),
             ),
           ),
 
-          // Indicador de progreso accesible para procesamiento
-          if (widget.isProcessing) ...[
-            SizedBox(height: 16),
+          // INDICADOR DE GRABACIÓN
+          if (widget.isRecording) ...[
+            const SizedBox(height: 24),
             Semantics(
-              label: 'Indicador de progreso',
-              value: 'Transcribiendo audio',
-              child: Container(
-                width: 200,
-                child: LinearProgressIndicator(
-                  backgroundColor: Theme.of(context).brightness == Brightness.dark
-                      ? Colors.grey[700]
-                      : Colors.grey[300],
-                  valueColor: AlwaysStoppedAnimation<Color>(Colors.blue),
-                ),
-              ),
-            ),
-            SizedBox(height: 8),
-            Semantics(
-              label: 'Estado de transcripción: Whisper está procesando su audio',
-              readOnly: true,
-              child: Text(
-                'Whisper está transcribiendo el audio...',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.blue[600],
-                  fontStyle: FontStyle.italic,
-                ),
+              label: 'Grabando ahora',
+              liveRegion: true,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  AnimatedBuilder(
+                    animation: _pulseController,
+                    builder: (context, child) {
+                      return Container(
+                        width: 12,
+                        height: 12,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: theme.colorScheme.error,
+                          boxShadow: [
+                            BoxShadow(
+                              color: theme.colorScheme.error.withValues(
+                                alpha: (0.5 + _pulseAnimation.value * 0.5).clamp(0.0,1.0),
+                              ),
+
+                              blurRadius: 8,
+                              spreadRadius: 2,
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(width: 12),
+                  Text(
+                    'REC',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: theme.colorScheme.error,
+                      letterSpacing: 2,
+                    ),
+                  ),
+                ],
               ),
             ),
           ],
 
-          // Indicadores visuales y semánticos de grabación
-          if (widget.isRecording) ...[
-            SizedBox(height: 16),
+          // BARRA DE PROGRESO
+          if (widget.isProcessing) ...[
+            const SizedBox(height: 24),
             Semantics(
-              label: 'Indicador de grabación activa',
-              value: 'Grabando',
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: Colors.red,
+              label: 'Procesando audio',
+              liveRegion: true,
+              child: SizedBox(
+                width: 200,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: LinearProgressIndicator(
+                    minHeight: 6,
+                    backgroundColor: theme.colorScheme.primary.withValues(alpha: 0.2),
+
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      theme.colorScheme.primary,
                     ),
                   ),
-                  SizedBox(width: 8),
-                  Text(
-                    'GRABANDO',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.red,
-                      letterSpacing: 1.5,
-                    ),
-                  ),
-                ],
+                ),
               ),
             ),
           ],
