@@ -1,23 +1,22 @@
-// lib/config/api_config.dart
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class ApiConfig {
   // ======================
   // BASE URLS
   // ======================
-  static final String baseUrlPC =
+  static String get baseUrlPC =>
       dotenv.env['BASE_URL_PC'] ?? 'http://127.0.0.1:8080';
 
-  static final String baseUrl =
+  static String get baseUrl =>
       dotenv.env['BASE_URL'] ?? 'http://192.168.1.9:8080';
 
   // ======================
   // API KEYS (NO GIT)
   // ======================
-  static final String geminiApiKey =
+  static String get geminiApiKey =>
       dotenv.env['GEMINI_API_KEY'] ?? '';
 
-  static final String picovoiceAccessKey =
+  static String get picovoiceAccessKey =>
       dotenv.env['PICOVOICE_ACCESS_KEY'] ?? '';
 
   // ======================

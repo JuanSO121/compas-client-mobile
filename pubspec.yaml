@@ -77,3 +77,4 @@ flutter:
     - assets/wake_words/
     - assets/wake_words/oye_compas_android.ppn
     - assets/wake_words/porcupine_params_es.pv
+    - .env

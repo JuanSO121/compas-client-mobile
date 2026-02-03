@@ -4,17 +4,22 @@ import 'package:flutter/services.dart';
 import 'screens/auth/welcome_screen.dart';
 import 'screens/voice_navigation_screen.dart';
 import 'screens/environment_recognition_screen.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // 🔑 Cargar variables de entorno
+  await dotenv.load(fileName: ".env");
+
   // Bloquear orientación vertical
-  SystemChrome.setPreferredOrientations([
+  await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
   ]);
 
   runApp(const MyApp());
 }
+
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
