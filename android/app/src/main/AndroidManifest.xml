@@ -1,23 +1,45 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="com.example.flutter_voice_robot">
 
-    <!-- === PERMISOS === -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- ═══════════════════════════════════════════════════════ -->
+    <!-- ✅ PERMISOS ESENCIALES (MODERNOS) -->
+    <!-- ═══════════════════════════════════════════════════════ -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- ✅ MEJORA: Permiso para audio Bluetooth en Android 12+ -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- ================================================================ -->
+    <!-- ✅ SOLUCIÓN: CÁMARA OPCIONAL (FORMA CORRECTA)                      -->
+    <!-- ================================================================ -->
+    <!-- 1. Declara que vas a usar el permiso de la cámara. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- 2. Declara que la característica (la cámara física) NO es requerida. -->
+    <!-- Esto permite que tu app se instale en dispositivos sin cámara. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
 
     <application
-        android:label="flutter_voice_robot"
+        android:label="COMPAS"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:networkSecurityConfig="@xml/network_security_config">
+
+        <!-- ✅ METADATA PARA GOOGLE AI EDGE (NPU) -->
+        <meta-data
+            android:name="com.google.android.gms.ai.edge.enabled"
+            android:value="true" />
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:taskAffinity=""
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
@@ -36,13 +58,23 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
-    <!-- Consultas de texto (no tocar) -->
+    <!-- ✅ QUERIES (YA ESTABA BIEN) -->
     <queries>
         <intent>
-            <action android:name="android.intent.action.PROCESS_TEXT"/>
-            <data android:mimeType="text/plain"/>
+            <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
+        <package android:name="com.google.android.gms" />
     </queries>
 </manifest>

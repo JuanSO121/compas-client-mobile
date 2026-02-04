@@ -1,119 +1,80 @@
-# pubspec.yaml - Configuración mejorada para accesibilidad
-name: accessible_voice_robot_control
-description: Control de voz accesible para robot - Diseñado para personas con discapacidad visual
-
-# Incrementar versión para reflejar mejoras de accesibilidad
-version: 2.0.0+2
+name: flutter_voice_robot
+description: Asistente de voz offline con IA local
+version: 3.0.0+1
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
-  flutter: ">=3.0.0"
+  sdk: '>=3.8.0 <4.0.0'
+  flutter: ">=3.27.0"
+
 dependencies:
   flutter:
     sdk: flutter
+  flutter_dotenv: ^5.1.0
+  # ══════════════════════════════════════════════════════════
+  # ✅ IA Y PROCESAMIENTO LOCAL
+  # ══════════════════════════════════════════════════════════
+  google_generative_ai: ^0.4.7  # Gemini API (online)
+  tflite_flutter: ^0.12.1       # TensorFlow Lite (offline)
 
-  # HTTP y utilidades
-  http: ^1.2.2          # Última estable y compatible con Flutter 3.x
-  path_provider: ^2.1.2
-  permission_handler: ^11.3.1   # Última versión estable, sin breaking changes
+  flutter_secure_storage: ^9.0.0
+
+  # ══════════════════════════════════════════════════════════
+  # ✅ VOZ (CORE - NECESARIO)
+  # ══════════════════════════════════════════════════════════
+  speech_to_text: ^7.0.0        # STT
+  flutter_tts: ^4.0.2           # TTS
+  porcupine_flutter: ^4.0.0 # Wake word detection
+
+  # ══════════════════════════════════════════════════════════
+  # ✅ AUDIO (OPCIONAL - para grabar)
+  # ══════════════════════════════════════════════════════════
+  record: ^5.1.2
+  audioplayers: ^6.1.0
+  audio_session: ^0.1.16
+
+  # ══════════════════════════════════════════════════════════
+  # ✅ CÁMARA (SOLO para Environment Recognition)
+  # ══════════════════════════════════════════════════════════
+  camera: ^0.11.0+2
+
+  # ══════════════════════════════════════════════════════════
+  # ✅ NETWORKING
+  # ══════════════════════════════════════════════════════════
+  http: ^1.2.2
+  dio: ^5.7.0
+  connectivity_plus: ^6.1.0
+
+  # ══════════════════════════════════════════════════════════
+  # ✅ ALMACENAMIENTO Y PERMISOS
+  # ══════════════════════════════════════════════════════════
+  path_provider: ^2.1.4
+  permission_handler: ^11.3.1
   shared_preferences: ^2.3.2
-  
-  # Text-to-Speech mejorado
-  flutter_tts: ^3.8.5   # Última versión, incluye fixes de iOS y Android
 
-  # Audio y grabación
-  record: ^5.1.0        # Mantiene compatibilidad, versión recomendada
-  audioplayers: ^5.2.1  # Última estable sin breaking changes
+  # ══════════════════════════════════════════════════════════
+  # ✅ UTILIDADES
+  # ══════════════════════════════════════════════════════════
+  device_info_plus: ^10.1.2
+  package_info_plus: ^8.1.0
+  logger: ^2.4.0
 
-  # Conectividad y WebSocket
-  web_socket_channel: ^2.4.5
-  connectivity_plus: ^6.0.3     # Compatible con Flutter 3.24
-
-  # Info de dispositivo y paquete
-  device_info_plus: ^10.1.0
-  package_info_plus: ^8.0.0
-
-  # Iconos accesibles
+  # ══════════════════════════════════════════════════════════
+  # ✅ UI
+  # ══════════════════════════════════════════════════════════
   cupertino_icons: ^1.0.8
-
-  # Herramientas de accesibilidad
-  flutter_accessibility_service: ^0.2.0  # No hay versiones nuevas, se mantiene
+  provider: ^6.1.2
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^3.0.2
-  integration_test:
-    sdk: flutter
+  flutter_lints: ^4.0.0
 
-
-# Configuración para diferentes plataformas
 flutter:
   uses-material-design: true
-  
-  # Assets optimizados para accesibilidad
+
   assets:
-    # - assets/sounds/          # Sonidos de feedback
-    - assets/icons/           # Iconos de alto contraste       # Fuentes accesibles
-  
-  # Fuentes optimizadas para legibilidad
-  fonts:
-    - family: AccessibleSans
-      fonts:
-        - asset: fonts/OpenSans-Regular.ttf
-          weight: 400
-        - asset: fonts/OpenSans-Medium.ttf  
-          weight: 500
-        - asset: fonts/OpenSans-SemiBold.ttf
-          weight: 600
-        - asset: fonts/OpenSans-Bold.ttf
-          weight: 700
-
-    - family: AccessibleMono
-      fonts:
-        - asset: fonts/RobotoMono-Regular.ttf
-          weight: 400
-        - asset: fonts/RobotoMono-Medium.ttf
-          weight: 500
-# Configuraciones específicas para Android
-android:
-  # Permisos adicionales para accesibilidad
-  permissions:
-    - android.permission.RECORD_AUDIO
-    - android.permission.INTERNET
-    - android.permission.ACCESS_NETWORK_STATE
-    - android.permission.VIBRATE
-    - android.permission.WAKE_LOCK
-    # Permisos de accesibilidad
-    - android.permission.BIND_ACCESSIBILITY_SERVICE
-  
-  # Configuración de accesibilidad en AndroidManifest.xml
-  accessibility_service:
-    enabled: true
-    can_retrieve_window_content: true
-    notification_timeout: 100
-    
-# Configuraciones para iOS
-ios:
-  # Configuraciones de accesibilidad VoiceOver
-  accessibility:
-    voice_over: true
-    guided_access: true
-  
-  # Configuraciones de audio para TTS
-  audio_session:
-    category: playback
-    mode: default
-    options:
-      - default_to_speaker
-      - allow_bluetooth
-
-# Configuraciones de desarrollo
-dev_dependencies_overrides:
-  # Herramientas de testing de accesibilidad
-  accessibility_tools:
-    git:
-      url: https://github.com/flutter/packages
-      path: packages/accessibility_tools
-
-      
+    - assets/models/
+    - assets/wake_words/
+    - assets/wake_words/oye_compas_android.ppn
+    - assets/wake_words/porcupine_params_es.pv
+    - .env

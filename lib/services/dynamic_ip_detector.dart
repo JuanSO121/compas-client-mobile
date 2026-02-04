@@ -111,7 +111,11 @@ class DynamicIPDetector {
 
     // 3. IPs específicas que pueden funcionar con port forwarding
     allIPs.addAll([
+      '172.16.206.94',
+      '172.16.203.38',
+      '192.168.1.2',
       '192.168.1.3',
+      '192.168.1.8',
       '192.168.1.100',  // IP común de PC Windows
       '192.168.1.101',
       '192.168.1.102',
@@ -224,6 +228,10 @@ class DynamicIPDetector {
 
     // Prioridades para conexión desde Android
     final highPriority = [
+      '192.168.1.8',
+      '172.16.203.38',
+      '192.168.1.2',
+      '192.168.1.1',
       '192.168.1.3',
       '192.168.1.100',  // IP muy común de PC Windows
       '192.168.1.101',
@@ -337,6 +345,7 @@ class DynamicIPDetector {
 
       // Test específico de IPs comunes para Windows host
       diagnostics['windows_host_tests'] = {
+        '192.168.1.2:8000': await verifyWhisperService('192.168.1.2', 8000),
         '192.168.1.3:8000': await verifyWhisperService('192.168.1.3', 8000),
         '192.168.1.101:8000': await verifyWhisperService('192.168.1.101', 8000),
         '192.168.0.100:8000': await verifyWhisperService('192.168.0.100', 8000),
