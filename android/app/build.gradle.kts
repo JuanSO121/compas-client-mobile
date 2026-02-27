@@ -1,5 +1,4 @@
 // android/app/build.gradle.kts
-// ✅ VERSIÓN SIMPLIFICADA SIN ARCORE
 
 plugins {
     id("com.android.application")
@@ -10,6 +9,8 @@ plugins {
 android {
     namespace = "com.example.flutter_voice_robot"
     compileSdk = 36
+
+    ndkVersion = "28.2.13676358"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11

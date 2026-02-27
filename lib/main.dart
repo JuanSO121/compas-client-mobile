@@ -1,4 +1,3 @@
-// lib/main.dart - VERSIÓN SIMPLIFICADA
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'screens/auth/welcome_screen.dart';
@@ -9,17 +8,14 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 🔑 Cargar variables de entorno
   await dotenv.load(fileName: ".env");
 
-  // Bloquear orientación vertical
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
   ]);
 
   runApp(const MyApp());
 }
-
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
@@ -28,48 +24,112 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'COMPAS - Asistente de Voz',
-      theme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.light,
-        colorScheme: const ColorScheme.light(
-          primary: Color(0xFFFFB300),
-          secondary: Color(0xFF2E7D32),
-          error: Color(0xFFC62828),
-          surface: Colors.white,
-          onSurface: Color(0xFF212121),
-        ),
-        textTheme: const TextTheme(
-          bodyLarge: TextStyle(fontSize: 18, height: 1.5),
-          bodyMedium: TextStyle(fontSize: 16, height: 1.5),
-          titleLarge: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-          titleMedium: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
-        ),
-      ),
-      darkTheme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.dark,
-        colorScheme: const ColorScheme.dark(
-          primary: Color(0xFFFFD54F),
-          secondary: Color(0xFF66BB6A),
-          error: Color(0xFFEF5350),
-          surface: Color(0xFF1E1E1E),
-          onSurface: Colors.white,
-        ),
-      ),
-      themeMode: ThemeMode.system,
+      debugShowCheckedModeBanner: false,
+
+      themeMode: ThemeMode.dark,
+
+      theme: _lightTheme(),
+      darkTheme: _darkTheme(),
+
       home: const WelcomeScreen(),
+
       routes: {
         '/voice': (context) => const VoiceNavigationScreen(),
         '/camera': (context) => const EnvironmentRecognitionScreen(),
       },
-      debugShowCheckedModeBanner: false,
     );
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// ✅ PANTALLA PRINCIPAL CON NAVEGACIÓN SIMPLIFICADA (2 TABS)
-// ═══════════════════════════════════════════════════════════════════
+ThemeData _darkTheme() {
+  return ThemeData(
+    useMaterial3: true,
+    brightness: Brightness.dark,
+
+    colorScheme: const ColorScheme.dark(
+      primary: Color(0xFFFF6B00),        // 🔥 Nuevo naranja
+      onPrimary: Color(0xFFFFFFFF),
+
+      secondary: Color(0xFFFFFFFF),
+      onSecondary: Color(0xFF00162D),
+
+      background: Color(0xFF00162D),     // Azul profundo
+      surface: Color(0xFF00162D),
+
+      onSurface: Color(0xFFFFFFFF),
+      onBackground: Color(0xFFFFFFFF),
+
+      error: Color(0xFFFF4D4F),
+      onError: Color(0xFFFFFFFF),
+    ),
+
+    scaffoldBackgroundColor: const Color(0xFF00162D),
+
+    textTheme: const TextTheme(
+      bodyLarge: TextStyle(
+        fontSize: 20,
+        height: 1.6,
+        fontWeight: FontWeight.w500,
+      ),
+      bodyMedium: TextStyle(
+        fontSize: 18,
+        height: 1.6,
+      ),
+      titleLarge: TextStyle(
+        fontSize: 26,
+        fontWeight: FontWeight.bold,
+      ),
+      titleMedium: TextStyle(
+        fontSize: 22,
+        fontWeight: FontWeight.w600,
+      ),
+    ),
+
+    bottomNavigationBarTheme: const BottomNavigationBarThemeData(
+      backgroundColor: Color(0xFF00162D),
+      selectedItemColor: Color(0xFFFF6B00),  // 🔥 Activo en naranja
+      unselectedItemColor: Colors.white70,
+      selectedLabelStyle: TextStyle(fontSize: 16),
+      unselectedLabelStyle: TextStyle(fontSize: 14),
+    ),
+
+    elevatedButtonTheme: ElevatedButtonThemeData(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: const Color(0xFFFF6B00), // 🔥 Botones naranja
+        foregroundColor: const Color(0xFFFFFFFF),
+        textStyle: const TextStyle(
+          fontSize: 18,
+          fontWeight: FontWeight.bold,
+        ),
+        padding: const EdgeInsets.symmetric(
+          vertical: 18,
+          horizontal: 24,
+        ),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+        ),
+      ),
+    ),
+  );
+}
+
+ThemeData _lightTheme() {
+  return ThemeData(
+    useMaterial3: true,
+    brightness: Brightness.light,
+    colorScheme: const ColorScheme.light(
+      primary: Color(0xFFFF6B00),
+      onPrimary: Color(0xFFFFFFFF),
+      secondary: Color(0xFF00162D),
+      onSecondary: Color(0xFFFFFFFF),
+      background: Color(0xFFF5F5F5),
+      surface: Color(0xFFFFFFFF),
+      onSurface: Color(0xFF00162D),
+      onBackground: Color(0xFF00162D),
+    ),
+  );
+}
+
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
 
@@ -100,11 +160,11 @@ class _MainScreenState extends State<MainScreen> {
         },
         items: const [
           BottomNavigationBarItem(
-            icon: Icon(Icons.mic),
+            icon: Icon(Icons.mic, size: 30),
             label: 'Comandos de Voz',
           ),
           BottomNavigationBarItem(
-            icon: Icon(Icons.videocam),
+            icon: Icon(Icons.videocam, size: 30),
             label: 'Reconocimiento',
           ),
         ],

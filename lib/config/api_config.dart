@@ -8,16 +8,27 @@ class ApiConfig {
       dotenv.env['BASE_URL_PC'] ?? 'http://127.0.0.1:8080';
 
   static String get baseUrl =>
-      dotenv.env['BASE_URL'] ?? 'http://192.168.1.9:8080';
+      dotenv.env['BASE_URL'] ?? 'http://192.168.1.5:8080';
 
   // ======================
   // API KEYS (NO GIT)
   // ======================
-  static String get geminiApiKey =>
-      dotenv.env['GEMINI_API_KEY'] ?? '';
+  static String get groqApiKey =>
+      dotenv.env['GROQ_API_KEY'] ?? '';
 
   static String get picovoiceAccessKey =>
       dotenv.env['PICOVOICE_ACCESS_KEY'] ?? '';
+
+  // ======================
+  // GROQ CONFIGURATION
+  // ======================
+  static const String groqBaseUrl = 'https://api.groq.com/openai/v1';
+
+  // Modelo optimizado para comandos rápidos
+  static const String groqCommandModel = 'llama-3.3-70b-versatile';
+
+  // Modelo para conversación más compleja
+  static const String groqConversationModel = 'llama-3.3-70b-versatile';
 
   // ======================
   // API VERSION
@@ -54,6 +65,7 @@ class ApiConfig {
   // ======================
   static const Duration connectTimeout = Duration(seconds: 30);
   static const Duration receiveTimeout = Duration(seconds: 30);
+  static const Duration groqTimeout = Duration(seconds: 3); // Era 5, ahora 3
 
   // ======================
   // HEADERS
@@ -68,9 +80,14 @@ class ApiConfig {
     'Authorization': 'Bearer $token',
   };
 
+  static Map<String, String> get groqHeaders => {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer $groqApiKey',
+  };
+
   // ======================
   // VALIDATION
   // ======================
   static bool get isConfigured =>
-      geminiApiKey.isNotEmpty && picovoiceAccessKey.isNotEmpty;
+      groqApiKey.isNotEmpty && picovoiceAccessKey.isNotEmpty;
 }

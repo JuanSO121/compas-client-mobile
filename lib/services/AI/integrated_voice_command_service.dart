@@ -215,62 +215,28 @@ class IntegratedVoiceCommandService {
         return;
       }
 
-      VoiceCommandResult result;
+      // ✅ CAMBIO CRÍTICO: Ya NO clasificamos aquí
+      // Solo capturamos el texto y lo pasamos al NavigationCoordinator
+      // El NavigationCoordinator usará ConversationService para chatear
 
-      if (_classifier.isInitialized) {
-        try {
-          result = await _classifier.classify(text).timeout(
-            const Duration(seconds: 2),
-            onTimeout: () {
-              _logger.e('⏱️ Timeout en TFLite');
-              return VoiceCommandResult.error('Timeout');
-            },
-          );
+      _logger.i('📝 Texto capturado del usuario: "$text"');
 
-          if (result.hasError) {
-            throw Exception(result.errorMessage ?? 'TFLite error');
-          }
+      // Crear intent dummy solo para transportar el texto
+      final intent = NavigationIntent(
+        type: IntentType.navigate, // Dummy
+        target: 'forward',          // Dummy
+        priority: 5,               // Dummy
+        suggestedResponse: text,   // ✅ IMPORTANTE: El texto original
+      );
 
-        } catch (e) {
-          _logger.w('❌ TFLite falló: $e - Usando fallback');
-          result = _fallbackClassification(text);
-        }
-      } else {
-        result = _fallbackClassification(text);
-      }
+      _consecutiveErrors = 0;
 
-      _logger.i('🔍 "$text" → ${result.label} (${(result.confidence * 100).toStringAsFixed(1)}%)');
-
-      if (!result.passesThreshold) {
-        _logger.w('⛔ Confianza baja: ${(result.confidence * 100).toStringAsFixed(1)}%');
-        onCommandRejected?.call('Comando no reconocido con suficiente confianza');
-        return;
-      }
-
-      final action = _labelToAction(result.label);
-      final canExecute = _fsm.canExecute(action, result.confidence);
-
-      if (!canExecute.$1) {
-        _logger.w('⛔ FSM rechazó: ${canExecute.$2}');
-        onCommandRejected?.call(canExecute.$2);
-        return;
-      }
-
-      final executed = _fsm.execute(action, result.confidence, text);
-
-      if (executed) {
-        final intent = _actionToIntent(action, text);
-
-        _consecutiveErrors = 0;
-
-        onCommandDetected?.call(intent);
-        onCommandExecuted?.call(intent);
-
-        _logger.i('✅ Comando ejecutado: ${action.name}');
-      }
+      // Pasar al coordinator para que use el chatbot
+      onCommandDetected?.call(intent);
+      onCommandExecuted?.call(intent);
 
     } catch (e, stackTrace) {
-      _logger.e('Error procesando comando: $e');
+      _logger.e('Error capturando texto: $e');
       _logger.e('StackTrace: $stackTrace');
       _consecutiveErrors++;
     } finally {

@@ -1,5 +1,6 @@
-// lib/services/AI/navigation_coordinatorHy.dart
-// ✅ VERSIÓN CORREGIDA - LIMPIEZA ROBUSTA DE SESIONES STT
+// lib/services/AI/navigation_coordinator.dart
+// ✅ COORDINADOR CONVERSACIONAL - VERSIÓN ACTUALIZADA
+// Integra conversación natural + comandos de navegación
 
 import 'package:logger/logger.dart';
 import 'package:flutter/services.dart';
@@ -8,8 +9,11 @@ import 'dart:async';
 import '../../models/shared_models.dart';
 import '../../config/api_config.dart';
 import '../tts_service.dart';
+import 'conversation_service.dart';
 import 'integrated_voice_command_service.dart';
 import 'wake_word_service.dart';
+import 'ai_mode_controller.dart';
+import 'conversation_service.dart';
 
 enum CoordinatorState {
   idle,
@@ -26,14 +30,17 @@ class NavigationCoordinator {
 
   final Logger _logger = Logger();
 
+  final ConversationService _conversationService = ConversationService();
   final IntegratedVoiceCommandService _voiceService = IntegratedVoiceCommandService();
   final WakeWordService _wakeWordService = WakeWordService();
   final TTSService _ttsService = TTSService();
+  final AIModeController _aiModeController = AIModeController();
 
   CoordinatorState _state = CoordinatorState.idle;
   bool _isInitialized = false;
   bool _isActive = false;
   bool _wakeWordAvailable = false;
+
 
   Timer? _commandTimeoutTimer;
   static const Duration _commandTimeout = Duration(seconds: 5);
@@ -41,10 +48,14 @@ class NavigationCoordinator {
   NavigationIntent? _currentIntent;
   NavigationMode _mode = NavigationMode.eventBased;
 
+  // ✅ Historial de entrada del usuario
+  String? _lastUserInput;
+
   Function(String)? onStatusUpdate;
   Function(NavigationIntent)? onIntentDetected;
   Function(NavigationIntent)? onCommandExecuted;
   Function(String)? onCommandRejected;
+  Function(String)? onConversationalResponse; // ✅ NUEVO
 
   Future<void> initialize() async {
     if (_isInitialized) {
@@ -53,12 +64,13 @@ class NavigationCoordinator {
     }
 
     try {
-      _logger.i('🚀 Inicializando...');
+      _logger.i('🚀 Inicializando NavigationCoordinator...');
 
       await _ttsService.initialize();
+      await _aiModeController.initialize();
+      await _conversationService.initialize();
       await _initializeWakeWord();
       await _voiceService.initialize();
-      _logger.i('✅ STT listo');
 
       _setupServiceCallbacks();
 
@@ -66,8 +78,9 @@ class NavigationCoordinator {
       _state = CoordinatorState.idle;
 
       _logger.i('═══════════════════════════════════════');
-      _logger.i('✅ SISTEMA INICIALIZADO');
+      _logger.i('✅ SISTEMA CONVERSACIONAL INICIALIZADO');
       _logger.i('   Wake Word: ${_wakeWordAvailable ? "✅ ACTIVO" : "❌ INACTIVO"}');
+      _logger.i('   Modo IA: ${_aiModeController.getModeDescription()}');
       _logger.i('═══════════════════════════════════════');
 
       final status = _wakeWordAvailable
@@ -91,17 +104,11 @@ class NavigationCoordinator {
 
       final key = ApiConfig.picovoiceAccessKey;
 
-      _logger.i('📋 Access Key presente: ${key.isNotEmpty}');
-      _logger.i('📋 Longitud: ${key.length} caracteres');
-      _logger.i('📋 Primeros 10: ${key.substring(0, key.length > 10 ? 10 : key.length)}...');
-
       if (key.isEmpty || key.contains('...') || key.length < 20) {
         _logger.w('❌ Access Key INVÁLIDO');
         _wakeWordAvailable = false;
         return;
       }
-
-      _logger.i('✅ Access Key válido, inicializando Porcupine...');
 
       await _wakeWordService.initialize(
         accessKey: key,
@@ -130,10 +137,13 @@ class NavigationCoordinator {
   }
 
   void _setupServiceCallbacks() {
+    // ✅ Variable para capturar el texto STT
+    String? capturedText;
+
     _voiceService.onCommandDetected = (intent) {
-      _logger.i('🎯 Comando: ${intent.type}');
-      _currentIntent = intent;
-      onIntentDetected?.call(intent);
+      // Capturar el texto original del usuario
+      capturedText = intent.suggestedResponse;
+      _logger.d('📝 Texto capturado: "$capturedText"');
     };
 
     _voiceService.onCommandExecuted = (intent) async {
@@ -141,14 +151,80 @@ class NavigationCoordinator {
         _logger.w('⚠️ Estado incorrecto: $_state');
         return;
       }
-      _logger.i('✅ Ejecutado: ${intent.type}');
-      await _transitionToProcessing(intent);
+
+      // ✅ Usar el texto capturado
+      final userText = capturedText ?? intent.suggestedResponse;
+      capturedText = null; // Limpiar
+
+      await _processUserInput(userText);
     };
 
     _voiceService.onCommandRejected = (reason) {
       _logger.w('⛔ Rechazado: $reason');
+      capturedText = null;
       _returnToIdle();
     };
+  }
+
+  /// ✅ PROCESAR ENTRADA DEL USUARIO (Chatbot primero)
+  Future<void> _processUserInput(String userInput) async {
+    if (_state != CoordinatorState.listeningCommand) {
+      _logger.w('⚠️ Estado incorrecto para procesar: $_state');
+      return;
+    }
+
+    _lastUserInput = userInput;
+    _logger.i('💬 Usuario: "$userInput"');
+
+    try {
+      _state = CoordinatorState.processing;
+
+      // Detener STT mientras procesamos
+      if (_voiceService.isListening) {
+        await _voiceService.stopListening();
+        await _voiceService.sessionManager.waitUntilIdle();
+      }
+
+      // Verificar conexión
+      await _aiModeController.verifyInternetNow();
+
+      // ✅ CHATEAR con el usuario (chatbot primero)
+      final response = await _conversationService.chat(userInput);
+
+      _logger.i('🤖 Bot (${response.type.name}): "${response.message}"');
+
+      // Hablar la respuesta del chatbot
+      _state = CoordinatorState.speaking;
+      await _ttsService.speak(response.message, interrupt: true);
+
+      // ✅ DESPUÉS de hablar, ejecutar navegación si existe
+      if (response.shouldNavigate) {
+        _logger.i('🎯 Ejecutando navegación: ${response.intent!.target}');
+        _currentIntent = response.intent;
+        onIntentDetected?.call(response.intent!);
+
+        await _ttsService.waitForCompletion();
+        onCommandExecuted?.call(response.intent!);
+      } else {
+        _logger.i('💬 Conversación pura (sin navegación)');
+        if (onConversationalResponse != null) {
+          onConversationalResponse?.call(response.message);
+        }
+        await _ttsService.waitForCompletion();
+      }
+
+      await _completeAndReturnToIdle();
+
+    } catch (e, stack) {
+      _logger.e('❌ Error procesando entrada: $e');
+      _logger.e('Stack: $stack');
+
+      _state = CoordinatorState.speaking;
+      await _ttsService.speak('Lo siento, hubo un error. ¿Puedes repetir?', interrupt: true);
+      await _ttsService.waitForCompletion();
+
+      await _returnToIdle();
+    }
   }
 
   void _onWakeWordDetected() async {
@@ -167,8 +243,7 @@ class NavigationCoordinator {
       _state = CoordinatorState.wakeWordDetected;
       _logger.d('🔄 IDLE → WAKE_WORD_DETECTED');
 
-      // ✅ 1. LIMPIEZA PREVENTIVA DE STT
-      // Aseguramos que NO haya sesiones fantasma
+      // ✅ Limpieza preventiva de STT
       if (_voiceService.isListening || !_voiceService.sessionManager.isIdle) {
         _logger.w('⚠️ STT no estaba limpio, forzando detención...');
         await _voiceService.stopListening();
@@ -178,23 +253,24 @@ class NavigationCoordinator {
         _logger.i('✅ STT limpiado completamente');
       }
 
-      // ✅ 2. PAUSA WAKE WORD
+      // ✅ Pausa wake word
       if (_wakeWordService.isListening) {
         await _wakeWordService.pause();
         _logger.d('⏸️ Wake word pausado');
         await Future.delayed(const Duration(milliseconds: 300));
       }
 
-      // ✅ 3. HABLAR Y ESPERAR
+      // ✅ Hablar y esperar
       _state = CoordinatorState.speaking;
-      await _ttsService.speak('Dime', interrupt: true);
+
+      final greeting = _getRandomGreeting();
+      await _ttsService.speak(greeting, interrupt: true);
       await _ttsService.waitForCompletion();
       await Future.delayed(const Duration(milliseconds: 200));
 
-      // ✅ 4. INICIAR STT CON VALIDACIÓN
+      // ✅ Iniciar STT con validación
       _state = CoordinatorState.listeningCommand;
 
-      // Verificar que session manager permite inicio
       if (!_voiceService.sessionManager.canStart()) {
         _logger.e('❌ Session manager no permite inicio');
         await _returnToIdle();
@@ -202,10 +278,10 @@ class NavigationCoordinator {
       }
 
       await _voiceService.startListening();
-      _logger.i('🎤 Escuchando el comando...');
+      _logger.i('🎤 Escuchando...');
       onStatusUpdate?.call('Escuchando...');
 
-      // ✅ 5. TIMEOUT
+      // ✅ Timeout
       _commandTimeoutTimer?.cancel();
       _commandTimeoutTimer = Timer(_commandTimeout, () {
         _logger.w('⏱️ Timeout del comando');
@@ -218,20 +294,15 @@ class NavigationCoordinator {
     }
   }
 
-  Future<void> _transitionToProcessing(NavigationIntent intent) async {
-    try {
-      _state = CoordinatorState.processing;
-      _commandTimeoutTimer?.cancel();
-
-      await _executeCommand(intent);
-      await _ttsService.waitForCompletion();
-
-      await _completeAndReturnToIdle();
-
-    } catch (e) {
-      _logger.e('❌ Error procesando: $e');
-      await _returnToIdle();
-    }
+  String _getRandomGreeting() {
+    final greetings = [
+      'Dime',
+      '¿Sí?',
+      'Te escucho',
+      '¿En qué puedo ayudarte?',
+      'Aquí estoy',
+    ];
+    return greetings[DateTime.now().millisecond % greetings.length];
   }
 
   Future<void> _returnToIdle() async {
@@ -244,16 +315,13 @@ class NavigationCoordinator {
     try {
       _commandTimeoutTimer?.cancel();
 
-      // ✅ LIMPIEZA EXHAUSTIVA DE STT
+      // ✅ Limpieza exhaustiva de STT
       if (_voiceService.isListening || !_voiceService.sessionManager.isIdle) {
         _logger.i('🧹 Limpiando sesión STT...');
         await _voiceService.stopListening();
-
-        // Esperar hasta que session manager esté realmente idle
         await _voiceService.sessionManager.waitUntilIdle(
           timeout: const Duration(seconds: 3),
         );
-
         _logger.i('✅ STT completamente limpio');
       }
 
@@ -272,7 +340,6 @@ class NavigationCoordinator {
     } catch (e) {
       _logger.e('❌ Error crítico volviendo a IDLE: $e');
       _state = CoordinatorState.idle;
-      // Forzar reset total
       _voiceService.sessionManager.forceReset();
     }
   }
@@ -280,7 +347,7 @@ class NavigationCoordinator {
   Future<void> _completeAndReturnToIdle() async {
     _logger.d('🔄 Ciclo completado. Volviendo a IDLE...');
 
-    // ✅ LIMPIEZA PREVENTIVA ANTES DE VOLVER A IDLE
+    // ✅ Limpieza preventiva antes de volver a IDLE
     if (_voiceService.isListening || !_voiceService.sessionManager.isIdle) {
       _logger.i('🧹 Limpiando STT antes de completar...');
       await _voiceService.stopListening();
@@ -300,24 +367,6 @@ class NavigationCoordinator {
     }
   }
 
-  Future<void> _executeCommand(NavigationIntent intent) async {
-    _logger.i('⚙️ Ejecutando: ${intent.type}');
-
-    _state = CoordinatorState.speaking;
-    await _ttsService.speak(intent.suggestedResponse, interrupt: true);
-
-    onCommandExecuted?.call(intent);
-
-    switch (intent.type) {
-      case IntentType.help:
-        await _ttsService.waitForCompletion();
-        await _ttsService.speak('Comandos: avanza, detente, gira, ayuda');
-        break;
-      default:
-        break;
-    }
-  }
-
   Future<void> start({NavigationMode mode = NavigationMode.eventBased}) async {
     if (!_isInitialized) throw Exception('No inicializado');
     if (_isActive) {
@@ -331,9 +380,10 @@ class NavigationCoordinator {
       _state = CoordinatorState.idle;
 
       _logger.i('═══════════════════════════════════════');
-      _logger.i('🚀 INICIANDO SISTEMA');
+      _logger.i('🚀 INICIANDO SISTEMA CONVERSACIONAL');
       _logger.i('   Modo: ${mode.name}');
       _logger.i('   Wake Word: ${_wakeWordAvailable ? "SI" : "NO"}');
+      _logger.i('   Modo IA: ${_aiModeController.getModeDescription()}');
       _logger.i('═══════════════════════════════════════');
 
       if (_wakeWordAvailable) {
@@ -342,18 +392,17 @@ class NavigationCoordinator {
         onStatusUpdate?.call('Di "Oye COMPAS"');
 
         await Future.delayed(const Duration(milliseconds: 500));
-        await _ttsService.speak('Sistema activado');
+        await _ttsService.speak('Sistema conversacional activado');
         await _ttsService.waitForCompletion();
 
       } else {
         _logger.w('⚠️ SIN WAKE WORD - Modo manual');
 
-        // ✅ Esperar que session manager esté limpio
         await _voiceService.sessionManager.waitUntilIdle();
         await Future.delayed(const Duration(milliseconds: 500));
 
         await _voiceService.startListening();
-        onStatusUpdate?.call('Escuchando comandos...');
+        onStatusUpdate?.call('Escuchando...');
       }
 
     } catch (e) {
@@ -416,18 +465,27 @@ class NavigationCoordinator {
     }
   }
 
+  /// ✅ NUEVO: Limpiar historial de conversación
+  void clearConversationHistory() {
+    _conversationService.clearHistory();
+    _logger.i('🗑️ Historial de conversación limpiado');
+  }
+
   Map<String, dynamic> getStatistics() {
     return {
       'voice_service': _voiceService.getStatistics(),
+      'conversation_service': _conversationService.getStatistics(),
       'wake_word': _wakeWordAvailable
           ? _wakeWordService.getStatistics()
           : {'enabled': false},
+      'ai_mode': _aiModeController.getStatistics(),
       'system': {
         'is_active': _isActive,
         'mode': _mode.toString(),
         'state': _state.name,
         'wake_word_available': _wakeWordAvailable,
         'is_speaking': _ttsService.isSpeaking,
+        'last_user_input': _lastUserInput,
       },
     };
   }
@@ -438,10 +496,12 @@ class NavigationCoordinator {
     if (_wakeWordAvailable) {
       _wakeWordService.resetStatistics();
     }
+    clearConversationHistory();
     _currentIntent = null;
+    _lastUserInput = null;
     _state = CoordinatorState.idle;
     _commandTimeoutTimer?.cancel();
-    _logger.i('🔄 Reset');
+    _logger.i('🔄 Reset completo');
   }
 
   bool get isInitialized => _isInitialized;
@@ -451,6 +511,7 @@ class NavigationCoordinator {
   NavigationIntent? get currentIntent => _currentIntent;
   CoordinatorState get state => _state;
   bool get isSpeaking => _ttsService.isSpeaking;
+  String? get lastUserInput => _lastUserInput;
 
   void dispose() {
     stop();
@@ -458,6 +519,8 @@ class NavigationCoordinator {
     _voiceService.dispose();
     _wakeWordService.dispose();
     _ttsService.dispose();
-    _logger.i('Disposed');
+    _conversationService.dispose();
+    _aiModeController.dispose();
+    _logger.i('NavigationCoordinator disposed');
   }
 }

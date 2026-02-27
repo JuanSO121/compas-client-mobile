@@ -1,11 +1,9 @@
 // lib/services/AI/voice_command_classifier.dart
-// ✅ CLASIFICADOR CON GEMINI + TFLITE FALLBACK
+// ✅ CLASIFICADOR CON GROQ + TFLITE FALLBACK
 
 import 'dart:async';
-
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:logger/logger.dart';
-import 'package:google_generative_ai/google_generative_ai.dart';
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
 import 'dart:convert';
@@ -14,6 +12,7 @@ import '../../models/shared_models.dart';
 import '../../config/api_config.dart';
 import 'portable_tokenizer.dart';
 import 'ai_mode_controller.dart';
+import 'groq_service.dart'; // ✅ NUEVO
 
 class VoiceCommandClassifier {
   static final VoiceCommandClassifier _instance = VoiceCommandClassifier._internal();
@@ -22,6 +21,7 @@ class VoiceCommandClassifier {
 
   final Logger _logger = Logger();
   final AIModeController _aiMode = AIModeController();
+  final GroqService _groqService = GroqService(); // ✅ NUEVO
 
   // TFLite (offline)
   Interpreter? _interpreter;
@@ -29,9 +29,6 @@ class VoiceCommandClassifier {
   late int _maxLength;
   late int _numClasses;
   late Map<int, String> _labelMap;
-
-  // Gemini (online)
-  GenerativeModel? _geminiModel;
 
   static const Map<String, double> _confidenceThresholds = {
     'MOVE': 0.65,
@@ -46,7 +43,7 @@ class VoiceCommandClassifier {
   bool _isInitialized = false;
   int _inferenceCount = 0;
   int _crashCount = 0;
-  int _geminiCalls = 0;
+  int _groqCalls = 0;
   int _tfliteCalls = 0;
 
   Future<void> initialize() async {
@@ -61,9 +58,14 @@ class VoiceCommandClassifier {
       // 1. Inicializar AI Mode Controller
       await _aiMode.initialize();
 
-      // 2. Inicializar Gemini (si disponible)
-      if (_aiMode.geminiAvailable) {
-        await _initializeGemini();
+      // 2. Inicializar Groq (si disponible)
+      if (_aiMode.groqAvailable) { // Nota: reutilizamos la misma lógica
+        try {
+          await _groqService.initialize();
+          _logger.i('✅ Groq inicializado');
+        } catch (e) {
+          _logger.w('⚠️ Groq no disponible: $e');
+        }
       }
 
       // 3. Inicializar TFLite (siempre, como fallback)
@@ -88,26 +90,7 @@ class VoiceCommandClassifier {
     }
   }
 
-  /// ✅ Inicializar Gemini
-  Future<void> _initializeGemini() async {
-    try {
-      _geminiModel = GenerativeModel(
-        model: 'gemini-2.5-flash',
-        apiKey: ApiConfig.geminiApiKey,
-        generationConfig: GenerationConfig(
-          temperature: 0.1,  // Baja temperatura para respuestas consistentes
-          maxOutputTokens: 50,
-        ),
-      );
-
-      _logger.i('✅ Gemini inicializado');
-    } catch (e) {
-      _logger.e('Error inicializando Gemini: $e');
-      _geminiModel = null;
-    }
-  }
-
-  /// ✅ CLASIFICAR (decide entre Gemini o TFLite)
+  /// ✅ CLASIFICAR (decide entre Groq o TFLite)
   Future<VoiceCommandResult> classify(String text) async {
     if (!_isInitialized) {
       throw StateError('Clasificador no inicializado');
@@ -125,20 +108,22 @@ class VoiceCommandClassifier {
     final stopwatch = Stopwatch()..start();
 
     // ✅ Decidir qué método usar
-    final shouldUseGemini = _aiMode.canUseGemini() && _geminiModel != null;
+    final shouldUseGroq = _aiMode.canUseGroq(); // Reutilizamos la lógica de Gemini
 
-    if (shouldUseGemini) {
+    if (shouldUseGroq) {
       try {
-        final result = await _classifyWithGemini(text);
-        _geminiCalls++;
+        final groqResponse = await _groqService.classifyCommand(text);
+        final result = groqResponse.toVoiceCommandResult();
+
+        _groqCalls++;
         stopwatch.stop();
 
-        _logger.i('[GEMINI] "$text" → ${result.label} (${(result.confidence * 100).toStringAsFixed(1)}%) [${stopwatch.elapsedMilliseconds}ms]');
+        _logger.i('[GROQ] "$text" → ${result.label} (${(result.confidence * 100).toStringAsFixed(1)}%) [${stopwatch.elapsedMilliseconds}ms]');
 
         return result;
 
       } catch (e) {
-        _logger.e('❌ Gemini falló: $e, usando TFLite fallback');
+        _logger.e('❌ Groq falló: $e, usando TFLite fallback');
         // Continuar con TFLite
       }
     }
@@ -156,73 +141,6 @@ class VoiceCommandClassifier {
     } catch (e) {
       _logger.e('Error en clasificación: $e');
       return VoiceCommandResult.error(e.toString());
-    }
-  }
-
-  /// ✅ Clasificar con Gemini
-  Future<VoiceCommandResult> _classifyWithGemini(String text) async {
-    final prompt = '''
-Clasifica el siguiente comando de voz en español en UNA de estas categorías:
-
-CATEGORÍAS EXACTAS:
-- MOVE: comandos para moverse hacia adelante (avanza, muévete, camina, adelante, forward)
-- STOP: comandos para detenerse (para, detente, alto, stop, frena)
-- TURN_LEFT: comandos para girar a la izquierda (izquierda, gira a la izquierda, left)
-- TURN_RIGHT: comandos para girar a la derecha (derecha, gira a la derecha, right)
-- HELP: solicitudes de ayuda (ayuda, help, auxilio, socorro)
-- REPEAT: solicitudes de repetir (repite, otra vez, de nuevo, again)
-- UNKNOWN: cualquier otra cosa
-
-COMANDO: "$text"
-
-Responde SOLO con JSON en este formato exacto:
-{"label": "CATEGORIA", "confidence": 0.XX}
-
-Donde CATEGORIA es una de las anteriores y confidence es un número entre 0.0 y 1.0.
-No agregues explicaciones, solo el JSON.
-''';
-
-    try {
-      final responseStream = _geminiModel!
-          .generateContentStream([Content.text(prompt)])
-          .timeout(const Duration(seconds: 3));
-
-      final buffer = StringBuffer();
-
-      await for (final chunk in responseStream) {
-        if (chunk.text != null) {
-          buffer.write(chunk.text);
-        }
-      }
-
-      var responseText = buffer.toString().trim();
-
-      // Limpiar respuesta (quitar markdown si existe)
-      final jsonText = responseText
-          .replaceAll('```json', '')
-          .replaceAll('```', '')
-          .trim();
-
-      final json = jsonDecode(jsonText);
-      final label = json['label'] as String;
-      final confidence = (json['confidence'] as num).toDouble();
-
-      final threshold = _confidenceThresholds[label] ?? 0.50;
-      final passesThreshold = confidence >= threshold;
-
-      return VoiceCommandResult(
-        label: label,
-        confidence: confidence,
-        passesThreshold: passesThreshold,
-        threshold: threshold,
-        inferenceTimeMs: 0, // Gemini no reporta tiempo
-        logits: [],
-      );
-
-    } on TimeoutException {
-      throw Exception('Gemini timeout');
-    } catch (e) {
-      throw Exception('Gemini parsing error: $e');
     }
   }
 
@@ -279,6 +197,8 @@ No agregues explicaciones, solo el JSON.
     );
   }
 
+  // ... [resto del código TFLite sin cambios] ...
+
   List<double> _runInferenceSafe(List<int> inputIds) {
     if (_interpreter == null) {
       throw StateError('Modelo no cargado');
@@ -313,8 +233,6 @@ No agregues explicaciones, solo el JSON.
 
     return logits;
   }
-
-  // ========== MÉTODOS DE CARGA (sin cambios) ==========
 
   Future<void> _loadModelConfig() async {
     try {
@@ -424,13 +342,13 @@ No agregues explicaciones, solo el JSON.
       'is_initialized': _isInitialized,
       'inference_count': _inferenceCount,
       'crash_count': _crashCount,
-      'gemini_calls': _geminiCalls,
+      'groq_calls': _groqCalls,
       'tflite_calls': _tfliteCalls,
       'ai_mode': _aiMode.getStatistics(),
+      'groq_stats': _groqService.getStatistics(),
     };
   }
 
-  /// ✅ MÉTODO FALTANTE: Validar chunk de texto
   bool validateChunk(String text, String label) {
     const minChars = {
       'STOP': 3,
@@ -465,7 +383,7 @@ No agregues explicaciones, solo el JSON.
   void resetCounter() {
     _inferenceCount = 0;
     _crashCount = 0;
-    _geminiCalls = 0;
+    _groqCalls = 0;
     _tfliteCalls = 0;
   }
 
@@ -482,12 +400,9 @@ No agregues explicaciones, solo el JSON.
 
     _interpreter = null;
     _tokenizer = null;
-    _geminiModel = null;
+    _groqService.dispose();
     _aiMode.dispose();
     _isInitialized = false;
     _logger.i('VoiceCommandClassifier disposed');
   }
 }
-
-// ========== FIN DEL CLASIFICADOR ==========
-// Las clases VoiceCommandResult y ClassPrediction están en shared_models.dart

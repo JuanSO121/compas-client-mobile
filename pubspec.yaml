@@ -68,6 +68,13 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.4  # Versión estable 2026
+
+flutter_launcher_icons: # ← Nueva sección aquí (nivel flutter:)
+  android: true
+  ios: true
+  image_path: "assets/images/compas_V3.png"  # Tu logo listo
+  min_sdk_android: 21  # Adaptive icons
 
 flutter:
   uses-material-design: true
@@ -78,3 +85,4 @@ flutter:
     - assets/wake_words/oye_compas_android.ppn
     - assets/wake_words/porcupine_params_es.pv
     - .env
+    - assets/images/
