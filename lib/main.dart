@@ -4,6 +4,7 @@ import 'screens/auth/welcome_screen.dart';
 import 'screens/voice_navigation_screen.dart';
 import 'screens/environment_recognition_screen.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'screens/ar_navigation_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,7 +35,7 @@ class MyApp extends StatelessWidget {
       home: const WelcomeScreen(),
 
       routes: {
-        '/voice': (context) => const VoiceNavigationScreen(),
+        '/ar': (context) => const ArNavigationScreen(),
         '/camera': (context) => const EnvironmentRecognitionScreen(),
       },
     );

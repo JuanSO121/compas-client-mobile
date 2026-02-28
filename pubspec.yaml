@@ -64,6 +64,12 @@ dependencies:
   cupertino_icons: ^1.0.8
   provider: ^6.1.2
 
+  # ✅ Fork con soporte Unity 6
+  flutter_unity_widget:
+    git:
+      url: https://github.com/juicycleff/flutter-unity-view-widget.git
+      ref: experimental/unity_6000
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

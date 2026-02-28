@@ -513,6 +513,8 @@ class NavigationCoordinator {
   bool get isSpeaking => _ttsService.isSpeaking;
   String? get lastUserInput => _lastUserInput;
 
+  
+
   void dispose() {
     stop();
     _commandTimeoutTimer?.cancel();
