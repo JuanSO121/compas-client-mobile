@@ -13,7 +13,6 @@ import 'conversation_service.dart';
 import 'integrated_voice_command_service.dart';
 import 'wake_word_service.dart';
 import 'ai_mode_controller.dart';
-import 'conversation_service.dart';
 
 enum CoordinatorState {
   idle,
@@ -513,7 +512,10 @@ class NavigationCoordinator {
   bool get isSpeaking => _ttsService.isSpeaking;
   String? get lastUserInput => _lastUserInput;
 
-  
+  Future<void> speak(String message) async {
+    if (message.isEmpty) return;
+    await _ttsService.speak(message, interrupt: false);
+  }
 
   void dispose() {
     stop();

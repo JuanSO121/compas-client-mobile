@@ -70,6 +70,7 @@ dependencies:
       url: https://github.com/juicycleff/flutter-unity-view-widget.git
       ref: experimental/unity_6000
 
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -92,3 +93,4 @@ flutter:
     - assets/wake_words/porcupine_params_es.pv
     - .env
     - assets/images/
+    - assets/images/compas_V3.png

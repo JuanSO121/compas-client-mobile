@@ -1,5 +1,6 @@
 // lib/services/unity_bridge_service.dart
-// ✅ v2 — Sincronizado con FlutterUnityBridge.cs + VoiceCommandAPI.cs
+// ✅ v3 — Fix: handleIntent() decodifica prefijos __unity:* de ConversationService
+//          Fix: isReady expuesto como ValueNotifier para reactividad en UI
 //
 //  ACCIONES QUE ENTIENDE Unity (FlutterUnityBridge.cs switch):
 //    navigate_to       → VoiceCommandAPI.NavigateTo(name)
@@ -15,9 +16,17 @@
 //  RESPUESTAS QUE ENVÍA Unity (canal OnUnityResponse):
 //    { "action": "...", "ok": true|false, "message": "...", ...extras }
 //    list_waypoints incluye además: "count": N, "waypoints": [...]
+//
+//  PREFIJOS INTERNOS de ConversationService (resueltos aquí):
+//    __unity:list_waypoints          → listWaypoints()
+//    __unity:save_session            → saveSession()
+//    __unity:load_session            → loadSession()
+//    __unity:create_waypoint:<name>  → createWaypoint(name)
+//    __unity:remove_waypoint:<name>  → removeWaypoint(name)
 
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_unity_widget/flutter_unity_widget.dart';
 import 'package:logger/logger.dart';
 import '../models/shared_models.dart';
@@ -79,10 +88,10 @@ class WaypointInfo {
   });
 
   factory WaypointInfo.fromJson(Map<String, dynamic> j) => WaypointInfo(
-    id:       j['id']       as String? ?? '',
-    name:     j['name']     as String? ?? '',
-    type:     j['type']     as String? ?? '',
-    navigable: j['navigable'] as bool? ?? false,
+    id:        j['id']        as String? ?? '',
+    name:      j['name']      as String? ?? '',
+    type:      j['type']      as String? ?? '',
+    navigable: j['navigable'] as bool?   ?? false,
     x: (j['pos']?['x'] as num?)?.toDouble() ?? 0,
     y: (j['pos']?['y'] as num?)?.toDouble() ?? 0,
     z: (j['pos']?['z'] as num?)?.toDouble() ?? 0,
@@ -102,7 +111,12 @@ class UnityBridgeService {
   final Logger _logger = Logger();
 
   UnityWidgetController? _controller;
-  bool _isReady = false;
+
+  // ✅ FIX: ValueNotifier para que la UI se reconstruya cuando Unity esté listo
+  final ValueNotifier<bool> isReadyNotifier = ValueNotifier(false);
+
+  // Getter de conveniencia (retrocompatible)
+  bool get isReady => isReadyNotifier.value;
 
   // GameObject y método en Unity (deben coincidir exactamente)
   static const String _gameObject = 'FlutterBridge';
@@ -126,8 +140,8 @@ class UnityBridgeService {
 
   void setController(UnityWidgetController controller) {
     _controller = controller;
-    _isReady = true;
-    _logger.i('✅ [UnityBridge] Controller registrado');
+    isReadyNotifier.value = true;
+    _logger.i('✅ [UnityBridge] Controller registrado — isReady=true');
   }
 
   /// Llamar desde ArNavigationScreen.onUnityMessage
@@ -160,17 +174,34 @@ class UnityBridgeService {
     }
   }
 
-  bool get isReady => _isReady && _controller != null;
-
   // ─── handleIntent — punto de entrada desde NavigationCoordinator ─────────
 
   /// Traduce un NavigationIntent al comando Unity correspondiente.
-  /// Cubrir todos los IntentType que puedan venir del coordinador.
+  ///
+  /// ✅ FIX v3: Ahora decodifica los prefijos __unity:* generados por
+  /// ConversationService._buildIntent() para acciones extendidas.
+  ///
+  /// Formato de targets especiales:
+  ///   __unity:list_waypoints
+  ///   __unity:save_session
+  ///   __unity:load_session
+  ///   __unity:create_waypoint:<name>
+  ///   __unity:remove_waypoint:<name>
   void handleIntent(NavigationIntent intent) {
     switch (intent.type) {
+
       case IntentType.navigate:
-        if (intent.target.isNotEmpty) {
-          navigateTo(intent.target);
+        final target = intent.target;
+
+        // ── Prefijos especiales de ConversationService ──────────────────
+        if (target.startsWith('__unity:')) {
+          _handleUnityPrefix(target);
+          return;
+        }
+
+        // ── Navegación normal ───────────────────────────────────────────
+        if (target.isNotEmpty) {
+          navigateTo(target);
         } else {
           _logger.w('[UnityBridge] navigate_to sin target — ignorado');
         }
@@ -187,22 +218,63 @@ class UnityBridgeService {
     }
   }
 
+  /// ✅ FIX v3: Decodifica y ejecuta los prefijos __unity:*
+  void _handleUnityPrefix(String target) {
+    _logger.d('[UnityBridge] Decodificando prefijo: $target');
+
+    const prefix = '__unity:';
+    final cmd = target.substring(prefix.length); // quita '__unity:'
+
+    if (cmd == 'list_waypoints') {
+      listWaypoints();
+      return;
+    }
+
+    if (cmd == 'save_session') {
+      saveSession();
+      return;
+    }
+
+    if (cmd == 'load_session') {
+      loadSession();
+      return;
+    }
+
+    if (cmd.startsWith('create_waypoint:')) {
+      final name = cmd.substring('create_waypoint:'.length);
+      if (name.isNotEmpty) {
+        createWaypoint(name);
+      } else {
+        _logger.w('[UnityBridge] create_waypoint sin nombre — ignorado');
+      }
+      return;
+    }
+
+    if (cmd.startsWith('remove_waypoint:')) {
+      final name = cmd.substring('remove_waypoint:'.length);
+      if (name.isNotEmpty) {
+        removeWaypoint(name);
+      } else {
+        _logger.w('[UnityBridge] remove_waypoint sin nombre — ignorado');
+      }
+      return;
+    }
+
+    _logger.w('[UnityBridge] Prefijo __unity desconocido: $cmd');
+  }
+
   // ─── Comandos de navegación ───────────────────────────────────────────────
 
-  /// Navega al waypoint por nombre.
   void navigateTo(String waypointName) {
     _send({'action': 'navigate_to', 'name': waypointName});
     _logger.i('[UnityBridge] → navigate_to: $waypointName');
   }
 
-  /// Detiene la navegación activa.
   void stopNavigation() {
     _send({'action': 'stop_navigation'});
     _logger.i('[UnityBridge] → stop_navigation');
   }
 
-  /// Solicita el estado actual de navegación.
-  /// La respuesta llega vía onResponse con action == 'nav_status'.
   void requestNavStatus() {
     _send({'action': 'nav_status'});
     _logger.d('[UnityBridge] → nav_status');
@@ -210,26 +282,21 @@ class UnityBridgeService {
 
   // ─── Comandos de waypoints ────────────────────────────────────────────────
 
-  /// Solicita la lista completa de waypoints a Unity.
-  /// La respuesta llega vía onWaypointsReceived.
   void listWaypoints() {
     _send({'action': 'list_waypoints'});
     _logger.i('[UnityBridge] → list_waypoints');
   }
 
-  /// Crea un waypoint en la posición actual del agente con el nombre dado.
   void createWaypoint(String name) {
     _send({'action': 'create_waypoint', 'name': name});
     _logger.i('[UnityBridge] → create_waypoint: $name');
   }
 
-  /// Elimina el waypoint con ese nombre exacto.
   void removeWaypoint(String name) {
     _send({'action': 'remove_waypoint', 'name': name});
     _logger.i('[UnityBridge] → remove_waypoint: $name');
   }
 
-  /// Elimina todos los waypoints.
   void clearWaypoints() {
     _send({'action': 'clear_waypoints'});
     _logger.i('[UnityBridge] → clear_waypoints');
@@ -263,7 +330,8 @@ class UnityBridgeService {
 
   void dispose() {
     _responseStream.close();
+    isReadyNotifier.dispose();
     _controller = null;
-    _isReady = false;
+    isReadyNotifier.value = false;
   }
 }

@@ -1,10 +1,8 @@
 // lib/screens/ar_navigation_screen.dart
-// ✅ v2 — Unity AR de fondo + overlay de voz encima
-//   Cambios respecto a v1:
-//   • _onUnityMessage conectado a _unityBridge.handleUnityMessage()
-//   • _unityBridge.onResponse escucha confirmaciones de Unity (waypoint alcanzado, etc.)
-//   • Chips "Guardar/Cargar" usan las acciones correctas del bridge v2
-//   • _onUnityMessage era un stub vacío — ahora procesa respuestas reales
+// ✅ v4 — Feature: Panel de testing con comandos rápidos
+//          Fix: botones Guardar/Cargar/Balizas reactivos con ValueListenableBuilder
+//          Fix: _unityBridge.isReadyNotifier notifica a la UI cuando Unity carga
+//          Fix: _onUnityCreated actualiza isReadyNotifier → rebuild automático
 
 import 'package:flutter/material.dart' hide NavigationMode;
 import 'package:flutter/semantics.dart';
@@ -46,6 +44,12 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   bool _unityLoaded    = false;
   bool _showVoiceOverlay = true;
 
+  // ─── Panel de testing ─────────────────────────────────────
+  bool _showTestPanel = false;
+  final TextEditingController _waypointNameController = TextEditingController(text: 'Baliza 1');
+  final TextEditingController _navigateTargetController = TextEditingController(text: 'Entrada');
+  int _waypointCounter = 1;
+
   // ─── Historial ────────────────────────────────────────────
   final List<_CommandItem> _history = [];
   static const int _maxHistory = 5;
@@ -53,8 +57,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   // ─── Animaciones ──────────────────────────────────────────
   late AnimationController _pulseController;
   late AnimationController _waveController;
+  late AnimationController _testPanelController;
   late Animation<double>   _pulseAnimation;
   late Animation<double>   _waveAnimation;
+  late Animation<double>   _testPanelAnimation;
 
   // ─── Lifecycle ────────────────────────────────────────────
 
@@ -82,9 +88,17 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _waveAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(parent: _waveController, curve: Curves.easeInOut),
     );
+
+    _testPanelController = AnimationController(
+      duration: const Duration(milliseconds: 280),
+      vsync: this,
+    );
+    _testPanelAnimation = CurvedAnimation(
+      parent: _testPanelController,
+      curve: Curves.easeOutCubic,
+    );
   }
 
-  /// Registrar callbacks del bridge ANTES de que Unity cargue.
   void _setupUnityBridgeCallbacks() {
     _unityBridge.onResponse = (response) {
       if (!mounted) return;
@@ -97,7 +111,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
       _logger.i('[Bridge] ✅ ${response.action}: ${response.message}');
 
-      // ✅ Unity avisa que el agente llegó → TTS anuncia automáticamente
       if (response.action == 'navigation_arrived') {
         _coordinator.speak(response.message);
         _showSnackBar('📍 ${response.message}');
@@ -105,15 +118,16 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       }
     };
 
-    // ✅ Lista de waypoints → TTS anuncia los destinos disponibles
     _unityBridge.onWaypointsReceived = (waypoints) {
       if (!mounted) return;
       _logger.i('[Bridge] 📍 ${waypoints.length} waypoint(s) recibidos de Unity');
       if (waypoints.isEmpty) {
         _coordinator.speak('No hay balizas guardadas todavía.');
+        _showSnackBar('📍 No hay balizas aún');
       } else {
         final names = waypoints.map((w) => w.name).join(', ');
         _coordinator.speak('Destinos disponibles: $names');
+        _showSnackBar('📍 ${waypoints.length} balizas: $names');
       }
     };
   }
@@ -128,7 +142,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       await _coordinator.initialize();
       _wakeWordAvailable = _coordinator.wakeWordAvailable;
 
-      // ─── Callbacks voz ────────────────────────────────────
       _coordinator.onStatusUpdate = (status) {
         if (mounted) setState(() => _statusMessage = status);
       };
@@ -147,10 +160,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
       _coordinator.onCommandExecuted = (intent) {
         if (!mounted) return;
-
-        // ✅ Delegar a Unity bridge — usa las acciones correctas del bridge v2
         _unityBridge.handleIntent(intent);
-
         _addToHistory(intent);
         _showSnackBar('✅ ${intent.suggestedResponse}');
         HapticFeedback.lightImpact();
@@ -192,8 +202,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _logger.i('✅ Unity AR lista');
   }
 
-  /// ✅ CORREGIDO: era un stub vacío; ahora pasa el mensaje al bridge
-  /// para que lo parsee y dispare onResponse / onWaypointsReceived.
   void _onUnityMessage(message) {
     _unityBridge.handleUnityMessage(message);
   }
@@ -260,10 +268,116 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
+  // ─── Testing panel helpers ────────────────────────────────
+
+  void _toggleTestPanel() {
+    setState(() => _showTestPanel = !_showTestPanel);
+    if (_showTestPanel) {
+      _testPanelController.forward();
+    } else {
+      _testPanelController.reverse();
+    }
+    HapticFeedback.selectionClick();
+  }
+
+  /// Simula un intent como si viniera del coordinador de voz
+  void _fireTestIntent(NavigationIntent intent) {
+    _unityBridge.handleIntent(intent);
+    _addToHistory(intent);
+    _showSnackBar('🧪 TEST: ${intent.suggestedResponse}');
+    HapticFeedback.lightImpact();
+    setState(() => _currentIntent = intent);
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _currentIntent = null);
+    });
+  }
+
+  void _testCreateWaypoint() {
+    final name = _waypointNameController.text.trim();
+    if (name.isEmpty) {
+      _showSnackBar('⚠️ Escribe un nombre para la baliza', isError: true);
+      return;
+    }
+    _fireTestIntent(NavigationIntent(
+      type: IntentType.navigate,
+      target: '__unity:create_waypoint:$name',
+      priority: 6,
+      suggestedResponse: 'Creando baliza "$name"',
+    ));
+    // Auto-increment para el próximo
+    setState(() {
+      _waypointCounter++;
+      _waypointNameController.text = 'Baliza $_waypointCounter';
+    });
+  }
+
+  void _testNavigateTo() {
+    final target = _navigateTargetController.text.trim();
+    if (target.isEmpty) {
+      _showSnackBar('⚠️ Escribe un destino', isError: true);
+      return;
+    }
+    _fireTestIntent(NavigationIntent(
+      type: IntentType.navigate,
+      target: target,
+      priority: 8,
+      suggestedResponse: 'Navegando a $target',
+    ));
+  }
+
+  void _testStop() {
+    _fireTestIntent(NavigationIntent(
+      type: IntentType.stop,
+      target: '',
+      priority: 10,
+      suggestedResponse: 'Navegación detenida',
+    ));
+  }
+
+  void _testListWaypoints() {
+    _fireTestIntent(NavigationIntent(
+      type: IntentType.navigate,
+      target: '__unity:list_waypoints',
+      priority: 5,
+      suggestedResponse: 'Consultando balizas',
+    ));
+  }
+
+  void _testSaveSession() {
+    _fireTestIntent(NavigationIntent(
+      type: IntentType.navigate,
+      target: '__unity:save_session',
+      priority: 5,
+      suggestedResponse: 'Guardando sesión',
+    ));
+  }
+
+  void _testLoadSession() {
+    _fireTestIntent(NavigationIntent(
+      type: IntentType.navigate,
+      target: '__unity:load_session',
+      priority: 5,
+      suggestedResponse: 'Cargando sesión',
+    ));
+  }
+
+  void _testNavStatus() {
+    if (!_unityBridge.isReady) {
+      _showSnackBar('⚠️ Unity no está lista', isError: true);
+      return;
+    }
+    _unityBridge.requestNavStatus();
+    _showSnackBar('🧪 TEST: Consultando estado de navegación');
+    HapticFeedback.lightImpact();
+  }
+
   @override
   void dispose() {
     _pulseController.dispose();
     _waveController.dispose();
+    _testPanelController.dispose();
+    _waypointNameController.dispose();
+    _navigateTargetController.dispose();
     _coordinator.dispose();
     _aiModeController.dispose();
     _unityBridge.dispose();
@@ -316,6 +430,34 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               top:   MediaQuery.of(context).padding.top + 8,
               right: 12,
               child: _buildToggleOverlayButton(),
+            ),
+
+          // ── Capa 5: Botón TEST (esquina inferior izquierda) ───
+          if (_unityLoaded)
+            Positioned(
+              bottom: MediaQuery.of(context).padding.bottom + 24,
+              left:   16,
+              child: _buildTestButton(),
+            ),
+
+          // ── Capa 6: Panel de testing (slide desde la izquierda) ──
+          if (_unityLoaded)
+            AnimatedBuilder(
+              animation: _testPanelAnimation,
+              builder: (context, child) {
+                return Positioned(
+                  bottom: MediaQuery.of(context).padding.bottom + 80,
+                  left:   16,
+                  child: Transform.translate(
+                    offset: Offset(-300 * (1 - _testPanelAnimation.value), 0),
+                    child: Opacity(
+                      opacity: _testPanelAnimation.value,
+                      child: child,
+                    ),
+                  ),
+                );
+              },
+              child: _buildTestPanel(),
             ),
         ],
       ),
@@ -375,8 +517,404 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
+  // ─── TEST BUTTON ──────────────────────────────────────────
+
+  Widget _buildTestButton() {
+    return GestureDetector(
+      onTap: _toggleTestPanel,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: _showTestPanel
+              ? const Color(0xFF7B1FA2).withOpacity(0.92)
+              : Colors.black.withOpacity(0.72),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: _showTestPanel
+                ? const Color(0xFFCE93D8)
+                : Colors.white30,
+            width: 1.5,
+          ),
+          boxShadow: _showTestPanel ? [
+            BoxShadow(
+              color: const Color(0xFF7B1FA2).withOpacity(0.4),
+              blurRadius: 12,
+              spreadRadius: 2,
+            ),
+          ] : [],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _showTestPanel ? Icons.close_rounded : Icons.bug_report_rounded,
+              color: _showTestPanel ? const Color(0xFFCE93D8) : Colors.white70,
+              size: 18,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              _showTestPanel ? 'Cerrar' : 'TEST',
+              style: TextStyle(
+                color: _showTestPanel ? const Color(0xFFCE93D8) : Colors.white70,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ─── TEST PANEL ───────────────────────────────────────────
+
+  Widget _buildTestPanel() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: _unityBridge.isReadyNotifier,
+      builder: (context, isReady, _) {
+        return Container(
+          width: 290,
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(context).size.height * 0.55,
+          ),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0D0D1A).withOpacity(0.96),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: const Color(0xFF7B1FA2).withOpacity(0.6), width: 1.5),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF7B1FA2).withOpacity(0.25),
+                blurRadius: 20,
+                spreadRadius: 2,
+              ),
+            ],
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(20),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // ── Header ──────────────────────────────────
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF7B1FA2).withOpacity(0.3),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(
+                          Icons.bug_report_rounded,
+                          color: Color(0xFFCE93D8),
+                          size: 16,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'Panel de Testing',
+                        style: TextStyle(
+                          color: Color(0xFFCE93D8),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.3,
+                        ),
+                      ),
+                      const Spacer(),
+                      // Estado Unity
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: isReady
+                              ? Colors.green.withOpacity(0.2)
+                              : Colors.orange.withOpacity(0.2),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: isReady ? Colors.greenAccent : Colors.orange,
+                            width: 0.8,
+                          ),
+                        ),
+                        child: Text(
+                          isReady ? 'Unity ✓' : 'Unity ⏳',
+                          style: TextStyle(
+                            color: isReady ? Colors.greenAccent : Colors.orange,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 14),
+                  _testSectionDivider('NAVEGACIÓN'),
+                  const SizedBox(height: 10),
+
+                  // ── Navegar a destino ────────────────────────
+                  _buildTestInputRow(
+                    controller: _navigateTargetController,
+                    hint: 'Nombre del destino',
+                    buttonLabel: 'Navegar',
+                    buttonIcon: Icons.navigation_rounded,
+                    color: const Color(0xFF1565C0),
+                    accentColor: const Color(0xFF64B5F6),
+                    onPressed: isReady ? _testNavigateTo : null,
+                  ),
+
+                  const SizedBox(height: 8),
+
+                  // ── Stop ────────────────────────────────────
+                  _buildTestActionButton(
+                    label: 'Detener navegación',
+                    icon: Icons.stop_circle_rounded,
+                    color: const Color(0xFFB71C1C),
+                    accentColor: const Color(0xFFEF9A9A),
+                    onPressed: isReady ? _testStop : null,
+                  ),
+
+                  const SizedBox(height: 14),
+                  _testSectionDivider('BALIZAS'),
+                  const SizedBox(height: 10),
+
+                  // ── Crear baliza ─────────────────────────────
+                  _buildTestInputRow(
+                    controller: _waypointNameController,
+                    hint: 'Nombre de la baliza',
+                    buttonLabel: 'Crear',
+                    buttonIcon: Icons.add_location_alt_rounded,
+                    color: const Color(0xFF1B5E20),
+                    accentColor: const Color(0xFFA5D6A7),
+                    onPressed: isReady ? _testCreateWaypoint : null,
+                  ),
+
+                  const SizedBox(height: 8),
+
+                  // ── Listar balizas ───────────────────────────
+                  _buildTestActionButton(
+                    label: 'Listar balizas',
+                    icon: Icons.list_alt_rounded,
+                    color: const Color(0xFF0E4749),
+                    accentColor: const Color(0xFF80CBC4),
+                    onPressed: isReady ? _testListWaypoints : null,
+                  ),
+
+                  const SizedBox(height: 14),
+                  _testSectionDivider('SESIÓN'),
+                  const SizedBox(height: 10),
+
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildTestActionButton(
+                          label: 'Guardar',
+                          icon: Icons.save_rounded,
+                          color: const Color(0xFF1A237E),
+                          accentColor: const Color(0xFF90CAF9),
+                          onPressed: isReady ? _testSaveSession : null,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _buildTestActionButton(
+                          label: 'Cargar',
+                          icon: Icons.folder_open_rounded,
+                          color: const Color(0xFF1A237E),
+                          accentColor: const Color(0xFF90CAF9),
+                          onPressed: isReady ? _testLoadSession : null,
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 8),
+
+                  // ── Estado de navegación ─────────────────────
+                  _buildTestActionButton(
+                    label: 'Estado de navegación',
+                    icon: Icons.radar_rounded,
+                    color: const Color(0xFF33691E),
+                    accentColor: const Color(0xFFDCE775),
+                    onPressed: isReady ? _testNavStatus : null,
+                  ),
+
+                  const SizedBox(height: 14),
+                  _testSectionDivider('SISTEMA'),
+                  const SizedBox(height: 10),
+
+                  // ── Reset ────────────────────────────────────
+                  _buildTestActionButton(
+                    label: 'Reset completo',
+                    icon: Icons.refresh_rounded,
+                    color: const Color(0xFF4A148C),
+                    accentColor: const Color(0xFFCE93D8),
+                    onPressed: () {
+                      _coordinator.reset();
+                      setState(() {
+                        _currentIntent = null;
+                        _history.clear();
+                        _waypointCounter = 1;
+                        _waypointNameController.text = 'Baliza 1';
+                        _navigateTargetController.text = 'Entrada';
+                      });
+                      _showSnackBar('🔄 Reset completo del sistema');
+                      HapticFeedback.mediumImpact();
+                    },
+                  ),
+
+                  const SizedBox(height: 4),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _testSectionDivider(String label) {
+    return Row(
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            color: Color(0xFF9E9E9E),
+            fontSize: 10,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 1.2,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Container(
+            height: 0.5,
+            color: Colors.white12,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTestInputRow({
+    required TextEditingController controller,
+    required String hint,
+    required String buttonLabel,
+    required IconData buttonIcon,
+    required Color color,
+    required Color accentColor,
+    VoidCallback? onPressed,
+  }) {
+    final enabled = onPressed != null;
+    return Row(
+      children: [
+        Expanded(
+          child: Container(
+            height: 38,
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(enabled ? 0.07 : 0.03),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.white.withOpacity(0.12)),
+            ),
+            child: TextField(
+              controller: controller,
+              enabled: enabled,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+              decoration: InputDecoration(
+                hintText: hint,
+                hintStyle: TextStyle(color: Colors.white.withOpacity(0.35), fontSize: 12),
+                border: InputBorder.none,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                isDense: true,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        GestureDetector(
+          onTap: onPressed,
+          child: AnimatedOpacity(
+            opacity: enabled ? 1.0 : 0.35,
+            duration: const Duration(milliseconds: 200),
+            child: Container(
+              height: 38,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.85),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: accentColor.withOpacity(0.5)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(buttonIcon, color: accentColor, size: 15),
+                  const SizedBox(width: 5),
+                  Text(
+                    buttonLabel,
+                    style: TextStyle(
+                      color: accentColor,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTestActionButton({
+    required String label,
+    required IconData icon,
+    required Color color,
+    required Color accentColor,
+    VoidCallback? onPressed,
+  }) {
+    final enabled = onPressed != null;
+    return GestureDetector(
+      onTap: onPressed,
+      child: AnimatedOpacity(
+        opacity: enabled ? 1.0 : 0.35,
+        duration: const Duration(milliseconds: 200),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.75),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: accentColor.withOpacity(0.4)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, color: accentColor, size: 16),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    color: accentColor,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ─── Status bar + controles existentes ───────────────────
+
   Widget _buildStatusBar() {
-    final isConnected = _unityBridge.isReady;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Row(
@@ -412,27 +950,32 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             ),
           ),
           const Spacer(),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.black.withOpacity(0.65),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.view_in_ar,
-                  color: isConnected ? Colors.greenAccent : Colors.orange,
-                  size: 14,
+          ValueListenableBuilder<bool>(
+            valueListenable: _unityBridge.isReadyNotifier,
+            builder: (context, isConnected, _) {
+              return Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.65),
+                  borderRadius: BorderRadius.circular(20),
                 ),
-                const SizedBox(width: 6),
-                Text(
-                  isConnected ? 'AR Activo' : 'AR Cargando',
-                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.view_in_ar,
+                      color: isConnected ? Colors.greenAccent : Colors.orange,
+                      size: 14,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      isConnected ? 'AR Activo' : 'AR Cargando',
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                  ],
                 ),
-              ],
-            ),
+              );
+            },
           ),
         ],
       ),
@@ -480,7 +1023,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: _history.take(3).map((item) {
-            final diff   = DateTime.now().difference(item.time);
+            final diff    = DateTime.now().difference(item.time);
             final timeStr = diff.inSeconds < 60
                 ? 'hace ${diff.inSeconds}s'
                 : 'hace ${diff.inMinutes}m';
@@ -573,39 +1116,55 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   Widget _buildSecondaryControls() {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 32),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-        children: [
-          _buildControlChip(
-            icon:  Icons.save_outlined,
-            label: 'Guardar',
-            // ✅ Usa saveSession del bridge v2
-            onTap: _unityBridge.isReady ? () => _unityBridge.saveSession() : null,
-          ),
-          _buildControlChip(
-            icon:  Icons.folder_open_outlined,
-            label: 'Cargar',
-            // ✅ Usa loadSession del bridge v2
-            onTap: _unityBridge.isReady ? () => _unityBridge.loadSession() : null,
-          ),
-          _buildControlChip(
-            icon:  Icons.list_alt_rounded,
-            label: 'Balizas',
-            // ✅ NUEVO: consultar waypoints disponibles en Unity
-            onTap: _unityBridge.isReady ? () => _unityBridge.listWaypoints() : null,
-          ),
-          _buildControlChip(
-            icon:  Icons.refresh_rounded,
-            label: 'Reset',
-            onTap: () {
-              _coordinator.reset();
-              setState(() {
-                _currentIntent = null;
-                _history.clear();
-              });
-            },
-          ),
-        ],
+      child: ValueListenableBuilder<bool>(
+        valueListenable: _unityBridge.isReadyNotifier,
+        builder: (context, isReady, _) {
+          return Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _buildControlChip(
+                icon:  Icons.save_outlined,
+                label: 'Guardar',
+                onTap: isReady ? () {
+                  _unityBridge.saveSession();
+                  _showSnackBar('💾 Guardando sesión...');
+                  HapticFeedback.lightImpact();
+                } : null,
+              ),
+              _buildControlChip(
+                icon:  Icons.folder_open_outlined,
+                label: 'Cargar',
+                onTap: isReady ? () {
+                  _unityBridge.loadSession();
+                  _showSnackBar('📂 Cargando sesión...');
+                  HapticFeedback.lightImpact();
+                } : null,
+              ),
+              _buildControlChip(
+                icon:  Icons.list_alt_rounded,
+                label: 'Balizas',
+                onTap: isReady ? () {
+                  _unityBridge.listWaypoints();
+                  _showSnackBar('📍 Consultando balizas...');
+                  HapticFeedback.lightImpact();
+                } : null,
+              ),
+              _buildControlChip(
+                icon:  Icons.refresh_rounded,
+                label: 'Reset',
+                onTap: () {
+                  _coordinator.reset();
+                  setState(() {
+                    _currentIntent = null;
+                    _history.clear();
+                  });
+                  _showSnackBar('🔄 Sistema reiniciado');
+                  HapticFeedback.mediumImpact();
+                },
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -618,14 +1177,17 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     final enabled = onTap != null;
     return GestureDetector(
       onTap: onTap,
-      child: Opacity(
+      child: AnimatedOpacity(
         opacity: enabled ? 1.0 : 0.4,
+        duration: const Duration(milliseconds: 300),
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
             color: Colors.black.withOpacity(0.65),
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: Colors.white24),
+            border: Border.all(
+              color: enabled ? Colors.white38 : Colors.white24,
+            ),
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,

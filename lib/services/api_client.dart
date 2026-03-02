@@ -181,40 +181,76 @@ class ApiClient {
     try {
       final Map<String, dynamic> jsonResponse = jsonDecode(response.body);
 
-      // Manejar errores HTTP
+      // ── Error HTTP (4xx / 5xx) ──────────────────────────────────────────
       if (response.statusCode >= 400) {
         return ApiResponse<T>(
           success: false,
           message: jsonResponse['message'] ?? 'Error del servidor',
           messageType: jsonResponse['message_type'] ?? 'error',
           accessibilityInfo: jsonResponse['accessibility_info'] != null
-              ? AccessibilityInfo.fromJson(jsonResponse['accessibility_info'])
+              ? AccessibilityInfo.fromJson(
+              jsonResponse['accessibility_info'] as Map<String, dynamic>)
               : null,
           errors: jsonResponse['errors'] != null
               ? (jsonResponse['errors'] as List)
-              .map((e) => ApiError.fromJson(e))
+              .map((e) => ApiError.fromJson(e as Map<String, dynamic>))
               .toList()
               : null,
         );
       }
 
-      // Respuesta exitosa
+      // ── FIX: El servidor devuelve HTTP 200 con success:false ────────────
+      // Antes solo se revisaba el statusCode, por lo que success:false con
+      // HTTP 200 entraba al bloque "exitoso" e intentaba parsear data:{}
+      // como un modelo tipado, causando crashes o sesiones no guardadas.
+      final bool isSuccess = jsonResponse['success'] == true;
+
+      if (!isSuccess) {
+        return ApiResponse<T>(
+          success: false,
+          message: jsonResponse['message'] ?? 'Error desconocido',
+          messageType: jsonResponse['message_type'] ?? 'error',
+          accessibilityInfo: jsonResponse['accessibility_info'] != null
+              ? AccessibilityInfo.fromJson(
+              jsonResponse['accessibility_info'] as Map<String, dynamic>)
+              : null,
+          errors: jsonResponse['errors'] != null
+              ? (jsonResponse['errors'] as List)
+              .map((e) => ApiError.fromJson(e as Map<String, dynamic>))
+              .toList()
+              : null,
+          timestamp: jsonResponse['timestamp'] as String?,
+        );
+      }
+
+      // ── Respuesta exitosa: parsear data ────────────────────────────────
+      // FIX: Se pasa jsonResponse['data'] al fromJson (no el JSON completo).
+      // El fromJson de cada servicio debe trabajar directamente con `data`,
+      // no buscar map['data'] dentro de él.
+      T? parsedData;
+      if (fromJson != null) {
+        final rawData = jsonResponse['data'];
+        // Solo parsear si data no es null y no es un mapa vacío
+        if (rawData != null && !(rawData is Map && rawData.isEmpty)) {
+          parsedData = fromJson(rawData);
+        }
+      }
+
       return ApiResponse<T>(
-        success: jsonResponse['success'] ?? true,
+        success: true,
         message: jsonResponse['message'] ?? '',
         messageType: jsonResponse['message_type'],
-        data: jsonResponse['data'] != null && fromJson != null
-            ? fromJson(jsonResponse['data'])
-            : null,
+        data: parsedData,
         accessibilityInfo: jsonResponse['accessibility_info'] != null
-            ? AccessibilityInfo.fromJson(jsonResponse['accessibility_info'])
+            ? AccessibilityInfo.fromJson(
+            jsonResponse['accessibility_info'] as Map<String, dynamic>)
             : null,
         errors: jsonResponse['errors'] != null
             ? (jsonResponse['errors'] as List)
-            .map((e) => ApiError.fromJson(e))
+            .map((e) => ApiError.fromJson(e as Map<String, dynamic>))
             .toList()
             : null,
-        timestamp: jsonResponse['timestamp'],
+        timestamp: jsonResponse['timestamp'] as String?,
       );
     } catch (e) {
       debugPrint('❌ Error parseando respuesta: $e');
