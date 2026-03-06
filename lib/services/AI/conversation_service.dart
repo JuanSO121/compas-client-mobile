@@ -1,44 +1,44 @@
 // lib/services/AI/conversation_service.dart
-// ✅ v3 — Fix extracción de destino de navegación
+// ✅ v4 — Groq ahora conoce los waypoints reales de Unity
 //
-//  BUG CORREGIDO (v2 → v3):
-//  ──────────────────────────────────────────────────────────────────────────
-//  SÍNTOMA:
-//    Usuario: "guíame a la baliza creada"
-//    Groq responde: "Iniciando navegación a la baliza que acabas de crear. ¡Vamos!"
-//    _extractAction detecta "iniciando navegación" en el texto del bot.
-//    Extrae todo lo que viene después → "a la baliza que acabas de crear. ¡Vamos"
-//    Unity recibe navigate_to("a la baliza que acabas de crear. ¡Vamos")
-//    Unity: No encontré 'a la baliza que acabas de crear. ¡Vamos' ← ERROR
+//  CAMBIOS v3 → v4:
+//  ─────────────────────────────────────────────────────────────────────────
+//  PROBLEMA CORREGIDO:
+//    Usuario: "guíame a la habitación"
+//    Groq respondía: "No sé a qué habitación te refieres" ← INCORRECTO
+//    Pero el intent SÍ llegaba a Unity porque _extractAction lo detectaba
+//    del texto del usuario → NPC navegaba pero el TTS decía que no sabía.
 //
-//  CAUSA RAÍZ — dos problemas combinados:
+//  CAUSA RAÍZ:
+//    El system prompt de Groq no incluía la lista de waypoints existentes.
+//    Groq no podía confirmar, desambiguar ni rechazar destinos.
 //
-//  1) El system prompt NO le exigía al bot usar el nombre EXACTO del waypoint.
-//     Groq inventaba frases como "la baliza que acabas de crear" en vez de
-//     decir "Baliza 1" (el nombre real).
+//  FIX v4:
+//  1. WaypointContextService inyecta la lista real de waypoints en el prompt.
+//     Groq ahora ve: "BALIZAS DISPONIBLES: Habitación 1, Habitación 2, Baño"
+//     y puede responder correctamente:
+//     → "Navegando a Habitación 1." (si hay una sola habitación)
+//     → "Hay dos habitaciones: 1 y 2. ¿A cuál?" (si hay ambigüedad)
+//     → "No tengo baliza 'cocina'. Destinos disponibles: [lista]" (si no existe)
 //
-//  2) _cleanDestination no limitaba la longitud del destino extraído.
-//     Si el bot decía una frase larga, se pasaba entera a Unity.
+//  2. _resolveTarget() resuelve el target extraído contra la lista real ANTES
+//     de enviarlo a Unity — garantiza que Unity recibe el nombre exacto.
+//     Ejemplo: usuario dice "habitación" → extracción da "habitación" →
+//     resolveTarget("habitación") devuelve "Habitación 1" (de la lista real).
 //
-//  FIX:
-//  1) System prompt: instrucción explícita de usar SIEMPRE el nombre exacto
-//     del waypoint tal como el usuario lo mencionó, en las confirmaciones.
-//     El bot DEBE responder: "Navegando a Baliza 1." — no parafrasear.
+//  3. Si WaypointContextService no tiene datos aún (primer arranque),
+//     el prompt instruye a Groq a pedir lista antes de navegar.
 //
-//  2) _extractNavigateTarget() reemplaza la extracción inline de navigate:
-//     - Busca el nombre en la respuesta del bot comparando con el mensaje
-//       del usuario (fuente más confiable del nombre real)
-//     - Limita a máx. 50 chars (los nombres de waypoints son cortos)
-//     - Prioriza extraer desde el mensaje del usuario si el bot parafrasea
+//  INTEGRACIÓN REQUERIDA en ar_navigation_screen.dart v7:
+//    // En _setupUnityBridgeCallbacks():
+//    _unityBridge.onWaypointsReceived = (waypoints) {
+//      WaypointContextService().updateFromUnity(waypoints);  // ← AÑADIR
+//      // ... resto del callback
+//    };
+//    // En _initializeServices(), al final:
+//    if (_unityBridge.isReady) _unityBridge.listWaypoints();  // ← AÑADIR
 //
-//  FLUJO CORREGIDO:
-//    Usuario: "guíame a Baliza 1"
-//    Bot: "Navegando a Baliza 1 ahora mismo."
-//    _extractAction → navigate, target = "Baliza 1"   ✅
-//
-//    Usuario: "llévame a la baliza creada"  (nombre ambiguo)
-//    Bot: "Navegando a Baliza 1."  ← el prompt lo fuerza a usar nombre exacto
-//    _extractAction → navigate, target = "Baliza 1"   ✅
+//  TODO LO DEMÁS ES IDÉNTICO A v3.
 
 import 'dart:async';
 import 'package:logger/logger.dart';
@@ -46,6 +46,7 @@ import 'package:logger/logger.dart';
 import '../../models/shared_models.dart';
 import 'groq_service.dart';
 import 'ai_mode_controller.dart';
+import 'waypoint_context_service.dart'; // ✅ v4
 
 // ─── Tipos de respuesta ───────────────────────────────────────────────────────
 
@@ -80,9 +81,11 @@ class ConversationService {
   factory ConversationService() => _instance;
   ConversationService._internal();
 
-  final Logger           _logger           = Logger();
-  final GroqService      _groqService      = GroqService();
-  final AIModeController _aiModeController = AIModeController();
+  final Logger                _logger           = Logger();
+  final GroqService           _groqService      = GroqService();
+  final AIModeController      _aiModeController = AIModeController();
+  // ✅ v4: contexto de waypoints reales
+  final WaypointContextService _waypointContext = WaypointContextService();
 
   final List<ChatMessage> _conversationHistory = [];
   static const int _maxHistory = 20;
@@ -133,17 +136,22 @@ class ConversationService {
             ? _conversationHistory.sublist(0, _conversationHistory.length - 1)
             : [],
         maxTokens: 350,
-        systemPrompt: _buildSystemPrompt(),
+        systemPrompt: _buildSystemPrompt(), // ✅ v4: incluye waypoints
       );
 
       _addToHistory('assistant', response.content);
 
-      final (action, target) = _extractAction(response.content, userMessage);
+      final (action, rawTarget) = _extractAction(response.content, userMessage);
 
       if (action != _UnityAction.none) {
-        final intent = _buildIntent(action, target);
+        // ✅ v4: Resolver el target contra la lista real de waypoints
+        final resolvedTarget = action == _UnityAction.navigate
+            ? _resolveTarget(rawTarget)
+            : rawTarget;
+
+        final intent = _buildIntent(action, resolvedTarget);
         if (intent != null) {
-          _logger.i('💬🎯 Intent: $action → "$target"');
+          _logger.i('💬🎯 Intent: $action → raw="$rawTarget" → resolved="$resolvedTarget"');
           return ChatbotResponse(
             type:       ResponseType.conversationWithIntent,
             message:    response.content,
@@ -165,16 +173,54 @@ class ConversationService {
     }
   }
 
+  // ─── Resolución de target ────────────────────────────────────────────────
+  //
+  // ✅ v4: Resuelve el nombre extraído al nombre exacto de la lista Unity.
+  //
+  // Ejemplos:
+  //   "habitación"  → "Habitación 1"  (si es el único match)
+  //   "Habitación 1" → "Habitación 1" (match exacto, sin cambio)
+  //   "baño"        → "Baño"          (normaliza capitalización)
+  //   "cocina"      → "cocina"        (no hay match → se manda tal cual,
+  //                                    Unity responderá que no existe)
+
+  String _resolveTarget(String rawTarget) {
+    if (rawTarget.isEmpty) return rawTarget;
+
+    // Si no tenemos contexto de waypoints, devolver tal cual
+    if (!_waypointContext.hasWaypoints) {
+      _logger.d('[Resolve] Sin contexto de waypoints, usando raw: "$rawTarget"');
+      return rawTarget;
+    }
+
+    final resolved = _waypointContext.resolveTarget(rawTarget);
+    if (resolved != null && resolved != rawTarget) {
+      _logger.i('[Resolve] "$rawTarget" → "$resolved" (de lista Unity)');
+      return resolved;
+    }
+
+    // Sin match claro: devolver raw capitalizado
+    if (rawTarget.isNotEmpty) {
+      final capitalized = rawTarget[0].toUpperCase() + rawTarget.substring(1);
+      if (capitalized != rawTarget) {
+        _logger.d('[Resolve] Capitalizado: "$rawTarget" → "$capitalized"');
+        return capitalized;
+      }
+    }
+
+    return rawTarget;
+  }
+
   // ─── System prompt ───────────────────────────────────────────────────────
   //
-  // ✅ FIX v3: Regla crítica añadida al prompt:
-  //   "CONFIRMACIÓN DE NAVEGACIÓN — usa SIEMPRE el nombre EXACTO"
-  //
-  // El problema anterior era que Groq parafraseaba: "Navegando a la baliza
-  // que acabas de crear" → la extracción obtenía la frase larga.
-  // Ahora el prompt le exige: "Navegando a [NombreExacto]." punto.
+  // ✅ v4: Ahora incluye la lista real de waypoints de Unity.
+  //        WaypointContextService.getContextForPrompt() genera el bloque
+  //        dinámicamente con las balizas actuales.
 
   String _buildSystemPrompt() {
+    // ✅ v4: Inyectar contexto de waypoints reales
+    final waypointContext = _waypointContext.getContextForPrompt();
+
     return '''Eres COMPAS, asistente de navegación indoor amigable y conversacional.
 
 PERSONALIDAD:
@@ -188,30 +234,39 @@ Ayudas al usuario a moverse dentro de un edificio usando balizas (waypoints).
 Puedes: navegar a un destino, detener la navegación, listar destinos disponibles,
 crear/eliminar balizas, guardar y cargar sesiones.
 
+$waypointContext
+
 ══════════════════════════════════════════════════════════════════
 REGLA CRÍTICA — CONFIRMACIÓN DE NAVEGACIÓN:
 
-Cuando el usuario pida ir a un destino, tu confirmación DEBE usar
-el NOMBRE EXACTO que el usuario mencionó, sin parafrasear.
+Cuando el usuario pida ir a un destino:
+1. Verifica si existe en la lista de BALIZAS DISPONIBLES (arriba).
+2. Si existe con ese nombre o uno similar → confirma usando el nombre EXACTO de la lista.
+3. Si hay varios destinos similares → pregunta cuál antes de navegar.
+4. Si NO existe → avisa y sugiere los disponibles.
+5. NUNCA digas "no sé a qué destino te refieres" si la lista no está vacía —
+   en su lugar, mapea la descripción al destino más probable o pregunta.
+
+Tu confirmación DEBE usar el nombre EXACTO de la lista, sin parafrasear.
 
 ✅ CORRECTO:
-  Usuario: "llévame a Baliza 1"
-  Tú: "Navegando a Baliza 1."
-
-  Usuario: "ir a la sala 101"
-  Tú: "Navegando a Sala 101."
+  Lista tiene: "Habitación 1", "Baño", "Sala Principal"
+  Usuario: "llévame a la habitación"
+  Tú: "Navegando a Habitación 1."
 
   Usuario: "quiero ir al baño"
   Tú: "Navegando a Baño."
 
-❌ INCORRECTO — NUNCA hagas esto:
-  "Iniciando navegación a la baliza que acabas de crear."
-  "Voy hacia el destino que mencionaste."
-  "Te llevo al lugar que me indicaste."
+  Usuario: "habitaciones" (hay Habitación 1 y Habitación 2)
+  Tú: "Hay dos habitaciones: Habitación 1 y Habitación 2. ¿A cuál quieres ir?"
 
-Si el usuario describe un destino en lugar de nombrarlo
-("la baliza que creé", "el último punto", "el sitio de antes"),
-pregunta cuál es el nombre exacto antes de navegar.
+  Usuario: "llévame a la cocina" (no existe en la lista)
+  Tú: "No tengo una baliza llamada cocina. Los destinos disponibles son: Habitación 1, Baño, Sala Principal."
+
+❌ INCORRECTO — NUNCA hagas esto:
+  "No sé a qué habitación te refieres."  ← si solo hay una, ve ahí
+  "Iniciando navegación a la baliza que acabas de crear."  ← parafraseo
+  "Voy hacia el destino que mencionaste."  ← sin nombre concreto
 
 ══════════════════════════════════════════════════════════════════
 
@@ -230,14 +285,12 @@ EJEMPLOS COMPLETOS:
 • Usuario: "llévame al baño"
   Tú: "¡Claro! Navegando a Baño."
 
-• Usuario: "quiero ir a la sala de reuniones"
-  Tú: "Perfecto. Navegando a Sala de Reuniones."
-
 • Usuario: "para la navegación"
   Tú: "Entendido. Deteniendo la navegación."
 
 • Usuario: "¿qué balizas hay?" / "¿qué destinos hay?"
   Tú: "Consultando los destinos disponibles."
+  (NO listes los destinos tú mismo — deja que el sistema los muestre)
 
 • Usuario: "guarda esto como sala principal"
   Tú: "Creando una baliza llamada Sala Principal."
@@ -260,7 +313,8 @@ CONVERSACIÓN GENERAL:
   Tú: "Puedo guiarte por el edificio. Dime el nombre de un destino y te llevo."
 
 RECUERDA:
-- Si no sabes el nombre exacto del destino, pregunta antes de confirmar
+- Usa SIEMPRE los nombres de la lista para confirmar navegación
+- Si no hay balizas, díselo al usuario amablemente
 - NO uses listas con viñetas en respuestas conversacionales
 - Respuestas breves y directas siempre''';
   }
@@ -320,20 +374,6 @@ RECUERDA:
     }
 
     // ── NAVIGATE ─────────────────────────────────────────────────────────
-    //
-    // ✅ FIX v3: _extractNavigateTarget() en lugar de extracción inline.
-    //
-    // Antes (v2):
-    //   Buscaba "navegando a " en el bot y tomaba todo lo que seguía.
-    //   Si el bot decía "Iniciando navegación a la baliza que acabas de crear.
-    //   ¡Vamos!" → target = "A la baliza que acabas de crear. ¡Vamos"  ← MALO
-    //
-    // Ahora (v3):
-    //   1. Busca el patrón "Navegando a [NombreCorto]." que el prompt fuerza
-    //   2. Limita el nombre a máx. 50 chars (los nombres son cortos)
-    //   3. Si el bot parafrasea igualmente, intenta extraer el nombre
-    //      directamente del mensaje del usuario (más confiable)
-
     final navPhrases = [
       'navegando a ',
       'voy a navegar hacia ',
@@ -344,8 +384,6 @@ RECUERDA:
       'me dirijo hacia ',
       'iniciando ruta a ',
       'iniciando ruta hacia ',
-      // Las siguientes son frases largas del bot que debemos reconocer
-      // aunque el nombre no venga inmediatamente después:
       'iniciando navegación a ',
       'iniciando navegación hacia ',
       'navego a ',
@@ -362,9 +400,7 @@ RECUERDA:
     return (_UnityAction.none, '');
   }
 
-  // ─── Extracción de destino de navegación ─────────────────────────────────
-  //
-  // ✅ FIX v3: lógica separada con límite de longitud y fallback al usuario.
+  // ─── Extracción de destino de navegación (v3, sin cambios) ──────────────
 
   String? _extractNavigateTarget(
       String botLower,
@@ -377,12 +413,7 @@ RECUERDA:
     for (final phrase in phrases) {
       final idx = botLower.indexOf(phrase);
       if (idx >= 0) {
-        final afterLower    = botLower.substring(idx + phrase.length).trim();
         final afterOriginal = botOriginal.substring(idx + phrase.length).trim();
-
-        // Limpiar y verificar longitud máxima
-        // Los nombres de waypoints son cortos (< 50 chars)
-        // Si es más largo, el bot probablemente está parafraseando
         final cleaned = _cleanDestination(afterOriginal);
         if (cleaned.isNotEmpty && cleaned.length <= 50) {
           _logger.d('🎯 Navigate (bot): "$phrase" → "$cleaned"');
@@ -390,13 +421,12 @@ RECUERDA:
         } else if (cleaned.length > 50) {
           _logger.d('🎯 Navigate bot-phrase demasiado larga (${cleaned.length} chars), '
               'intentando extraer desde usuario...');
-          break; // Salir del loop y probar con el usuario
+          break;
         }
       }
     }
 
-    // 2. Fallback: extraer destino directamente del mensaje del usuario
-    //    Este es más confiable porque el usuario dice el nombre real
+    // 2. Fallback: extraer del mensaje del usuario
     final userNavPhrases = [
       'llévame a ', 'llevame a ', 'llévame al ', 'llevame al ',
       'llévame a la ', 'llevame a la ',
@@ -448,8 +478,10 @@ RECUERDA:
     for (final phrase in navPhrases) {
       final idx = user.indexOf(phrase);
       if (idx >= 0) {
-        final dest = _cleanDestination(userMessage.substring(idx + phrase.length));
-        if (dest.isNotEmpty) {
+        final rawDest = _cleanDestination(userMessage.substring(idx + phrase.length));
+        if (rawDest.isNotEmpty) {
+          // ✅ v4: también resolver en modo offline
+          final dest = _resolveTarget(rawDest);
           return ChatbotResponse(
             type: ResponseType.offlineCommand,
             message: 'Navegando a $dest.',
@@ -501,7 +533,14 @@ RECUERDA:
       return 'Bien, aunque sin internet. Dime a dónde quieres ir.';
     }
     if (user.contains('qué puedes') || user.contains('que puedes')) {
-      return 'Sin internet solo proceso comandos básicos: "llévame a [nombre]", "para", "qué balizas hay".';
+      // ✅ v4: listar waypoints disponibles si los tenemos
+      if (_waypointContext.hasWaypoints) {
+        final names = _waypointContext.navigableWaypoints
+            .map((w) => w.name)
+            .join(', ');
+        return 'Sin internet proceso comandos básicos. Destinos disponibles: $names.';
+      }
+      return 'Sin internet solo entiendo comandos básicos: "llévame a [nombre]", "para", "qué balizas hay".';
     }
     return 'Sin conexión solo entiendo comandos directos. Ejemplo: "llévame al baño".';
   }
@@ -591,16 +630,9 @@ RECUERDA:
     return null;
   }
 
-  /// Limpia el texto extraído para obtener un nombre de destino válido.
-  ///
-  /// ✅ FIX v3: Añade límite de 50 palabras antes de la primera pausa
-  /// (coma, punto, exclamación) para evitar capturar frases largas del bot.
   String _cleanDestination(String raw) {
     var s = raw.trim();
 
-    // ── 1. Cortar en la primera puntuación de pausa ───────────────────
-    // Esto previene capturar "la baliza que creé. ¡Vamos!" completo.
-    // Delimitadores: . ! ? , ; : — ( [ "
     for (final char in ['.', '!', '?', ',', ';', ':', '—', '(', '[', '"']) {
       final idx = s.indexOf(char);
       if (idx > 0) {
@@ -608,21 +640,18 @@ RECUERDA:
       }
     }
 
-    // ── 2. Quitar artículos iniciales ─────────────────────────────────
     final articles = ['el ', 'la ', 'los ', 'las ', 'un ', 'una ', 'al ', 'del '];
     for (final art in articles) {
       if (s.toLowerCase().startsWith(art)) {
         s = s.substring(art.length).trim();
-        break; // Solo quitar uno
+        break;
       }
     }
 
-    // ── 3. Quitar puntuación final residual ───────────────────────────
     while (s.isNotEmpty && '.!?,;:'.contains(s[s.length - 1])) {
       s = s.substring(0, s.length - 1).trim();
     }
 
-    // ── 4. Capitalizar primera letra ──────────────────────────────────
     if (s.isNotEmpty) {
       s = s[0].toUpperCase() + s.substring(1);
     }
@@ -651,6 +680,8 @@ RECUERDA:
     'can_use_groq':        _aiModeController.canUseGroq(),
     'has_internet':        _aiModeController.hasInternet,
     'ai_mode':             _aiModeController.currentMode.name,
+    'waypoints_in_context': _waypointContext.count,         // ✅ v4
+    'waypoints_last_update': _waypointContext.lastUpdate?.toIso8601String(),
   };
 
   bool get isInitialized => _isInitialized;

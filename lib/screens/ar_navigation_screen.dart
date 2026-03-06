@@ -1,25 +1,33 @@
 // lib/screens/ar_navigation_screen.dart
-// ✅ v6 — Fix dos TTS + Fix Porcupine key agotada
+// ✅ v7 — Groq ahora conoce los waypoints reales de Unity
 //
-//  CAMBIOS v5 → v6:
+//  CAMBIOS v6 → v7:
 //  ─────────────────────────────────────────────────────────────────────────
-//  🐛 BUG 1 CORREGIDO: Doble instancia FlutterTts.
-//     VoiceNavigationService v3.0 ya no crea su propio FlutterTts.
-//     _initializeServices() ahora pasa el TTSService del coordinator a
-//     _voiceNav.initialize(ttsService). Un solo engine TTS en toda la app.
+//  PROBLEMA CORREGIDO:
+//    Usuario: "guíame a la habitación"
+//    Groq respondía: "No sé a qué habitación te refieres" ← INCORRECTO
+//    Mientras el NPC SÍ navegaba (intent detectado del texto del usuario).
+//    Resultado: TTS incoherente con la acción en pantalla.
 //
-//  🐛 BUG 2 CORREGIDO: Porcupine con key agotada bloqueaba el flujo.
-//     El coordinator ya maneja el fallo de Porcupine con _wakeWordAvailable=false
-//     y continúa en modo manual. En _initializeServices() ahora se muestra
-//     un mensaje claro en la UI cuando el wake word no está disponible, y
-//     el botón de voz funciona directamente sin necesitar "Oye COMPAS".
+//  FIX v7 — 3 cambios quirúrgicos:
 //
-//  ORDEN DE INICIALIZACIÓN (crítico):
-//    1. _coordinator.initialize()  ← inicializa TTSService internamente
-//    2. _voiceNav.initialize(ttsService)  ← recibe el TTSService ya listo
-//    3. _voiceNav.attachToUnityBridge(_unityBridge)  ← suscribe al stream
+//  1. _setupUnityBridgeCallbacks() — onWaypointsReceived:
+//     + _waypointContext.updateFromUnity(waypoints)   ← NUEVA LÍNEA
+//     ConversationService v4 inyecta esta lista en el prompt de Groq.
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v5.
+//  2. _initializeServices() — al final:
+//     + if (_unityBridge.isReady) _unityBridge.listWaypoints()  ← NUEVA
+//     Carga el contexto inicial si Unity ya estaba lista.
+//
+//  3. _onUnityCreated() — nuevo:
+//     + Future.delayed(800ms, () => _unityBridge.listWaypoints())  ← NUEVA
+//     Carga el contexto cuando Unity se conecta por primera vez.
+//     El delay de 800ms le da tiempo a Unity para inicializar sus managers.
+//
+//  4. Panel de testing — nuevo badge "WP N" y banner de estado del contexto.
+//     Muestra en verde qué waypoints conoce Groq, o aviso si aún no los tiene.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v6.
 
 import 'package:flutter/material.dart' hide NavigationMode;
 import 'package:flutter/semantics.dart';
@@ -30,6 +38,7 @@ import 'package:logger/logger.dart';
 import '../models/shared_models.dart';
 import '../services/AI/navigation_coordinator.dart';
 import '../services/AI/ai_mode_controller.dart';
+import '../services/AI/waypoint_context_service.dart'; // ✅ v7
 import '../services/unity_bridge_service.dart';
 import '../services/voice_navigation_service.dart';
 
@@ -48,6 +57,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   final AIModeController       _aiModeController = AIModeController();
   final UnityBridgeService     _unityBridge      = UnityBridgeService();
   final VoiceNavigationService _voiceNav         = VoiceNavigationService();
+  final WaypointContextService _waypointContext  = WaypointContextService(); // ✅ v7
   final Logger                 _logger           = Logger();
 
   // ─── Estado de voz ────────────────────────────────────────
@@ -142,6 +152,12 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _unityBridge.onWaypointsReceived = (waypoints) {
       if (!mounted) return;
       _logger.i('[Bridge] 📍 ${waypoints.length} waypoint(s) recibidos de Unity');
+
+      // ✅ v7: Actualizar contexto ANTES de leer nombres.
+      // ConversationService v4 inyecta esta lista en el prompt de Groq
+      // en el siguiente chat(), así Groq ya sabe qué destinos existen.
+      _waypointContext.updateFromUnity(waypoints);
+
       if (waypoints.isEmpty) {
         _coordinator.speak('No hay balizas guardadas todavía.');
         _showSnackBar('📍 No hay balizas aún');
@@ -153,24 +169,15 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     };
   }
 
-  // ✅ v6: Orden de inicialización corregido.
-  //   1. coordinator.initialize() → inicializa TTSService internamente
-  //   2. voiceNav.initialize(ttsService) → recibe el mismo TTSService
-  //   3. voiceNav.attachToUnityBridge() → suscribe al stream
-  //
-  // IMPORTANTE: _voiceNav.initialize() se llama DESPUÉS del coordinator
-  // para garantizar que TTSService ya esté listo.
   Future<void> _initializeServices() async {
     try {
       setState(() => _statusMessage = 'Inicializando...');
 
-      // ── 1. Inicializar sistema de reconocimiento de voz ─────────────────
       setState(() => _statusMessage = 'Inicializando voz...');
 
       await _aiModeController.initialize();
       _aiMode = _aiModeController.currentMode;
 
-      // Coordinator inicializa TTSService internamente
       await _coordinator.initialize();
       _wakeWordAvailable = _coordinator.wakeWordAvailable;
 
@@ -217,30 +224,30 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         if (mounted) setState(() => _aiMode = mode);
       };
 
-      // ── 2. Inicializar VoiceNavigationService con el TTSService compartido
-      //       DESPUÉS del coordinator para que TTSService ya esté listo.
       await _voiceNav.initialize(_coordinator.ttsService);
-
-      // ── 3. Suscribir al stream de Unity
       _voiceNav.attachToUnityBridge(_unityBridge);
 
-      _logger.i('[Screen] ✅ VoiceNavigationService v3.0 inicializado (TTSService compartido).');
+      _logger.i('[Screen] ✅ VoiceNavigationService v3.0 inicializado.');
 
-      // ── Mensaje de estado según disponibilidad de wake word ─────────────
       String readyMessage;
       if (_wakeWordAvailable) {
         readyMessage = '✅ Di "Oye COMPAS"';
       } else {
         readyMessage = '✅ Presiona para hablar';
-        // Informar al usuario si la key de Porcupine está agotada
-        _logger.w('[Screen] ⚠️ Wake word no disponible. '
-            'Verifica tu Picovoice Access Key en console.picovoice.ai');
+        _logger.w('[Screen] ⚠️ Wake word no disponible.');
       }
 
       setState(() {
         _isInitialized = true;
         _statusMessage = readyMessage;
       });
+
+      // ✅ v7: Cargar contexto de waypoints si Unity ya está lista.
+      // Si Unity no está lista aún, se carga en _onUnityCreated().
+      if (_unityBridge.isReady) {
+        _logger.i('[Screen] 📍 Unity lista, solicitando waypoints para contexto Groq...');
+        _unityBridge.listWaypoints();
+      }
 
     } catch (e) {
       _logger.e('[Screen] Error inicializando servicios: $e');
@@ -257,10 +264,18 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
   void _onUnityCreated(UnityWidgetController controller) {
     _unityBridge.setController(controller);
-    // ✅ v6: pasar el controller a VoiceNavigationService para postMessage
     _voiceNav.setUnityController(controller);
     setState(() => _unityLoaded = true);
     _logger.i('✅ Unity AR lista');
+
+    // ✅ v7: Solicitar waypoints para el contexto de Groq.
+    // Delay de 800ms para que WaypointManager de Unity termine de inicializar.
+    Future.delayed(const Duration(milliseconds: 800), () {
+      if (mounted && _unityBridge.isReady) {
+        _logger.i('[Screen] 📍 Cargando contexto inicial de waypoints...');
+        _unityBridge.listWaypoints();
+      }
+    });
   }
 
   void _onUnityMessage(message) {
@@ -455,6 +470,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _aiModeController.dispose();
     _unityBridge.dispose();
     _voiceNav.dispose();
+    _waypointContext.dispose(); // ✅ v7
     super.dispose();
   }
 
@@ -466,7 +482,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // ── Capa 1: Unity AR (fondo completo) ──────────────
           Positioned.fill(
             child: UnityWidget(
               onUnityCreated:        _onUnityCreated,
@@ -476,7 +491,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             ),
           ),
 
-          // ── Capa 2: Splash mientras carga Unity ─────────────
           if (!_unityLoaded)
             Container(
               color: const Color(0xFF00162D),
@@ -486,19 +500,15 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   children: [
                     CircularProgressIndicator(color: Color(0xFFFF6B00)),
                     SizedBox(height: 16),
-                    Text(
-                      'Cargando AR...',
-                      style: TextStyle(color: Colors.white, fontSize: 18),
-                    ),
+                    Text('Cargando AR...',
+                        style: TextStyle(color: Colors.white, fontSize: 18)),
                   ],
                 ),
               ),
             ),
 
-          // ── Capa 3: Overlay de voz ───────────────────────────
           if (_unityLoaded && _showVoiceOverlay) _buildVoiceOverlay(),
 
-          // ── Capa 4: Botón toggle overlay ─────────────────────
           if (_unityLoaded)
             Positioned(
               top:   MediaQuery.of(context).padding.top + 8,
@@ -506,7 +516,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               child: _buildToggleOverlayButton(),
             ),
 
-          // ── Capa 5: Botón TEST ────────────────────────────────
           if (_unityLoaded)
             Positioned(
               bottom: MediaQuery.of(context).padding.bottom + 24,
@@ -514,7 +523,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               child: _buildTestButton(),
             ),
 
-          // ── Capa 6: Panel de testing ──────────────────────────
           if (_unityLoaded)
             AnimatedBuilder(
               animation: _testPanelAnimation,
@@ -577,8 +585,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           children: [
             Icon(
               _showVoiceOverlay ? Icons.visibility_off : Icons.mic,
-              color: Colors.white,
-              size: 16,
+              color: Colors.white, size: 16,
             ),
             const SizedBox(width: 6),
             Text(
@@ -590,8 +597,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       ),
     );
   }
-
-  // ─── TEST BUTTON ──────────────────────────────────────────
 
   Widget _buildTestButton() {
     return GestureDetector(
@@ -605,19 +610,13 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               : Colors.black.withOpacity(0.72),
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-            color: _showTestPanel
-                ? const Color(0xFFCE93D8)
-                : Colors.white30,
+            color: _showTestPanel ? const Color(0xFFCE93D8) : Colors.white30,
             width: 1.5,
           ),
           boxShadow: _showTestPanel
-              ? [
-            BoxShadow(
+              ? [BoxShadow(
               color: const Color(0xFF7B1FA2).withOpacity(0.4),
-              blurRadius: 12,
-              spreadRadius: 2,
-            ),
-          ]
+              blurRadius: 12, spreadRadius: 2)]
               : [],
         ),
         child: Row(
@@ -632,12 +631,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             Text(
               _showTestPanel ? 'Cerrar' : 'TEST',
               style: TextStyle(
-                color: _showTestPanel
-                    ? const Color(0xFFCE93D8)
-                    : Colors.white70,
-                fontSize: 13,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0.5,
+                color: _showTestPanel ? const Color(0xFFCE93D8) : Colors.white70,
+                fontSize: 13, fontWeight: FontWeight.w700, letterSpacing: 0.5,
               ),
             ),
           ],
@@ -645,8 +640,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       ),
     );
   }
-
-  // ─── TEST PANEL ───────────────────────────────────────────
 
   Widget _buildTestPanel() {
     return ValueListenableBuilder<bool>(
@@ -662,13 +655,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             borderRadius: BorderRadius.circular(20),
             border: Border.all(
                 color: const Color(0xFF7B1FA2).withOpacity(0.6), width: 1.5),
-            boxShadow: [
-              BoxShadow(
-                color: const Color(0xFF7B1FA2).withOpacity(0.25),
-                blurRadius: 20,
-                spreadRadius: 2,
-              ),
-            ],
+            boxShadow: [BoxShadow(
+              color: const Color(0xFF7B1FA2).withOpacity(0.25),
+              blurRadius: 20, spreadRadius: 2,
+            )],
           ),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(20),
@@ -678,7 +668,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // ── Header ──────────────────────────────────
+                  // Header
                   Row(
                     children: [
                       Container(
@@ -687,36 +677,38 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                           color: const Color(0xFF7B1FA2).withOpacity(0.3),
                           borderRadius: BorderRadius.circular(8),
                         ),
-                        child: const Icon(
-                          Icons.bug_report_rounded,
-                          color: Color(0xFFCE93D8),
-                          size: 16,
-                        ),
+                        child: const Icon(Icons.bug_report_rounded,
+                            color: Color(0xFFCE93D8), size: 16),
                       ),
                       const SizedBox(width: 8),
-                      const Text(
-                        'Panel de Testing',
-                        style: TextStyle(
-                          color: Color(0xFFCE93D8),
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 0.3,
-                        ),
-                      ),
+                      const Text('Panel de Testing',
+                          style: TextStyle(
+                            color: Color(0xFFCE93D8), fontSize: 14,
+                            fontWeight: FontWeight.w700, letterSpacing: 0.3,
+                          )),
                       const Spacer(),
+                      // ✅ v7: badges AR, TTS y WP (waypoints en contexto)
                       Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           _buildStatusBadge(
-                            label: isReady ? 'AR ✓' : 'AR ⏳',
-                            active: isReady,
-                          ),
+                              label: isReady ? 'AR ✓' : 'AR ⏳',
+                              active: isReady),
                           const SizedBox(width: 4),
                           ValueListenableBuilder<bool>(
                             valueListenable: _voiceNav.isReadyNotifier,
                             builder: (_, ttsReady, __) => _buildStatusBadge(
-                              label: ttsReady ? 'TTS ✓' : 'TTS ⏳',
-                              active: ttsReady,
+                                label: ttsReady ? 'TTS ✓' : 'TTS ⏳',
+                                active: ttsReady),
+                          ),
+                          const SizedBox(width: 4),
+                          StreamBuilder<List<WaypointEntry>>(
+                            stream: _waypointContext.onWaypointsChanged,
+                            builder: (_, __) => _buildStatusBadge(
+                              label: _waypointContext.hasWaypoints
+                                  ? 'WP ${_waypointContext.count}'
+                                  : 'WP ⏳',
+                              active: _waypointContext.hasWaypoints,
                             ),
                           ),
                         ],
@@ -724,7 +716,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     ],
                   ),
 
-                  // ✅ v6: Banner de advertencia si wake word está inactivo
+                  // Banner wake word
                   if (!_wakeWordAvailable) ...[
                     const SizedBox(height: 10),
                     Container(
@@ -733,128 +725,174 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                       decoration: BoxDecoration(
                         color: Colors.orange.withOpacity(0.15),
                         borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                            color: Colors.orange.withOpacity(0.5)),
+                        border: Border.all(color: Colors.orange.withOpacity(0.5)),
                       ),
-                      child: Row(
+                      child: const Row(
                         children: [
-                          const Icon(Icons.warning_amber_rounded,
+                          Icon(Icons.warning_amber_rounded,
                               color: Colors.orange, size: 14),
-                          const SizedBox(width: 6),
-                          const Expanded(
-                            child: Text(
-                              'Wake word inactivo.\nRenueva tu Picovoice key.',
-                              style: TextStyle(
-                                  color: Colors.orange, fontSize: 11),
-                            ),
+                          SizedBox(width: 6),
+                          Expanded(
+                            child: Text('Wake word inactivo.\nRenueva tu Picovoice key.',
+                                style: TextStyle(color: Colors.orange, fontSize: 11)),
                           ),
                         ],
                       ),
                     ),
                   ],
 
+                  // ✅ v7: Banner de contexto Groq
+                  const SizedBox(height: 10),
+                  StreamBuilder<List<WaypointEntry>>(
+                    stream: _waypointContext.onWaypointsChanged,
+                    builder: (_, __) {
+                      if (!_waypointContext.hasWaypoints) {
+                        return Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 7),
+                          decoration: BoxDecoration(
+                            color: Colors.blue.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                          ),
+                          child: const Row(
+                            children: [
+                              Icon(Icons.info_outline,
+                                  color: Colors.lightBlueAccent, size: 13),
+                              SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  'Groq aún no conoce las balizas.\nPulsa "Listar balizas" para cargar.',
+                                  style: TextStyle(
+                                      color: Colors.lightBlueAccent, fontSize: 10),
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }
+                      final names = _waypointContext.navigableWaypoints
+                          .map((w) => w.name).join(', ');
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 7),
+                        decoration: BoxDecoration(
+                          color: Colors.green.withOpacity(0.08),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.green.withOpacity(0.3)),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.location_on,
+                                color: Colors.greenAccent, size: 13),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                'Groq conoce: $names',
+                                style: const TextStyle(
+                                    color: Colors.greenAccent, fontSize: 10),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+
                   const SizedBox(height: 14),
                   _testSectionDivider('NAVEGACIÓN'),
                   const SizedBox(height: 10),
-
                   _buildTestInputRow(
-                    controller:  _navigateTargetController,
-                    hint:        'Nombre del destino',
+                    controller: _navigateTargetController,
+                    hint: 'Nombre del destino',
                     buttonLabel: 'Navegar',
-                    buttonIcon:  Icons.navigation_rounded,
-                    color:       const Color(0xFF1565C0),
+                    buttonIcon: Icons.navigation_rounded,
+                    color: const Color(0xFF1565C0),
                     accentColor: const Color(0xFF64B5F6),
-                    onPressed:   isReady ? _testNavigateTo : null,
+                    onPressed: isReady ? _testNavigateTo : null,
                   ),
                   const SizedBox(height: 8),
                   _buildTestActionButton(
-                    label:       'Detener navegación',
-                    icon:        Icons.stop_circle_rounded,
-                    color:       const Color(0xFFB71C1C),
+                    label: 'Detener navegación',
+                    icon: Icons.stop_circle_rounded,
+                    color: const Color(0xFFB71C1C),
                     accentColor: const Color(0xFFEF9A9A),
-                    onPressed:   isReady ? _testStop : null,
+                    onPressed: isReady ? _testStop : null,
                   ),
 
                   const SizedBox(height: 14),
                   _testSectionDivider('BALIZAS'),
                   const SizedBox(height: 10),
-
                   _buildTestInputRow(
-                    controller:  _waypointNameController,
-                    hint:        'Nombre de la baliza',
+                    controller: _waypointNameController,
+                    hint: 'Nombre de la baliza',
                     buttonLabel: 'Crear',
-                    buttonIcon:  Icons.add_location_alt_rounded,
-                    color:       const Color(0xFF1B5E20),
+                    buttonIcon: Icons.add_location_alt_rounded,
+                    color: const Color(0xFF1B5E20),
                     accentColor: const Color(0xFFA5D6A7),
-                    onPressed:   isReady ? _testCreateWaypoint : null,
+                    onPressed: isReady ? _testCreateWaypoint : null,
                   ),
                   const SizedBox(height: 8),
                   _buildTestActionButton(
-                    label:       'Listar balizas',
-                    icon:        Icons.list_alt_rounded,
-                    color:       const Color(0xFF0E4749),
+                    label: 'Listar balizas',
+                    icon: Icons.list_alt_rounded,
+                    color: const Color(0xFF0E4749),
                     accentColor: const Color(0xFF80CBC4),
-                    onPressed:   isReady ? _testListWaypoints : null,
+                    onPressed: isReady ? _testListWaypoints : null,
                   ),
 
                   const SizedBox(height: 14),
                   _testSectionDivider('SESIÓN'),
                   const SizedBox(height: 10),
-
                   Row(
                     children: [
-                      Expanded(
-                        child: _buildTestActionButton(
-                          label:       'Guardar',
-                          icon:        Icons.save_rounded,
-                          color:       const Color(0xFF1A237E),
-                          accentColor: const Color(0xFF90CAF9),
-                          onPressed:   isReady ? _testSaveSession : null,
-                        ),
-                      ),
+                      Expanded(child: _buildTestActionButton(
+                        label: 'Guardar', icon: Icons.save_rounded,
+                        color: const Color(0xFF1A237E),
+                        accentColor: const Color(0xFF90CAF9),
+                        onPressed: isReady ? _testSaveSession : null,
+                      )),
                       const SizedBox(width: 8),
-                      Expanded(
-                        child: _buildTestActionButton(
-                          label:       'Cargar',
-                          icon:        Icons.folder_open_rounded,
-                          color:       const Color(0xFF1A237E),
-                          accentColor: const Color(0xFF90CAF9),
-                          onPressed:   isReady ? _testLoadSession : null,
-                        ),
-                      ),
+                      Expanded(child: _buildTestActionButton(
+                        label: 'Cargar', icon: Icons.folder_open_rounded,
+                        color: const Color(0xFF1A237E),
+                        accentColor: const Color(0xFF90CAF9),
+                        onPressed: isReady ? _testLoadSession : null,
+                      )),
                     ],
                   ),
                   const SizedBox(height: 8),
                   _buildTestActionButton(
-                    label:       'Estado de navegación',
-                    icon:        Icons.radar_rounded,
-                    color:       const Color(0xFF33691E),
+                    label: 'Estado de navegación',
+                    icon: Icons.radar_rounded,
+                    color: const Color(0xFF33691E),
                     accentColor: const Color(0xFFDCE775),
-                    onPressed:   isReady ? _testNavStatus : null,
+                    onPressed: isReady ? _testNavStatus : null,
                   ),
 
                   const SizedBox(height: 14),
                   _testSectionDivider('VOZ GPS'),
                   const SizedBox(height: 10),
-
                   ValueListenableBuilder<bool>(
                     valueListenable: _voiceNav.isReadyNotifier,
                     builder: (_, ttsReady, __) => Column(
                       children: [
                         _buildTestActionButton(
-                          label:       'Test instrucción de giro',
-                          icon:        Icons.turn_right_rounded,
-                          color:       const Color(0xFF4A148C),
+                          label: 'Test instrucción de giro',
+                          icon: Icons.turn_right_rounded,
+                          color: const Color(0xFF4A148C),
                           accentColor: const Color(0xFFCE93D8),
-                          onPressed:   ttsReady ? _testVoiceInstruction : null,
+                          onPressed: ttsReady ? _testVoiceInstruction : null,
                         ),
                         const SizedBox(height: 8),
                         _buildTestActionButton(
-                          label:       'Silenciar TTS',
-                          icon:        Icons.volume_off_rounded,
-                          color:       const Color(0xFF37474F),
+                          label: 'Silenciar TTS',
+                          icon: Icons.volume_off_rounded,
+                          color: const Color(0xFF37474F),
                           accentColor: const Color(0xFFB0BEC5),
-                          onPressed:   ttsReady ? () {
+                          onPressed: ttsReady ? () {
                             _voiceNav.stop();
                             _showSnackBar('🔇 TTS silenciado');
                           } : null,
@@ -866,11 +904,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   const SizedBox(height: 14),
                   _testSectionDivider('SISTEMA'),
                   const SizedBox(height: 10),
-
                   _buildTestActionButton(
-                    label:       'Reset completo',
-                    icon:        Icons.refresh_rounded,
-                    color:       const Color(0xFF4A148C),
+                    label: 'Reset completo',
+                    icon: Icons.refresh_rounded,
+                    color: const Color(0xFF4A148C),
                     accentColor: const Color(0xFFCE93D8),
                     onPressed: () {
                       _coordinator.reset();
@@ -887,7 +924,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                       HapticFeedback.mediumImpact();
                     },
                   ),
-
                   const SizedBox(height: 4),
                 ],
               ),
@@ -907,33 +943,22 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             : Colors.orange.withOpacity(0.2),
         borderRadius: BorderRadius.circular(7),
         border: Border.all(
-          color: active ? Colors.greenAccent : Colors.orange,
-          width: 0.8,
-        ),
+            color: active ? Colors.greenAccent : Colors.orange, width: 0.8),
       ),
-      child: Text(
-        label,
-        style: TextStyle(
-          color: active ? Colors.greenAccent : Colors.orange,
-          fontSize: 10,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
+      child: Text(label,
+          style: TextStyle(
+              color: active ? Colors.greenAccent : Colors.orange,
+              fontSize: 10, fontWeight: FontWeight.w600)),
     );
   }
 
   Widget _testSectionDivider(String label) {
     return Row(
       children: [
-        Text(
-          label,
-          style: const TextStyle(
-            color: Color(0xFF9E9E9E),
-            fontSize: 10,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 1.2,
-          ),
-        ),
+        Text(label,
+            style: const TextStyle(
+                color: Color(0xFF9E9E9E), fontSize: 10,
+                fontWeight: FontWeight.w700, letterSpacing: 1.2)),
         const SizedBox(width: 8),
         Expanded(child: Container(height: 0.5, color: Colors.white12)),
       ],
@@ -995,14 +1020,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 children: [
                   Icon(buttonIcon, color: accentColor, size: 15),
                   const SizedBox(width: 5),
-                  Text(
-                    buttonLabel,
-                    style: TextStyle(
-                      color: accentColor,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
+                  Text(buttonLabel,
+                      style: TextStyle(
+                          color: accentColor, fontSize: 12,
+                          fontWeight: FontWeight.w600)),
                 ],
               ),
             ),
@@ -1039,15 +1060,11 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               Icon(icon, color: accentColor, size: 16),
               const SizedBox(width: 8),
               Flexible(
-                child: Text(
-                  label,
-                  style: TextStyle(
-                    color: accentColor,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                  ),
-                  overflow: TextOverflow.ellipsis,
-                ),
+                child: Text(label,
+                    style: TextStyle(
+                        color: accentColor, fontSize: 12,
+                        fontWeight: FontWeight.w600),
+                    overflow: TextOverflow.ellipsis),
               ),
             ],
           ),
@@ -1055,8 +1072,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       ),
     );
   }
-
-  // ─── Status bar ───────────────────────────────────────────
 
   Widget _buildStatusBar() {
     return Padding(
@@ -1073,24 +1088,19 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               mainAxisSize: MainAxisSize.min,
               children: [
                 Container(
-                  width: 8,
-                  height: 8,
+                  width: 8, height: 8,
                   decoration: BoxDecoration(
                     color: _isActive ? Colors.greenAccent : Colors.grey,
                     shape: BoxShape.circle,
                   ),
                 ),
                 const SizedBox(width: 8),
-                Text(
-                  _statusMessage,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
+                Text(_statusMessage,
+                    style: const TextStyle(
+                        color: Colors.white, fontSize: 12,
+                        fontWeight: FontWeight.w600),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis),
               ],
             ),
           ),
@@ -1100,55 +1110,42 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             children: [
               ValueListenableBuilder<bool>(
                 valueListenable: _unityBridge.isReadyNotifier,
-                builder: (context, isConnected, _) {
-                  return Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 10, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.65),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          Icons.view_in_ar,
-                          color: isConnected
-                              ? Colors.greenAccent
-                              : Colors.orange,
-                          size: 14,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          isConnected ? 'AR Activo' : 'AR Cargando',
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 12),
-                        ),
-                      ],
-                    ),
-                  );
-                },
+                builder: (context, isConnected, _) => Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.65),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.view_in_ar,
+                          color: isConnected ? Colors.greenAccent : Colors.orange,
+                          size: 14),
+                      const SizedBox(width: 6),
+                      Text(isConnected ? 'AR Activo' : 'AR Cargando',
+                          style: const TextStyle(color: Colors.white, fontSize: 12)),
+                    ],
+                  ),
+                ),
               ),
               const SizedBox(width: 6),
               ValueListenableBuilder<bool>(
                 valueListenable: _voiceNav.isReadyNotifier,
-                builder: (_, ttsReady, __) {
-                  return Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 8, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.65),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Icon(
-                      ttsReady
-                          ? Icons.record_voice_over_rounded
-                          : Icons.voice_over_off_rounded,
-                      color: ttsReady ? Colors.greenAccent : Colors.grey,
-                      size: 14,
-                    ),
-                  );
-                },
+                builder: (_, ttsReady, __) => Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.65),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Icon(
+                    ttsReady
+                        ? Icons.record_voice_over_rounded
+                        : Icons.voice_over_off_rounded,
+                    color: ttsReady ? Colors.greenAccent : Colors.grey,
+                    size: 14,
+                  ),
+                ),
               ),
             ],
           ),
@@ -1172,14 +1169,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 color: Colors.white, size: 22),
             const SizedBox(width: 12),
             Expanded(
-              child: Text(
-                _currentIntent!.suggestedResponse,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
+              child: Text(_currentIntent!.suggestedResponse,
+                  style: const TextStyle(
+                      color: Colors.white, fontSize: 16,
+                      fontWeight: FontWeight.bold)),
             ),
           ],
         ),
@@ -1211,18 +1204,13 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                       color: Colors.white70, size: 14),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(
-                      item.intent.suggestedResponse,
+                    child: Text(item.intent.suggestedResponse,
+                        style: const TextStyle(color: Colors.white70, fontSize: 13),
+                        overflow: TextOverflow.ellipsis),
+                  ),
+                  Text(timeStr,
                       style: const TextStyle(
-                          color: Colors.white70, fontSize: 13),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  Text(
-                    timeStr,
-                    style:
-                    const TextStyle(color: Colors.white38, fontSize: 11),
-                  ),
+                          color: Colors.white38, fontSize: 11)),
                 ],
               ),
             );
@@ -1241,8 +1229,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           return Transform.scale(
             scale: _isActive ? _pulseAnimation.value : 1.0,
             child: Container(
-              width: 100,
-              height: 100,
+              width: 100, height: 100,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 color: !_isInitialized
@@ -1250,16 +1237,12 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     : (_isActive
                     ? const Color(0xFFE53935).withOpacity(0.9)
                     : const Color(0xFFFF6B00).withOpacity(0.9)),
-                boxShadow: [
-                  BoxShadow(
-                    color: (_isActive
-                        ? const Color(0xFFE53935)
-                        : const Color(0xFFFF6B00))
-                        .withOpacity(0.4),
-                    blurRadius: 24,
-                    spreadRadius: 4,
-                  ),
-                ],
+                boxShadow: [BoxShadow(
+                  color: (_isActive
+                      ? const Color(0xFFE53935)
+                      : const Color(0xFFFF6B00)).withOpacity(0.4),
+                  blurRadius: 24, spreadRadius: 4,
+                )],
               ),
               child: Stack(
                 alignment: Alignment.center,
@@ -1268,7 +1251,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     AnimatedBuilder(
                       animation: _waveAnimation,
                       builder: (context, _) => Container(
-                        width: 100 + (30 * _waveAnimation.value),
+                        width:  100 + (30 * _waveAnimation.value),
                         height: 100 + (30 * _waveAnimation.value),
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
@@ -1282,8 +1265,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     ),
                   Icon(
                     _isActive ? Icons.stop_rounded : Icons.mic_rounded,
-                    color: Colors.white,
-                    size: 46,
+                    color: Colors.white, size: 46,
                   ),
                 ],
               ),
@@ -1304,48 +1286,35 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
               _buildControlChip(
-                icon:  Icons.save_outlined,
-                label: 'Guardar',
-                onTap: isReady
-                    ? () {
+                icon: Icons.save_outlined, label: 'Guardar',
+                onTap: isReady ? () {
                   _unityBridge.saveSession();
                   _showSnackBar('💾 Guardando sesión...');
                   HapticFeedback.lightImpact();
-                }
-                    : null,
+                } : null,
               ),
               _buildControlChip(
-                icon:  Icons.folder_open_outlined,
-                label: 'Cargar',
-                onTap: isReady
-                    ? () {
+                icon: Icons.folder_open_outlined, label: 'Cargar',
+                onTap: isReady ? () {
                   _unityBridge.loadSession();
                   _showSnackBar('📂 Cargando sesión...');
                   HapticFeedback.lightImpact();
-                }
-                    : null,
+                } : null,
               ),
               _buildControlChip(
-                icon:  Icons.list_alt_rounded,
-                label: 'Balizas',
-                onTap: isReady
-                    ? () {
+                icon: Icons.list_alt_rounded, label: 'Balizas',
+                onTap: isReady ? () {
                   _unityBridge.listWaypoints();
                   _showSnackBar('📍 Consultando balizas...');
                   HapticFeedback.lightImpact();
-                }
-                    : null,
+                } : null,
               ),
               _buildControlChip(
-                icon:  Icons.refresh_rounded,
-                label: 'Reset',
+                icon: Icons.refresh_rounded, label: 'Reset',
                 onTap: () {
                   _coordinator.reset();
                   _voiceNav.stop();
-                  setState(() {
-                    _currentIntent = null;
-                    _history.clear();
-                  });
+                  setState(() { _currentIntent = null; _history.clear(); });
                   _showSnackBar('🔄 Sistema reiniciado');
                   HapticFeedback.mediumImpact();
                 },
@@ -1374,30 +1343,23 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             color: Colors.black.withOpacity(0.65),
             borderRadius: BorderRadius.circular(14),
             border: Border.all(
-              color: enabled ? Colors.white38 : Colors.white24,
-            ),
+                color: enabled ? Colors.white38 : Colors.white24),
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(icon, color: Colors.white, size: 22),
               const SizedBox(height: 4),
-              Text(
-                label,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
+              Text(label,
+                  style: const TextStyle(
+                      color: Colors.white, fontSize: 11,
+                      fontWeight: FontWeight.w600)),
             ],
           ),
         ),
       ),
     );
   }
-
-  // ─── Helpers ──────────────────────────────────────────────
 
   IconData _getIntentIcon(IntentType type) {
     return switch (type) {
@@ -1409,8 +1371,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     };
   }
 }
-
-// ─── Modelo interno ───────────────────────────────────────
 
 class _CommandItem {
   final NavigationIntent intent;
