@@ -55,6 +55,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name="com.unity3d.player.UnityPlayerGameActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|fontScale|layoutDirection|density" />
+
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

@@ -33,7 +33,6 @@ class _WelcomeScreenState extends State<WelcomeScreen>
 
     _fadeController.forward();
 
-    // Anuncio accesible con pequeño retraso para asegurar que se lea correctamente
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await Future.delayed(const Duration(milliseconds: 300));
       SemanticsService.announce(
@@ -91,26 +90,12 @@ class _WelcomeScreenState extends State<WelcomeScreen>
 
                 // LOGO PRINCIPAL
                 Semantics(
-                  label: 'Icono de la aplicación COMPAS',
-                  child: Container(
-                    width: 120,
-                    height: 120,
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.primary,
-                      shape: BoxShape.circle,
-                      boxShadow: [
-                        BoxShadow(
-                          color: theme.colorScheme.primary.withValues(alpha: 0.4),
-                          blurRadius: 30,
-                          spreadRadius: 8,
-                        ),
-                      ],
-                    ),
-                    child: const Icon(
-                      Icons.mic_rounded,
-                      size: 60,
-                      color: Colors.white,
-                    ),
+                  label: 'Logo de la aplicación COMPAS',
+                  child: Image.asset(
+                    'assets/images/compas_V3.png',
+                    width: 180,
+                    height: 180,
+                    fit: BoxFit.contain,
                   ),
                 ),
 
@@ -119,7 +104,7 @@ class _WelcomeScreenState extends State<WelcomeScreen>
                 // TÍTULO PRINCIPAL
                 Semantics(
                   header: true,
-                  label: 'Control de Voz',
+                  label: 'COMPAS',
                   child: Text(
                     'COMPAS',
                     style: theme.textTheme.titleLarge?.copyWith(
@@ -135,7 +120,7 @@ class _WelcomeScreenState extends State<WelcomeScreen>
 
                 // SUBTÍTULO
                 Semantics(
-                  label: 'Controla tu robot con tu voz',
+                  label: 'Tecnología que te escucha',
                   child: Text(
                     'Tecnología que te escucha',
                     style: theme.textTheme.bodyLarge?.copyWith(
@@ -177,41 +162,6 @@ class _WelcomeScreenState extends State<WelcomeScreen>
                 ),
 
                 const Spacer(),
-
-                // INDICADOR DE ACCESIBILIDAD
-                Semantics(
-                  label: 'Aplicación optimizada para accesibilidad',
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.secondaryContainer.withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(
-                        color: theme.colorScheme.secondaryContainer.withValues(alpha: 0.3),
-                        width: 2,
-                      ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          Icons.accessibility_new_rounded,
-                          size: 20,
-                          color: theme.colorScheme.secondary,
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Optimizado para accesibilidad',
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            color: theme.colorScheme.onSecondaryContainer,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
 
                 const SizedBox(height: 32),
               ],

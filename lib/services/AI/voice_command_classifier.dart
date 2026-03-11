@@ -275,8 +275,18 @@ class VoiceCommandClassifier {
           ..useNnApiForAndroid = false,
       );
 
-      final inputShape = _interpreter!.getInputTensor(0).shape;
-      final outputShape = _interpreter!.getOutputTensor(0).shape;
+      // 🔥 OBTENER TENSORES
+      final inputTensor = _interpreter!.getInputTensor(0);
+      final outputTensor = _interpreter!.getOutputTensor(0);
+
+      final inputShape = inputTensor.shape;
+      final outputShape = outputTensor.shape;
+
+      // 🔥 AGREGAR ESTOS LOGS
+      _logger.i('Input shape: $inputShape');
+      _logger.i('Input type: ${inputTensor.type}');
+      _logger.i('Output shape: $outputShape');
+      _logger.i('Output type: ${outputTensor.type}');
 
       if (inputShape[1] != _maxLength) {
         _logger.w('⚠️ Input shape mismatch: esperado $_maxLength, obtenido ${inputShape[1]}');

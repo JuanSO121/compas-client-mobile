@@ -35,7 +35,7 @@ class AuthService {
       final response = await _apiClient.post<Map<String, dynamic>>(
         ApiConfig.register,
         body: request.toJson(),
-        fromJson: (json) => json as Map<String, dynamic>,
+        fromJson: (data) => data as Map<String, dynamic>,
       );
 
       if (response.success) {
@@ -74,18 +74,17 @@ class AuthService {
       final response = await _apiClient.post<AuthData>(
         ApiConfig.login,
         body: request.toJson(),
-        fromJson: (json) => AuthData.fromJson(json as Map<String, dynamic>),
+        fromJson: (data) => AuthData.fromJson(data as Map<String, dynamic>),
       );
 
       if (response.success && response.data != null) {
-        // Guardar tokens
         await _tokenService.saveTokens(
           accessToken: response.data!.tokens.accessToken,
           refreshToken: response.data!.tokens.refreshToken,
           tokenType: response.data!.tokens.tokenType,
           expiresIn: response.data!.tokens.expiresIn,
         );
-        debugPrint('✅ Sesión iniciada exitosamente');
+        debugPrint('✅ Sesión iniciada y tokens guardados');
       }
 
       return response;
@@ -102,7 +101,10 @@ class AuthService {
     }
   }
 
-  // ===== LOGOUT =====
+  // ===== LOGOUT (completo: servidor + local) =====
+  // Usar este método cuando el usuario presiona "Cerrar sesión"
+  // manualmente desde la UI, ya que en ese caso sí tiene un
+  // access token válido para autenticar el request al servidor.
   Future<ApiResponse<void>> logout() async {
     try {
       debugPrint('👋 Cerrando sesión');
@@ -111,14 +113,12 @@ class AuthService {
         ApiConfig.logout,
       );
 
-      // Limpiar tokens locales independientemente de la respuesta del servidor
       await _tokenService.clearTokens();
       debugPrint('✅ Sesión cerrada exitosamente');
 
       return response;
     } catch (e) {
       debugPrint('❌ Error en logout: $e');
-      // Aún así limpiar tokens locales
       await _tokenService.clearTokens();
       return ApiResponse(
         success: true,
@@ -131,32 +131,64 @@ class AuthService {
     }
   }
 
+  // ===== LIMPIAR SESIÓN LOCAL (sin llamar al servidor) =====
+  // Usar cuando el refresh token falla o expira.
+  // NO llama al endpoint /logout del servidor porque:
+  //   1. El access token puede estar expirado (el servidor lo rechazaría)
+  //   2. Llamar /logout en este caso registraba un logout en los logs
+  //      del servidor justo después del refresh, confundiendo el flujo
+  //      y haciendo que la sesión pareciera no guardarse.
+  Future<void> clearLocalSession() async {
+    try {
+      await _tokenService.clearTokens();
+      debugPrint('🧹 Sesión local limpiada');
+    } catch (e) {
+      debugPrint('❌ Error limpiando sesión local: $e');
+    }
+  }
+
   // ===== RENOVAR TOKEN =====
   Future<ApiResponse<TokenPair>> refreshToken() async {
     try {
-      final refreshToken = await _tokenService.getRefreshToken();
-      if (refreshToken == null) {
-        throw Exception('No hay refresh token disponible');
+      final storedRefreshToken = await _tokenService.getRefreshToken();
+      if (storedRefreshToken == null) {
+        debugPrint('⚠️ No hay refresh token guardado');
+        return ApiResponse(
+          success: false,
+          message: 'No hay sesión activa',
+          accessibilityInfo: AccessibilityInfo(
+            announcement: 'Sesión no encontrada',
+            hapticPattern: 'warning',
+          ),
+        );
       }
 
       debugPrint('🔄 Renovando token');
 
       final response = await _apiClient.post<TokenPair>(
         ApiConfig.refreshToken,
-        body: {'refresh_token': refreshToken},
-        fromJson: (json) =>
-            TokenPair.fromJson((json as Map<String, dynamic>)['tokens']),
+        body: {'refresh_token': storedRefreshToken},
+        fromJson: (data) {
+          final map = data as Map<String, dynamic>;
+
+          // El backend retorna data: { tokens: { access_token, refresh_token, ... } }
+          if (map.containsKey('tokens')) {
+            return TokenPair.fromJson(map['tokens'] as Map<String, dynamic>);
+          }
+
+          // Fallback: si data es directamente el TokenPair
+          return TokenPair.fromJson(map);
+        },
       );
 
       if (response.success && response.data != null) {
-        // Guardar nuevos tokens
         await _tokenService.saveTokens(
           accessToken: response.data!.accessToken,
           refreshToken: response.data!.refreshToken,
           tokenType: response.data!.tokenType,
           expiresIn: response.data!.expiresIn,
         );
-        debugPrint('✅ Token renovado exitosamente');
+        debugPrint('✅ Token renovado y guardado');
       }
 
       return response;

@@ -20,7 +20,35 @@ pluginManagement {
 plugins {
     id("dev.flutter.flutter-plugin-loader") version "1.0.0"
     id("com.android.application") version "8.9.1" apply false
+    id("com.android.library") version "8.9.1" apply false
     id("org.jetbrains.kotlin.android") version "2.1.0" apply false
 }
 
 include(":app")
+include(":unityLibrary")
+include(":unityLibrary:xrmanifest.androidlib")
+
+project(":unityLibrary").projectDir = file("unityLibrary")
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        google()
+        mavenCentral()
+
+        // ✅ Flutter embedding (flutter_embedding_debug, etc.)
+        val flutterSdkPath = run {
+            val properties = java.util.Properties()
+            file("local.properties").inputStream().use { properties.load(it) }
+            properties.getProperty("flutter.sdk") ?: ""
+        }
+        if (flutterSdkPath.isNotEmpty()) {
+            maven { url = uri("https://storage.googleapis.com/download.flutter.io") }
+        }
+
+        // ✅ Unity libs locales
+        flatDir {
+            dirs("${project(":unityLibrary").projectDir}/libs")
+        }
+    }
+}

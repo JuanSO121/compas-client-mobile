@@ -13,12 +13,12 @@ android {
     ndkVersion = "28.2.13676358"
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     kotlinOptions {
-        jvmTarget = "11"
+        jvmTarget = "17"
     }
 
     defaultConfig {
@@ -69,6 +69,8 @@ flutter {
     source = "../.."
 }
 
+
+
 dependencies {
     // ═══════════════════════════════════════════════════════
     // ✅ GOOGLE AI EDGE (IA LOCAL - NPU)
@@ -97,6 +99,9 @@ dependencies {
     // ✅ UTILIDADES
     // ═══════════════════════════════════════════════════════
     implementation("com.google.code.gson:gson:2.10.1")
+
+    // ← Unity
+    implementation(project(":unityLibrary"))
 }
 
 // ═══════════════════════════════════════════════════════
@@ -109,3 +114,4 @@ configurations.all {
         force("androidx.core:core:1.13.1")
     }
 }
+

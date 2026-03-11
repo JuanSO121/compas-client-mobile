@@ -387,6 +387,15 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "4.2.5"
+  flutter_unity_widget:
+    dependency: "direct main"
+    description:
+      path: "."
+      ref: "experimental/unity_6000"
+      resolved-ref: "19fa91aed815520d22395a245eff8c3b241b5e61"
+      url: "https://github.com/juicycleff/flutter-unity-view-widget.git"
+    source: git
+    version: "6000.1.0"
   flutter_voice_processor:
     dependency: transitive
     description:
@@ -981,6 +990,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.1.1"
+  webview_flutter_platform_interface:
+    dependency: transitive
+    description:
+      name: webview_flutter_platform_interface
+      sha256: "63d26ee3aca7256a83ccb576a50272edd7cfc80573a4305caa98985feb493ee0"
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.14.0"
+  webview_flutter_web:
+    dependency: transitive
+    description:
+      name: webview_flutter_web
+      sha256: "18a7ccc1c31dd9a5c759a1b7217a2a1e04bd8f65712714a4070bfac19a23ca9e"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.2.3+4"
   win32:
     dependency: transitive
     description:

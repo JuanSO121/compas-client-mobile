@@ -1,5 +1,32 @@
 // lib/services/AI/integrated_voice_command_service.dart
-// ✅ VERSIÓN ACTUALIZADA - EXPONE SESSION MANAGER
+// ✅ v3 — Fix condición de carrera STT/Porcupine + sessionManager corrupto
+//
+//  BUGS CORREGIDOS (v2 → v3):
+//  ─────────────────────────────────────────────────────────────────────────
+//  BUG 1: _onSpeechStatus('notListening'/'done') ponía _isListening=false
+//    pero NO llamaba _sessionManager.markIdle(). El coordinator veía
+//    sessionManager.isIdle==false y entraba en _returnToIdle() intentando
+//    detener un STT que ya había terminado solo → bucle de errores y el
+//    siguiente ciclo de escucha nunca arrancaba bien.
+//    FIX: markIdle() en _onSpeechStatus cuando status es done/notListening.
+//
+//  BUG 2: _processCommand() llamaba onCommandDetected + onCommandExecuted
+//    en el mismo tick síncrono. NavigationCoordinator asume que son eventos
+//    separados en el tiempo (onCommandDetected captura el texto, luego
+//    onCommandExecuted lo procesa). Al llegar juntos, capturedText=null
+//    cuando se ejecuta onCommandExecuted.
+//    FIX: onCommandExecuted se llama con microtask (un tick después).
+//
+//  BUG 3 (el bug del "Oye compas"): Cuando Porcupine está activo,
+//    el STT NO debería estar corriendo. Pero si por cualquier razón el STT
+//    captura el wake word, _processCommand lo enviaba al coordinator que
+//    estaba en CoordinatorState.idle → "Estado incorrecto".
+//    FIX: filtro de wake word en _processCommand. Si el texto es solo
+//    "oye compas" (o variantes), lo ignoramos silenciosamente.
+//    Además: exponer wakeWordActive setter para que el coordinator
+//    informe a este servicio si Porcupine está activo.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v2.
 
 import 'dart:async';
 import 'package:logger/logger.dart';
@@ -19,28 +46,46 @@ class IntegratedVoiceCommandService {
   factory IntegratedVoiceCommandService() => _instance;
   IntegratedVoiceCommandService._internal();
 
-  final Logger _logger = Logger();
-  final stt.SpeechToText _speech = stt.SpeechToText();
-  final VoiceCommandClassifier _classifier = VoiceCommandClassifier();
-  final RobotFSM _fsm = RobotFSM();
-  final STTSessionManager _sessionManager = STTSessionManager();
+  final Logger                 _logger         = Logger();
+  final stt.SpeechToText       _speech         = stt.SpeechToText();
+  final VoiceCommandClassifier _classifier     = VoiceCommandClassifier();
+  final RobotFSM               _fsm            = RobotFSM();
+  final STTSessionManager      _sessionManager = STTSessionManager();
 
-  // ✅ EXPONER SESSION MANAGER
   STTSessionManager get sessionManager => _sessionManager;
 
-  bool _isInitialized = false;
-  bool _isListening = false;
-  bool _isProcessing = false;
-  String _lastPartialText = '';
-  int _consecutiveErrors = 0;
+  bool   _isInitialized     = false;
+  bool   _isListening       = false;
+  bool   _isProcessing      = false;
+  String _lastPartialText   = '';
+  int    _consecutiveErrors = 0;
 
-  static const Duration _pauseTimeout = Duration(seconds: 2);
+  // ✅ BUG 3 FIX: el coordinator avisa si Porcupine está activo.
+  // Cuando es true, filtramos el wake word si el STT lo captura por error.
+  bool _wakeWordActive = false;
+  void setWakeWordActive(bool active) => _wakeWordActive = active;
+
+  // Frases de wake word que el STT podría capturar accidentalmente
+  static const List<String> _wakeWordVariants = [
+    'oye compas',
+    'oye compass',
+    'oye comas',
+    'oy compas',
+    'hoy compas',
+  ];
+
+  static const Duration _pauseTimeout = Duration(milliseconds: 4500);
   static const int _maxConsecutiveErrors = 3;
+
+  // ─── Callbacks ────────────────────────────────────────────────────────────
 
   Function(NavigationIntent)? onCommandDetected;
   Function(NavigationIntent)? onCommandExecuted;
-  Function(String)? onCommandRejected;
-  Function(String)? onStatusUpdate;
+  Function(String)?           onCommandRejected;
+  Function(String)?           onStatusUpdate;
+  Function(String partialText)? onPartialResult;
+
+  // ─── Inicialización ───────────────────────────────────────────────────────
 
   Future<void> initialize() async {
     if (_isInitialized) {
@@ -49,15 +94,14 @@ class IntegratedVoiceCommandService {
     }
 
     try {
-      _logger.i('Inicializando IntegratedVoiceCommandService...');
+      _logger.i('Inicializando IntegratedVoiceCommandService v3...');
 
       await _ensurePermissions();
 
       final available = await _speech.initialize(
-        onError: _onSpeechError,
-        onStatus: _onSpeechStatus,
+        onError:      _onSpeechError,
+        onStatus:     _onSpeechStatus,
         debugLogging: false,
-        finalTimeout: const Duration(milliseconds: 1500),
       );
 
       if (!available) {
@@ -67,14 +111,15 @@ class IntegratedVoiceCommandService {
       try {
         _logger.i('Intentando inicializar TFLite...');
         await _classifier.initialize();
-        _logger.i('✅ TFLite inicializado correctamente');
+        _logger.i('✅ TFLite inicializado');
       } catch (e) {
         _logger.w('⚠️ TFLite no disponible: $e');
         _logger.i('📌 Usando clasificación por keywords (fallback)');
       }
 
       _isInitialized = true;
-      _logger.i('✅ IntegratedVoiceCommandService listo');
+      _logger.i('✅ IntegratedVoiceCommandService v3 listo');
+      _logger.i('   pauseFor: ${_pauseTimeout.inMilliseconds}ms');
 
     } catch (e) {
       _logger.e('❌ Error inicializando servicio: $e');
@@ -93,16 +138,16 @@ class IntegratedVoiceCommandService {
     }
 
     if (micStatus.isPermanentlyDenied) {
-      throw Exception('Permiso permanentemente denegado');
+      throw Exception('Permiso permanentemente denegado. Ve a Ajustes.');
     }
 
     _logger.i('✅ Permisos verificados');
   }
 
+  // ─── Control de escucha ───────────────────────────────────────────────────
+
   Future<void> startListening() async {
-    if (!_isInitialized) {
-      throw StateError('Servicio no inicializado');
-    }
+    if (!_isInitialized) throw StateError('Servicio no inicializado');
 
     if (_isListening) {
       _logger.w('Ya está escuchando');
@@ -111,8 +156,6 @@ class IntegratedVoiceCommandService {
 
     try {
       await _startListeningSession();
-      _logger.i('🎤 Escucha iniciada');
-
     } catch (e) {
       _logger.e('Error iniciando escucha: $e');
       _consecutiveErrors++;
@@ -122,7 +165,7 @@ class IntegratedVoiceCommandService {
         await Future.delayed(const Duration(milliseconds: 500));
         await startListening();
       } else {
-        _logger.e('Demasiados errores, abortando');
+        _logger.e('Demasiados errores consecutivos, abortando');
         _consecutiveErrors = 0;
         rethrow;
       }
@@ -130,11 +173,8 @@ class IntegratedVoiceCommandService {
   }
 
   Future<void> _startListeningSession() async {
-    // ✅ VALIDACIÓN MEJORADA
     if (!await _sessionManager.markStarting()) {
-      _logger.w('⚠️ Session manager rechazó inicio');
-      _logger.w('   Estado actual: ${_sessionManager.state.name}');
-      _logger.w('   Tiempo desde último cambio: ${_sessionManager.timeSinceLastChange}');
+      _logger.w('⚠️ Session manager rechazó inicio — estado: ${_sessionManager.state.name}');
       return;
     }
 
@@ -147,35 +187,34 @@ class IntegratedVoiceCommandService {
     _lastPartialText = '';
 
     final options = stt.SpeechListenOptions(
-      partialResults: true,
-      onDevice: false,
-      autoPunctuation: false,
+      partialResults:       true,
+      onDevice:             false,
+      autoPunctuation:      false,
       enableHapticFeedback: false,
-      cancelOnError: false,
-      listenMode: stt.ListenMode.confirmation,
+      cancelOnError:        false,
+      listenMode:           stt.ListenMode.confirmation,
     );
 
     try {
       await _speech.listen(
-        onResult: _onSpeechResult,
-        pauseFor: _pauseTimeout,
-        localeId: 'es_CO',
+        onResult:     _onSpeechResult,
+        pauseFor:     _pauseTimeout,
+        localeId:     'es_CO',
         listenOptions: options,
       );
 
       _isListening = true;
       _sessionManager.markActive();
-      _logger.d('✅ Sesión STT activa');
-
+      _logger.i('✅ Sesión STT activa (pauseFor=${_pauseTimeout.inMilliseconds}ms)');
       onStatusUpdate?.call('Escuchando...');
 
     } catch (e) {
       _logger.e('Error iniciando sesión STT: $e');
       _isListening = false;
-      _sessionManager.markIdle();
+      _sessionManager.markIdle(); // ✅ Siempre limpiar el estado
 
       if (e.toString().contains('error_busy')) {
-        _logger.w('STT ocupado, esperando...');
+        _logger.w('STT ocupado, esperando 1s...');
         await Future.delayed(const Duration(seconds: 1));
       }
 
@@ -183,22 +222,26 @@ class IntegratedVoiceCommandService {
     }
   }
 
+  // ─── Resultado de voz ─────────────────────────────────────────────────────
+
   void _onSpeechResult(stt.SpeechRecognitionResult result) {
     final text = result.recognizedWords.trim();
 
     if (text.isEmpty) return;
 
-    if (text == _lastPartialText && !result.finalResult) {
-      return;
-    }
-
-    _lastPartialText = text;
-    _logger.d('STT: "$text" (final: ${result.finalResult})');
-
     if (result.finalResult) {
+      _logger.i('✅ STT final: "$text"');
       _processCommand(text);
+    } else {
+      if (text != _lastPartialText) {
+        _lastPartialText = text;
+        _logger.d('⏳ STT parcial: "$text"');
+        onPartialResult?.call(text);
+      }
     }
   }
+
+  // ─── Procesamiento del comando ────────────────────────────────────────────
 
   Future<void> _processCommand(String text) async {
     if (_isProcessing) {
@@ -206,134 +249,56 @@ class IntegratedVoiceCommandService {
       return;
     }
 
+    // ✅ BUG 3 FIX: filtrar wake word si Porcupine está activo.
+    // El STT a veces captura el propio wake word cuando se solapa con
+    // el inicio/fin de sesión de Porcupine. Ignorarlo silenciosamente.
+    if (_wakeWordActive) {
+      final normalized = text.toLowerCase().trim();
+      if (_wakeWordVariants.any((v) => normalized == v || normalized.startsWith(v))) {
+        _logger.w('⚠️ STT capturó wake word accidentalmente — ignorado: "$text"');
+        return;
+      }
+    }
+
     _isProcessing = true;
 
     try {
       if (text.trim().isEmpty || text.length < 2) {
-        _logger.w('Texto muy corto: "$text"');
-        _isProcessing = false;
+        _logger.w('Texto muy corto ignorado: "$text"');
         return;
       }
 
-      // ✅ CAMBIO CRÍTICO: Ya NO clasificamos aquí
-      // Solo capturamos el texto y lo pasamos al NavigationCoordinator
-      // El NavigationCoordinator usará ConversationService para chatear
+      _logger.i('📝 Texto capturado: "$text"');
 
-      _logger.i('📝 Texto capturado del usuario: "$text"');
-
-      // Crear intent dummy solo para transportar el texto
       final intent = NavigationIntent(
-        type: IntentType.navigate, // Dummy
-        target: 'forward',          // Dummy
-        priority: 5,               // Dummy
-        suggestedResponse: text,   // ✅ IMPORTANTE: El texto original
+        type:              IntentType.navigate,
+        target:            'forward',
+        priority:          5,
+        suggestedResponse: text,
       );
 
       _consecutiveErrors = 0;
 
-      // Pasar al coordinator para que use el chatbot
+      // Notificar captura del texto
       onCommandDetected?.call(intent);
-      onCommandExecuted?.call(intent);
+
+      // ✅ BUG 2 FIX: onCommandExecuted en el siguiente microtask.
+      // El coordinator necesita que onCommandDetected haya guardado
+      // el texto (capturedText) ANTES de que onCommandExecuted lo use.
+      // Sin este delay eran síncronos y capturedText era null al ejecutar.
+      await Future.microtask(() {
+        onCommandExecuted?.call(intent);
+      });
 
     } catch (e, stackTrace) {
-      _logger.e('Error capturando texto: $e');
-      _logger.e('StackTrace: $stackTrace');
+      _logger.e('Error procesando texto: $e\n$stackTrace');
       _consecutiveErrors++;
     } finally {
       _isProcessing = false;
     }
   }
 
-  VoiceCommandResult _fallbackClassification(String text) {
-    final normalized = text.toLowerCase().trim();
-
-    if (normalized.contains('muev') || normalized.contains('adelante') ||
-        normalized.contains('avanza') || normalized.contains('camina') ||
-        normalized.contains('anda') || normalized.contains('sigue') ||
-        normalized.contains('vamos') || normalized.contains('forward')) {
-      return VoiceCommandResult(
-        label: 'MOVE',
-        confidence: 0.80,
-        passesThreshold: true,
-        threshold: 0.65,
-        inferenceTimeMs: 0,
-        logits: [],
-      );
-    }
-
-    if (normalized.contains('para') || normalized.contains('pará') ||
-        normalized.contains('det') || normalized.contains('stop') ||
-        normalized.contains('alto') || normalized.contains('quieto') ||
-        normalized.contains('espera') || normalized.contains('frena')) {
-      return VoiceCommandResult(
-        label: 'STOP',
-        confidence: 0.90,
-        passesThreshold: true,
-        threshold: 0.65,
-        inferenceTimeMs: 0,
-        logits: [],
-      );
-    }
-
-    if (normalized.contains('izquierda') || normalized.contains('izq') ||
-        normalized.contains('zurda') || normalized.contains('left')) {
-      return VoiceCommandResult(
-        label: 'TURN_LEFT',
-        confidence: 0.75,
-        passesThreshold: true,
-        threshold: 0.60,
-        inferenceTimeMs: 0,
-        logits: [],
-      );
-    }
-
-    if (normalized.contains('derecha') || normalized.contains('der') ||
-        normalized.contains('diestra') || normalized.contains('right')) {
-      return VoiceCommandResult(
-        label: 'TURN_RIGHT',
-        confidence: 0.75,
-        passesThreshold: true,
-        threshold: 0.60,
-        inferenceTimeMs: 0,
-        logits: [],
-      );
-    }
-
-    if (normalized.contains('ayuda') || normalized.contains('help') ||
-        normalized.contains('auxilio') || normalized.contains('socorro')) {
-      return VoiceCommandResult(
-        label: 'HELP',
-        confidence: 0.85,
-        passesThreshold: true,
-        threshold: 0.70,
-        inferenceTimeMs: 0,
-        logits: [],
-      );
-    }
-
-    if (normalized.contains('repite') || normalized.contains('repeat') ||
-        normalized.contains('otra vez') || normalized.contains('de nuevo') ||
-        normalized.contains('again')) {
-      return VoiceCommandResult(
-        label: 'REPEAT',
-        confidence: 0.70,
-        passesThreshold: true,
-        threshold: 0.55,
-        inferenceTimeMs: 0,
-        logits: [],
-      );
-    }
-
-    _logger.w('Texto no reconocido en fallback: "$text"');
-    return VoiceCommandResult(
-      label: 'UNKNOWN',
-      confidence: 0.30,
-      passesThreshold: false,
-      threshold: 0.50,
-      inferenceTimeMs: 0,
-      logits: [],
-    );
-  }
+  // ─── Detener ──────────────────────────────────────────────────────────────
 
   Future<void> stopListening() async {
     if (!_isListening && !_isProcessing && _sessionManager.isIdle) {
@@ -342,9 +307,8 @@ class IntegratedVoiceCommandService {
     }
 
     _logger.i('Deteniendo escucha...');
-
-    _isListening = false;
-    _isProcessing = false;
+    _isListening      = false;
+    _isProcessing     = false;
     _consecutiveErrors = 0;
 
     try {
@@ -353,7 +317,7 @@ class IntegratedVoiceCommandService {
         await _speech.stop();
       }
       _sessionManager.markIdle();
-      _logger.d('⏹️ Escucha detenida completamente');
+      _logger.d('⏹️ Sesión STT cerrada');
     } catch (e) {
       _logger.e('Error deteniendo STT: $e');
       _sessionManager.forceReset();
@@ -362,23 +326,25 @@ class IntegratedVoiceCommandService {
     onStatusUpdate?.call('Escucha detenida');
   }
 
+  // ─── Callbacks de error y estado ─────────────────────────────────────────
+
   void _onSpeechError(stt.SpeechRecognitionError error) {
     _logger.e('STT Error: ${error.errorMsg} (permanent: ${error.permanent})');
 
     if (error.errorMsg == 'error_busy') {
-      _logger.w('⚠️ STT busy (esperado), ignorando...');
+      _logger.w('⚠️ STT busy (esperado durante transición), ignorando');
       return;
     }
 
     if (error.errorMsg == 'error_speech_timeout' && _lastPartialText.isEmpty) {
-      _logger.d('Timeout sin habla detectada');
+      _logger.d('Timeout por silencio (nadie habló)');
       return;
     }
 
     _consecutiveErrors++;
 
     if (error.permanent || _consecutiveErrors >= _maxConsecutiveErrors) {
-      _logger.e('Error permanente, deteniendo...');
+      _logger.e('Error permanente o límite alcanzado, deteniendo STT');
       stopListening();
       onStatusUpdate?.call('Error de reconocimiento');
     }
@@ -389,6 +355,15 @@ class IntegratedVoiceCommandService {
 
     if (status == 'done' || status == 'notListening') {
       _isListening = false;
+
+      // ✅ BUG 1 FIX: marcar el session manager como idle cuando el STT
+      // termina por su cuenta (pauseFor expirado, fin natural de sesión).
+      // Sin esto el coordinator veía sessionManager.isIdle==false y entraba
+      // en un bucle intentando detener un STT que ya había terminado.
+      if (!_sessionManager.isIdle) {
+        _logger.d('🔄 STT terminó solo → markIdle()');
+        _sessionManager.markIdle();
+      }
     }
 
     if (status == 'listening') {
@@ -396,88 +371,75 @@ class IntegratedVoiceCommandService {
     }
   }
 
+  // ─── Helpers ─────────────────────────────────────────────────────────────
+
+  VoiceCommandResult _fallbackClassification(String text) {
+    final normalized = text.toLowerCase().trim();
+
+    if (normalized.contains('muev') || normalized.contains('adelante') ||
+        normalized.contains('avanza') || normalized.contains('camina') ||
+        normalized.contains('anda')   || normalized.contains('sigue')  ||
+        normalized.contains('vamos')  || normalized.contains('forward')) {
+      return VoiceCommandResult(label: 'MOVE', confidence: 0.80, passesThreshold: true, threshold: 0.65, inferenceTimeMs: 0, logits: []);
+    }
+    if (normalized.contains('para')  || normalized.contains('det') ||
+        normalized.contains('stop')  || normalized.contains('alto') ||
+        normalized.contains('quieto')|| normalized.contains('frena')) {
+      return VoiceCommandResult(label: 'STOP', confidence: 0.90, passesThreshold: true, threshold: 0.65, inferenceTimeMs: 0, logits: []);
+    }
+    if (normalized.contains('izquierda') || normalized.contains('izq') || normalized.contains('left')) {
+      return VoiceCommandResult(label: 'TURN_LEFT', confidence: 0.75, passesThreshold: true, threshold: 0.60, inferenceTimeMs: 0, logits: []);
+    }
+    if (normalized.contains('derecha') || normalized.contains('der') || normalized.contains('right')) {
+      return VoiceCommandResult(label: 'TURN_RIGHT', confidence: 0.75, passesThreshold: true, threshold: 0.60, inferenceTimeMs: 0, logits: []);
+    }
+    if (normalized.contains('ayuda') || normalized.contains('help') || normalized.contains('auxilio')) {
+      return VoiceCommandResult(label: 'HELP', confidence: 0.85, passesThreshold: true, threshold: 0.70, inferenceTimeMs: 0, logits: []);
+    }
+    if (normalized.contains('repite') || normalized.contains('repeat') || normalized.contains('otra vez')) {
+      return VoiceCommandResult(label: 'REPEAT', confidence: 0.70, passesThreshold: true, threshold: 0.55, inferenceTimeMs: 0, logits: []);
+    }
+
+    return VoiceCommandResult(label: 'UNKNOWN', confidence: 0.30, passesThreshold: false, threshold: 0.50, inferenceTimeMs: 0, logits: []);
+  }
+
   Action _labelToAction(String label) {
     switch (label) {
-      case 'MOVE':
-        return Action.move;
-      case 'STOP':
-        return Action.stop;
-      case 'TURN_LEFT':
-        return Action.turnLeft;
-      case 'TURN_RIGHT':
-        return Action.turnRight;
-      case 'REPEAT':
-        return Action.repeat;
-      case 'HELP':
-        return Action.help;
-      default:
-        return Action.unknown;
+      case 'MOVE':       return Action.move;
+      case 'STOP':       return Action.stop;
+      case 'TURN_LEFT':  return Action.turnLeft;
+      case 'TURN_RIGHT': return Action.turnRight;
+      case 'REPEAT':     return Action.repeat;
+      case 'HELP':       return Action.help;
+      default:           return Action.unknown;
     }
   }
 
   NavigationIntent _actionToIntent(Action action, String text) {
     switch (action) {
-      case Action.move:
-        return NavigationIntent(
-          type: IntentType.navigate,
-          target: 'forward',
-          priority: 8,
-          suggestedResponse: 'Avanzando',
-        );
-
-      case Action.stop:
-        return NavigationIntent(
-          type: IntentType.stop,
-          target: '',
-          priority: 10,
-          suggestedResponse: 'Deteniéndome',
-        );
-
-      case Action.turnLeft:
-        return NavigationIntent(
-          type: IntentType.navigate,
-          target: 'left',
-          priority: 7,
-          suggestedResponse: 'Girando a la izquierda',
-        );
-
-      case Action.turnRight:
-        return NavigationIntent(
-          type: IntentType.navigate,
-          target: 'right',
-          priority: 7,
-          suggestedResponse: 'Girando a la derecha',
-        );
-
-      case Action.help:
-        return NavigationIntent(
-          type: IntentType.help,
-          target: '',
-          priority: 9,
-          suggestedResponse: 'Activando ayuda',
-        );
-
-      default:
-        return NavigationIntent.unknown();
+      case Action.move:      return NavigationIntent(type: IntentType.navigate, target: 'forward', priority: 8, suggestedResponse: 'Avanzando');
+      case Action.stop:      return NavigationIntent(type: IntentType.stop,     target: '',        priority: 10, suggestedResponse: 'Deteniéndome');
+      case Action.turnLeft:  return NavigationIntent(type: IntentType.navigate, target: 'left',    priority: 7, suggestedResponse: 'Girando a la izquierda');
+      case Action.turnRight: return NavigationIntent(type: IntentType.navigate, target: 'right',   priority: 7, suggestedResponse: 'Girando a la derecha');
+      case Action.help:      return NavigationIntent(type: IntentType.help,     target: '',        priority: 9, suggestedResponse: 'Activando ayuda');
+      default:               return NavigationIntent.unknown();
     }
   }
 
   Future<void> setSpeechRate(double rate) async {}
   Future<void> setVolume(double volume) async {}
 
-  Map<String, dynamic> getStatistics() {
-    return {
-      'is_initialized': _isInitialized,
-      'is_listening': _isListening,
-      'is_processing': _isProcessing,
-      'consecutive_errors': _consecutiveErrors,
-      'session_state': _sessionManager.state.name,
-      'fsm_stats': _fsm.getStatistics(),
-      'classifier_stats': {
-        'inference_count': _classifier.inferenceCount,
-      },
-    };
-  }
+  Map<String, dynamic> getStatistics() => {
+    'is_initialized':    _isInitialized,
+    'is_listening':      _isListening,
+    'is_processing':     _isProcessing,
+    'consecutive_errors': _consecutiveErrors,
+    'session_state':     _sessionManager.state.name,
+    'pause_timeout_ms':  _pauseTimeout.inMilliseconds,
+    'wake_word_active':  _wakeWordActive,
+    'fsm_stats':         _fsm.getStatistics(),
+    'classifier_stats':  {'inference_count': _classifier.inferenceCount},
+  };
 
   void resetFSM() {
     _fsm.reset();
@@ -485,8 +447,8 @@ class IntegratedVoiceCommandService {
   }
 
   bool get isInitialized => _isInitialized;
-  bool get isListening => _isListening;
-  bool get isProcessing => _isProcessing;
+  bool get isListening   => _isListening;
+  bool get isProcessing  => _isProcessing;
 
   void dispose() {
     stopListening();

@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+
 import 'screens/auth/welcome_screen.dart';
 import 'screens/voice_navigation_screen.dart';
 import 'screens/environment_recognition_screen.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'screens/ar_navigation_screen.dart';
+import 'services/auth_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -25,110 +28,110 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'COMPAS - Asistente de Voz',
       debugShowCheckedModeBanner: false,
-
       themeMode: ThemeMode.dark,
-
       theme: _lightTheme(),
       darkTheme: _darkTheme(),
-
-      home: const WelcomeScreen(),
-
+      home: const AuthGate(),
       routes: {
-        '/voice': (context) => const VoiceNavigationScreen(),
+        '/ar': (context) => const ArNavigationScreen(),
         '/camera': (context) => const EnvironmentRecognitionScreen(),
       },
     );
   }
 }
 
-ThemeData _darkTheme() {
-  return ThemeData(
-    useMaterial3: true,
-    brightness: Brightness.dark,
+////////////////////////////////////////////////////////////
+/// AUTH GATE - CORREGIDO
+////////////////////////////////////////////////////////////
 
-    colorScheme: const ColorScheme.dark(
-      primary: Color(0xFFFF6B00),        // 🔥 Nuevo naranja
-      onPrimary: Color(0xFFFFFFFF),
+class AuthGate extends StatefulWidget {
+  const AuthGate({super.key});
 
-      secondary: Color(0xFFFFFFFF),
-      onSecondary: Color(0xFF00162D),
-
-      background: Color(0xFF00162D),     // Azul profundo
-      surface: Color(0xFF00162D),
-
-      onSurface: Color(0xFFFFFFFF),
-      onBackground: Color(0xFFFFFFFF),
-
-      error: Color(0xFFFF4D4F),
-      onError: Color(0xFFFFFFFF),
-    ),
-
-    scaffoldBackgroundColor: const Color(0xFF00162D),
-
-    textTheme: const TextTheme(
-      bodyLarge: TextStyle(
-        fontSize: 20,
-        height: 1.6,
-        fontWeight: FontWeight.w500,
-      ),
-      bodyMedium: TextStyle(
-        fontSize: 18,
-        height: 1.6,
-      ),
-      titleLarge: TextStyle(
-        fontSize: 26,
-        fontWeight: FontWeight.bold,
-      ),
-      titleMedium: TextStyle(
-        fontSize: 22,
-        fontWeight: FontWeight.w600,
-      ),
-    ),
-
-    bottomNavigationBarTheme: const BottomNavigationBarThemeData(
-      backgroundColor: Color(0xFF00162D),
-      selectedItemColor: Color(0xFFFF6B00),  // 🔥 Activo en naranja
-      unselectedItemColor: Colors.white70,
-      selectedLabelStyle: TextStyle(fontSize: 16),
-      unselectedLabelStyle: TextStyle(fontSize: 14),
-    ),
-
-    elevatedButtonTheme: ElevatedButtonThemeData(
-      style: ElevatedButton.styleFrom(
-        backgroundColor: const Color(0xFFFF6B00), // 🔥 Botones naranja
-        foregroundColor: const Color(0xFFFFFFFF),
-        textStyle: const TextStyle(
-          fontSize: 18,
-          fontWeight: FontWeight.bold,
-        ),
-        padding: const EdgeInsets.symmetric(
-          vertical: 18,
-          horizontal: 24,
-        ),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(16),
-        ),
-      ),
-    ),
-  );
+  @override
+  State<AuthGate> createState() => _AuthGateState();
 }
 
-ThemeData _lightTheme() {
-  return ThemeData(
-    useMaterial3: true,
-    brightness: Brightness.light,
-    colorScheme: const ColorScheme.light(
-      primary: Color(0xFFFF6B00),
-      onPrimary: Color(0xFFFFFFFF),
-      secondary: Color(0xFF00162D),
-      onSecondary: Color(0xFFFFFFFF),
-      background: Color(0xFFF5F5F5),
-      surface: Color(0xFFFFFFFF),
-      onSurface: Color(0xFF00162D),
-      onBackground: Color(0xFF00162D),
-    ),
-  );
+class _AuthGateState extends State<AuthGate> {
+  final AuthService _authService = AuthService();
+
+  bool _isLoading = true;
+  bool _isAuthenticated = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeSession();
+  }
+
+  Future<void> _initializeSession() async {
+    try {
+      // 1️⃣ Verifica si existen tokens guardados
+      final hasSession = await _authService.isAuthenticated();
+
+      if (!hasSession) {
+        // No hay tokens → ir a login directamente, sin llamar logout
+        if (!mounted) return;
+        setState(() {
+          _isAuthenticated = false;
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // 2️⃣ Intenta renovar token automáticamente
+      final refreshResponse = await _authService.refreshToken();
+
+      if (!mounted) return;
+
+      if (refreshResponse.success) {
+        // ✅ Renovación exitosa → mantener sesión
+        setState(() {
+          _isAuthenticated = true;
+          _isLoading = false;
+        });
+      } else {
+        // ❌ FIX: El refresh falló → limpiar tokens localmente sin llamar
+        // al endpoint /logout del servidor, porque ese endpoint requiere
+        // un access token válido y además estaba causando que el servidor
+        // registrara un logout, confundiendo el flujo de sesión.
+        // Solo limpiamos el storage local.
+        await _authService.clearLocalSession();
+
+        if (!mounted) return;
+        setState(() {
+          _isAuthenticated = false;
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      // Error inesperado → limpiar solo localmente
+      await _authService.clearLocalSession();
+
+      if (!mounted) return;
+      setState(() {
+        _isAuthenticated = false;
+        _isLoading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(),
+        ),
+      );
+    }
+
+    return _isAuthenticated ? const MainScreen() : const WelcomeScreen();
+  }
 }
+
+////////////////////////////////////////////////////////////
+/// MAIN SCREEN
+////////////////////////////////////////////////////////////
 
 class MainScreen extends StatefulWidget {
   const MainScreen({super.key});
@@ -171,4 +174,41 @@ class _MainScreenState extends State<MainScreen> {
       ),
     );
   }
+}
+
+////////////////////////////////////////////////////////////
+/// THEMES
+////////////////////////////////////////////////////////////
+
+ThemeData _darkTheme() {
+  return ThemeData(
+    useMaterial3: true,
+    brightness: Brightness.dark,
+    colorScheme: const ColorScheme.dark(
+      primary: Color(0xFFFF6B00),
+      onPrimary: Color(0xFFFFFFFF),
+      secondary: Color(0xFFFFFFFF),
+      onSecondary: Color(0xFF00162D),
+      surface: Color(0xFF00162D),
+      onSurface: Color(0xFFFFFFFF),
+      error: Color(0xFFFF4D4F),
+      onError: Color(0xFFFFFFFF),
+    ),
+    scaffoldBackgroundColor: const Color(0xFF00162D),
+  );
+}
+
+ThemeData _lightTheme() {
+  return ThemeData(
+    useMaterial3: true,
+    brightness: Brightness.light,
+    colorScheme: const ColorScheme.light(
+      primary: Color(0xFFFF6B00),
+      onPrimary: Color(0xFFFFFFFF),
+      secondary: Color(0xFF00162D),
+      onSecondary: Color(0xFFFFFFFF),
+      surface: Color(0xFFFFFFFF),
+      onSurface: Color(0xFF00162D),
+    ),
+  );
 }
