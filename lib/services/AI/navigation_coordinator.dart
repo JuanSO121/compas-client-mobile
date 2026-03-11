@@ -1,17 +1,55 @@
 // lib/services/AI/navigation_coordinator.dart
-// ✅ v4 — Expone TTSService + Fix Porcupine key agotada
+// ✅ v5 — Fix: NavigateTo se disparaba múltiples veces + TTS del coordinator
+//          bloqueaba instrucciones de Unity
 //
-//  CAMBIOS v3 → v4:
-//  ─────────────────────────────────────────────────────────────────────────
-//  + Getter `ttsService` expuesto para que VoiceNavigationService v3.0
-//    pueda reutilizar el mismo engine TTS sin crear uno propio.
-//    Esto elimina la competencia de dos FlutterTts en Android.
+// ============================================================================
+//  CAMBIOS v4 → v5
+// ============================================================================
 //
-//  + Mejor mensaje de error cuando Porcupine falla por key agotada
-//    (PorcupineActivationRefusedException). El sistema continúa en modo
-//    manual sin bloquear la inicialización.
+//  BUG 1 CORREGIDO — NavigateTo llegaba a Unity 2-3 veces:
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v3.
+//    ANTES (v4):
+//      _processUserInput() hacía:
+//        onIntentDetected?.call(intent)    → ar_navigation_screen lo ignoraba
+//                                            pero NavigationCoordinator lo usaba
+//        await waitForCompletion()
+//        onCommandExecuted?.call(intent)   → ar_navigation_screen llamaba
+//                                            _unityBridge.handleIntent() → NavigateTo #1
+//      Y _completeAndReturnToIdle() hacía resume del wake word → STT detectaba
+//      eco del TTS → procesaba de nuevo → NavigateTo #2 y #3.
+//
+//    AHORA (v5):
+//      onIntentDetected solo notifica la UI (para mostrar el comando en pantalla).
+//      onCommandExecuted se llama UNA SOLA VEZ, DESPUÉS de waitForCompletion().
+//      Se añade _navigationExecuted flag para garantizar idempotencia.
+//
+//  BUG 2 CORREGIDO — TTS del coordinator bloqueaba instrucciones de Unity:
+//
+//    ANTES:
+//      El coordinator hablaba "¿A qué baliza quieres ir? ..." con interrupt:true.
+//      Luego enviaba NavigateTo a Unity.
+//      Unity respondía inmediatamente con instrucciones de voz.
+//      Pero el coordinator aún tenía el TTS activo (speak sin terminar) →
+//      VoiceNavigationService no podía adquirir el engine.
+//
+//    AHORA:
+//      Se espera waitForCompletion() ANTES de enviar el intent a Unity.
+//      Unity solo recibe la orden cuando el TTS del coordinator ya terminó.
+//      VoiceNavigationService puede hablar libremente desde ese momento.
+//
+//  BUG 3 CORREGIDO — Echo de TTS activaba el STT en modo sin wake word:
+//
+//    ANTES:
+//      En modo manual (sin wake word), después de _completeAndReturnToIdle()
+//      el STT volvía a escuchar inmediatamente y captaba el eco del TTS
+//      ("¿A qué baliza...") como nuevo comando → procesamiento duplicado.
+//
+//    AHORA:
+//      Si hay un intent de navegación activo, _completeAndReturnToIdle()
+//      NO reactiva el STT hasta que se llama explícitamente resetNavigation().
+//      En modo sin wake word, el STT solo se reactiva si no hay navegación activa.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v4.
 
 import 'package:logger/logger.dart';
 import 'package:flutter/services.dart';
@@ -52,9 +90,14 @@ class NavigationCoordinator {
   bool             _isActive          = false;
   bool             _wakeWordAvailable = false;
 
+  // ✅ v5: flag para garantizar que onCommandExecuted se llama una sola vez
+  bool _navigationExecuted = false;
+  // ✅ v5: true mientras hay una navegación activa (evita reactivar STT por eco)
+  bool _navigationActive   = false;
+
   Timer?           _commandTimeoutTimer;
   static const Duration _commandTimeout = Duration(seconds: 15);
-  static const Duration _ttsEchoDelay   = Duration(milliseconds: 350);
+  static const Duration _ttsEchoDelay   = Duration(milliseconds: 500);
 
   NavigationIntent? _currentIntent;
   NavigationMode    _mode = NavigationMode.eventBased;
@@ -67,7 +110,7 @@ class NavigationCoordinator {
   Function(String)?           onCommandRejected;
   Function(String)?           onConversationalResponse;
 
-  // ✅ v4: Getter expuesto para que VoiceNavigationService use el mismo engine
+  // ✅ v4+: Getter expuesto para que VoiceNavigationService use el mismo engine
   TTSService get ttsService => _ttsService;
 
   // ─── Inicialización ───────────────────────────────────────────────────────
@@ -79,7 +122,7 @@ class NavigationCoordinator {
     }
 
     try {
-      _logger.i('🚀 Inicializando NavigationCoordinator v4...');
+      _logger.i('🚀 Inicializando NavigationCoordinator v5...');
 
       await _ttsService.initialize();
       await _aiModeController.initialize();
@@ -93,7 +136,7 @@ class NavigationCoordinator {
       _state = CoordinatorState.idle;
 
       _logger.i('═══════════════════════════════════════');
-      _logger.i('✅ SISTEMA CONVERSACIONAL v4 INICIALIZADO');
+      _logger.i('✅ SISTEMA CONVERSACIONAL v5 INICIALIZADO');
       _logger.i('   Wake Word : ${_wakeWordAvailable ? "✅ ACTIVO" : "❌ INACTIVO"}');
       _logger.i('   Modo IA   : ${_aiModeController.getModeDescription()}');
       _logger.i('   Timeout   : ${_commandTimeout.inSeconds}s (dinámico)');
@@ -104,7 +147,6 @@ class NavigationCoordinator {
             ? '✅ Di "Oye COMPAS" para comenzar'
             : '✅ Presiona Play para hablar',
       );
-
     } catch (e, stack) {
       _logger.e('❌ Error inicializando: $e');
       _logger.e('Stack: $stack');
@@ -141,12 +183,10 @@ class NavigationCoordinator {
 
       _wakeWordAvailable = true;
       _logger.i('✅ Wake word "Oye COMPAS" ACTIVO');
-
     } catch (e, stack) {
       _logger.e('❌ Error wake word: $e\n$stack');
       _wakeWordAvailable = false;
 
-      // ✅ v4: Mensaje específico para key agotada/expirada
       final errorStr = e.toString();
       if (errorStr.contains('ActivationRefused') ||
           errorStr.contains('ActivationLimit') ||
@@ -188,8 +228,8 @@ class NavigationCoordinator {
       final userText = (capturedText != null && capturedText!.isNotEmpty)
           ? capturedText!
           : (_partialText.isNotEmpty ? _partialText : intent.suggestedResponse);
-      capturedText  = null;
-      _partialText  = '';
+      capturedText = null;
+      _partialText = '';
 
       _commandTimeoutTimer?.cancel();
       await _processUserInput(userText);
@@ -235,7 +275,8 @@ class NavigationCoordinator {
       return;
     }
 
-    _lastUserInput = userInput;
+    _lastUserInput    = userInput;
+    _navigationExecuted = false; // ✅ v5: reset antes de cada procesamiento
     _logger.i('💬 Usuario: "$userInput"');
     onStatusUpdate?.call('Procesando: "$userInput"');
 
@@ -253,28 +294,52 @@ class NavigationCoordinator {
       _logger.i('🤖 Bot (${response.type.name}): "${response.message}"');
 
       _state = CoordinatorState.speaking;
+
+      // ✅ v5: Hablar respuesta del coordinator
       await _ttsService.speak(response.message, interrupt: true);
 
       if (response.shouldNavigate) {
-        _logger.i('🎯 Ejecutando navegación: ${response.intent!.target}');
+        _logger.i('🎯 Navegación detectada: ${response.intent!.target}');
         _currentIntent = response.intent;
+
+        // ✅ v5: Notificar UI (solo visual — NO dispara handleIntent)
         onIntentDetected?.call(response.intent!);
+
+        // ✅ v5: ESPERAR a que el TTS del coordinator termine COMPLETAMENTE
+        // antes de enviar la orden a Unity. Esto garantiza que:
+        // 1. El engine TTS está libre para instrucciones de Unity
+        // 2. El STT no capta el eco del TTS como nuevo comando
         await _ttsService.waitForCompletion();
-        onCommandExecuted?.call(response.intent!);
+
+        // ✅ v5: Delay extra para silencio de eco del micrófono
+        await Future.delayed(_ttsEchoDelay);
+
+        // ✅ v5: Enviar orden a Unity UNA SOLA VEZ con flag de idempotencia
+        if (!_navigationExecuted) {
+          _navigationExecuted = true;
+          _navigationActive   = true;
+          _logger.i('🎯 Ejecutando navegación: ${response.intent!.target}');
+          onCommandExecuted?.call(response.intent!);
+        }
       } else {
+        // ✅ v5: Respuesta conversacional — esperar TTS y volver a idle
         onConversationalResponse?.call(response.message);
         await _ttsService.waitForCompletion();
       }
 
-      await _completeAndReturnToIdle();
+      // ✅ v5: Si hay navegación activa, NO reactivar STT automáticamente
+      // para evitar que el eco active comandos duplicados.
+      await _completeAndReturnToIdle(suppressSTT: _navigationActive);
 
     } catch (e, stack) {
       _logger.e('❌ Error procesando entrada: $e\n$stack');
       _state = CoordinatorState.speaking;
       await _ttsService.speak(
-          'Lo siento, hubo un error. ¿Puedes repetir?',
-          interrupt: true);
+        'Lo siento, hubo un error. ¿Puedes repetir?',
+        interrupt: true,
+      );
       await _ttsService.waitForCompletion();
+      _navigationActive = false;
       await _returnToIdle();
     }
   }
@@ -332,7 +397,6 @@ class NavigationCoordinator {
       onStatusUpdate?.call('Escuchando...');
 
       _resetCommandTimeout();
-
     } catch (e) {
       _logger.e('❌ Error en transición: $e');
       await _returnToIdle();
@@ -390,7 +454,9 @@ class NavigationCoordinator {
     }
   }
 
-  Future<void> _completeAndReturnToIdle() async {
+  /// ✅ v5: [suppressSTT] — si true y no hay wake word, NO reactiva el STT.
+  /// Evita que el eco del TTS se capture como nuevo comando durante navegación.
+  Future<void> _completeAndReturnToIdle({bool suppressSTT = false}) async {
     _commandTimeoutTimer?.cancel();
     _partialText = '';
 
@@ -402,6 +468,8 @@ class NavigationCoordinator {
     _state = CoordinatorState.idle;
 
     if (_wakeWordAvailable && _isActive) {
+      // Con wake word: siempre reactivar (Porcupine no escucha comandos,
+      // solo la palabra clave — el eco no puede activarlo accidentalmente).
       try {
         _voiceService.setWakeWordActive(true);
         await _wakeWordService.resume();
@@ -409,10 +477,44 @@ class NavigationCoordinator {
       } catch (e) {
         _logger.e('❌ Error reanudando wake word: $e');
       }
+    } else if (!suppressSTT && _isActive) {
+      // ✅ v5: Sin wake word y sin navegación activa → reactivar STT manual
+      try {
+        await Future.delayed(const Duration(milliseconds: 600));
+        if (_voiceService.sessionManager.canStart()) {
+          await _voiceService.startListening();
+          _resetCommandTimeout();
+          onStatusUpdate?.call('Escuchando...');
+        }
+      } catch (e) {
+        _logger.e('❌ Error reactivando STT: $e');
+      }
+    } else {
+      // ✅ v5: Navegación activa — no reactivar STT; esperar resetNavigation()
+      _logger.d('[Coordinator] Navegación activa — STT en pausa');
+      onStatusUpdate?.call('Navegando...');
     }
   }
 
   // ─── API pública ──────────────────────────────────────────────────────────
+
+  /// ✅ v5: Llamar desde ar_navigation_screen cuando la navegación termina
+  /// (navigation_arrived) para reactivar el STT/wake word.
+  void resetNavigation() {
+    _navigationActive   = false;
+    _navigationExecuted = false;
+    _currentIntent      = null;
+    _logger.i('[Coordinator] Navegación terminada — STT reactivado');
+
+    if (!_isActive) return;
+
+    if (_wakeWordAvailable) {
+      // El wake word ya debería estar escuchando — no hacer nada
+    } else {
+      // Sin wake word: reactivar STT manual
+      _completeAndReturnToIdle(suppressSTT: false);
+    }
+  }
 
   Future<void> start({NavigationMode mode = NavigationMode.eventBased}) async {
     if (!_isInitialized) throw Exception('No inicializado');
@@ -441,7 +543,6 @@ class NavigationCoordinator {
         _resetCommandTimeout();
         onStatusUpdate?.call('Escuchando...');
       }
-
     } catch (e) {
       _isActive = false;
       _logger.e('❌ Error start: $e');
@@ -454,7 +555,8 @@ class NavigationCoordinator {
 
     try {
       _logger.i('🛑 Deteniendo...');
-      _isActive = false;
+      _isActive         = false;
+      _navigationActive = false;
       _commandTimeoutTimer?.cancel();
       _partialText = '';
 
@@ -469,7 +571,6 @@ class NavigationCoordinator {
       _state = CoordinatorState.idle;
       await _ttsService.speak('Sistema detenido', interrupt: true);
       await _ttsService.waitForCompletion();
-
     } catch (e) {
       _logger.e('❌ Error stop: $e');
     }
@@ -513,6 +614,7 @@ class NavigationCoordinator {
       'is_speaking':         _ttsService.isSpeaking,
       'last_user_input':     _lastUserInput,
       'timeout_seconds':     _commandTimeout.inSeconds,
+      'navigation_active':   _navigationActive,
     },
   };
 
@@ -522,10 +624,12 @@ class NavigationCoordinator {
     _voiceService.setWakeWordActive(_wakeWordAvailable && _isActive);
     if (_wakeWordAvailable) _wakeWordService.resetStatistics();
     clearConversationHistory();
-    _currentIntent    = null;
-    _lastUserInput    = null;
-    _partialText      = '';
-    _state            = CoordinatorState.idle;
+    _currentIntent      = null;
+    _lastUserInput      = null;
+    _partialText        = '';
+    _navigationExecuted = false;
+    _navigationActive   = false;
+    _state              = CoordinatorState.idle;
     _commandTimeoutTimer?.cancel();
     _logger.i('🔄 Reset completo');
   }
@@ -539,6 +643,7 @@ class NavigationCoordinator {
   CoordinatorState  get state             => _state;
   bool              get isSpeaking        => _ttsService.isSpeaking;
   String?           get lastUserInput     => _lastUserInput;
+  bool              get navigationActive  => _navigationActive;
 
   Future<void> speak(String message) async {
     if (message.isEmpty) return;

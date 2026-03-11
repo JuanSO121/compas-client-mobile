@@ -1,6 +1,18 @@
 // lib/services/unity_bridge_service.dart
-// ✅ v3 — Fix: handleIntent() decodifica prefijos __unity:* de ConversationService
+// ✅ v3.1 — Fix: handleIntent() decodifica prefijos __unity:* de ConversationService
 //          Fix: isReady expuesto como ValueNotifier para reactividad en UI
+//          NEW: onTrackingStateChanged callback para tracking_state de ARCore
+//
+//  CAMBIOS v3 → v3.1:
+//  ─────────────────────────────────────────────────────────────────────────
+//  1. Nuevo callback: onTrackingStateChanged(bool isStable, String state, String reason)
+//     Llamado cuando Unity envía action="tracking_state". No se propaga a
+//     onResponse para evitar que el coordinator hable por TTS sobre cada
+//     cambio de estado (sería muy ruidoso durante VIO fault).
+//
+//  2. handleUnityMessage() — branch tracking_state con return temprano.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v3.
 //
 //  ACCIONES QUE ENTIENDE Unity (FlutterUnityBridge.cs switch):
 //    navigate_to       → VoiceCommandAPI.NavigateTo(name)
@@ -16,6 +28,7 @@
 //  RESPUESTAS QUE ENVÍA Unity (canal OnUnityResponse):
 //    { "action": "...", "ok": true|false, "message": "...", ...extras }
 //    list_waypoints incluye además: "count": N, "waypoints": [...]
+//    tracking_state incluye: "stable": bool, "state": String, "reason": String
 //
 //  PREFIJOS INTERNOS de ConversationService (resueltos aquí):
 //    __unity:list_waypoints          → listWaypoints()
@@ -112,7 +125,7 @@ class UnityBridgeService {
 
   UnityWidgetController? _controller;
 
-  // ✅ FIX: ValueNotifier para que la UI se reconstruya cuando Unity esté listo
+  // ValueNotifier para que la UI se reconstruya cuando Unity esté listo
   final ValueNotifier<bool> isReadyNotifier = ValueNotifier(false);
 
   // Getter de conveniencia (retrocompatible)
@@ -136,6 +149,19 @@ class UnityBridgeService {
   /// Llamado específicamente cuando llega la lista de waypoints
   Function(List<WaypointInfo>)? onWaypointsReceived;
 
+  /// ✅ v3.1: Llamado cuando Unity reporta cambio en el estado de tracking AR.
+  ///
+  /// Parámetros:
+  ///   isStable — true si ARCore tiene SessionTracking activo y confiable
+  ///   state    — ARSessionState: "SessionTracking", "SessionInitializing", etc.
+  ///   reason   — NotTrackingReason de ARCore: "ExcessiveMotion",
+  ///              "InsufficientFeatures", "InsufficientLight",
+  ///              "Relocalizing", "Initializing", "None", etc.
+  ///
+  /// NO se propaga a onResponse para evitar que NavigationCoordinator
+  /// hable por TTS sobre cada cambio de estado de tracking.
+  Function(bool isStable, String state, String reason)? onTrackingStateChanged;
+
   // ─── Setup ───────────────────────────────────────────────────────────────
 
   void setController(UnityWidgetController controller) {
@@ -154,10 +180,22 @@ class UnityBridgeService {
     try {
       final response = UnityResponse.fromJson(raw);
 
-      // Notificar stream
+      // Notificar stream (todos los mensajes)
       if (!_responseStream.isClosed) _responseStream.add(response);
 
-      // Callbacks específicos
+      // ✅ v3.1: tracking_state se maneja por su propio callback.
+      // Return temprano — no llegar a onResponse (evita TTS ruidoso).
+      if (response.action == 'tracking_state') {
+        final isStable = response.raw['stable'] as bool?   ?? true;
+        final state    = response.raw['state']  as String? ?? '';
+        final reason   = response.raw['reason'] as String? ?? '';
+        onTrackingStateChanged?.call(isStable, state, reason);
+        _logger.d('[UnityBridge] tracking_state: stable=$isStable '
+            'state=$state reason=$reason');
+        return;
+      }
+
+      // Callbacks generales
       onResponse?.call(response);
 
       if (response.action == 'list_waypoints' && response.ok) {
@@ -178,7 +216,7 @@ class UnityBridgeService {
 
   /// Traduce un NavigationIntent al comando Unity correspondiente.
   ///
-  /// ✅ FIX v3: Ahora decodifica los prefijos __unity:* generados por
+  /// Decodifica los prefijos __unity:* generados por
   /// ConversationService._buildIntent() para acciones extendidas.
   ///
   /// Formato de targets especiales:
@@ -218,27 +256,16 @@ class UnityBridgeService {
     }
   }
 
-  /// ✅ FIX v3: Decodifica y ejecuta los prefijos __unity:*
+  /// Decodifica y ejecuta los prefijos __unity:*
   void _handleUnityPrefix(String target) {
     _logger.d('[UnityBridge] Decodificando prefijo: $target');
 
     const prefix = '__unity:';
-    final cmd = target.substring(prefix.length); // quita '__unity:'
+    final cmd = target.substring(prefix.length);
 
-    if (cmd == 'list_waypoints') {
-      listWaypoints();
-      return;
-    }
-
-    if (cmd == 'save_session') {
-      saveSession();
-      return;
-    }
-
-    if (cmd == 'load_session') {
-      loadSession();
-      return;
-    }
+    if (cmd == 'list_waypoints') { listWaypoints(); return; }
+    if (cmd == 'save_session')   { saveSession();   return; }
+    if (cmd == 'load_session')   { loadSession();   return; }
 
     if (cmd.startsWith('create_waypoint:')) {
       final name = cmd.substring('create_waypoint:'.length);
