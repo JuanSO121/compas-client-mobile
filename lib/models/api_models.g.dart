@@ -119,52 +119,59 @@ TokenPair _$TokenPairFromJson(Map<String, dynamic> json) => TokenPair(
   expiresIn: (json['expires_in'] as num).toInt(),
 );
 
-Map<String, dynamic> _$TokenPairToJson(TokenPair instance) => <String, dynamic>{
-  'access_token': instance.accessToken,
-  'refresh_token': instance.refreshToken,
-  'token_type': instance.tokenType,
-  'expires_in': instance.expiresIn,
-};
+Map<String, dynamic> _$TokenPairToJson(TokenPair instance) =>
+    <String, dynamic>{
+      'access_token': instance.accessToken,
+      'refresh_token': instance.refreshToken,
+      'token_type': instance.tokenType,
+      'expires_in': instance.expiresIn,
+    };
 
+// ── AuthData: añadido first_login ────────────────────────────────────────────
 AuthData _$AuthDataFromJson(Map<String, dynamic> json) => AuthData(
-  tokens: TokenPair.fromJson(json['tokens'] as Map<String, dynamic>),
-  user: UserData.fromJson(json['user'] as Map<String, dynamic>),
-);
+      tokens: TokenPair.fromJson(json['tokens'] as Map<String, dynamic>),
+      user: UserData.fromJson(json['user'] as Map<String, dynamic>),
+      firstLogin: json['first_login'] as bool? ?? false,
+    );
 
 Map<String, dynamic> _$AuthDataToJson(AuthData instance) => <String, dynamic>{
-  'tokens': instance.tokens,
-  'user': instance.user,
-};
+      'tokens': instance.tokens,
+      'user': instance.user,
+      'first_login': instance.firstLogin,
+    };
 
+// ── UserData: añadido first_login ─────────────────────────────────────────────
 UserData _$UserDataFromJson(Map<String, dynamic> json) => UserData(
-  id: json['id'] as String,
-  email: json['email'] as String,
-  profile: json['profile'] == null
-      ? null
-      : UserProfile.fromJson(json['profile'] as Map<String, dynamic>),
-  accessibility: json['accessibility'] == null
-      ? null
-      : AccessibilityPreferences.fromJson(
-          json['accessibility'] as Map<String, dynamic>,
-        ),
-  lastLogin: json['last_login'] as String?,
-);
+      id: json['id'] as String,
+      email: json['email'] as String,
+      profile: json['profile'] == null
+          ? null
+          : UserProfile.fromJson(json['profile'] as Map<String, dynamic>),
+      accessibility: json['accessibility'] == null
+          ? null
+          : AccessibilityPreferences.fromJson(
+              json['accessibility'] as Map<String, dynamic>,
+            ),
+      lastLogin: json['last_login'] as String?,
+      firstLogin: json['first_login'] as bool? ?? false,
+    );
 
 Map<String, dynamic> _$UserDataToJson(UserData instance) => <String, dynamic>{
-  'id': instance.id,
-  'email': instance.email,
-  'profile': instance.profile,
-  'accessibility': instance.accessibility,
-  'last_login': instance.lastLogin,
-};
+      'id': instance.id,
+      'email': instance.email,
+      'profile': instance.profile,
+      'accessibility': instance.accessibility,
+      'last_login': instance.lastLogin,
+      'first_login': instance.firstLogin,
+    };
 
 UserProfile _$UserProfileFromJson(Map<String, dynamic> json) => UserProfile(
-  firstName: json['first_name'] as String?,
-  lastName: json['last_name'] as String?,
-  phone: json['phone'] as String?,
-  preferredLanguage: json['preferred_language'] as String?,
-  timezone: json['timezone'] as String?,
-);
+      firstName: json['first_name'] as String?,
+      lastName: json['last_name'] as String?,
+      phone: json['phone'] as String?,
+      preferredLanguage: json['preferred_language'] as String?,
+      timezone: json['timezone'] as String?,
+    );
 
 Map<String, dynamic> _$UserProfileToJson(UserProfile instance) =>
     <String, dynamic>{
@@ -178,21 +185,21 @@ Map<String, dynamic> _$UserProfileToJson(UserProfile instance) =>
 AccessibilityPreferences _$AccessibilityPreferencesFromJson(
   Map<String, dynamic> json,
 ) => AccessibilityPreferences(
-  visualImpairmentLevel: json['visual_impairment_level'] as String?,
-  screenReaderUser: json['screen_reader_user'] as bool?,
-  preferredTtsSpeed: (json['preferred_tts_speed'] as num?)?.toDouble(),
-  highContrastMode: json['high_contrast_mode'] as bool?,
-  darkModeEnabled: json['dark_mode_enabled'] as bool?,
-  hapticFeedbackEnabled: json['haptic_feedback_enabled'] as bool?,
-);
+      visualImpairmentLevel: json['visual_impairment_level'] as String?,
+      screenReaderUser: json['screen_reader_user'] as bool?,
+      preferredTtsSpeed: (json['preferred_tts_speed'] as num?)?.toDouble(),
+      highContrastMode: json['high_contrast_mode'] as bool?,
+      darkModeEnabled: json['dark_mode_enabled'] as bool?,
+      hapticFeedbackEnabled: json['haptic_feedback_enabled'] as bool?,
+    );
 
 Map<String, dynamic> _$AccessibilityPreferencesToJson(
   AccessibilityPreferences instance,
 ) => <String, dynamic>{
-  'visual_impairment_level': instance.visualImpairmentLevel,
-  'screen_reader_user': instance.screenReaderUser,
-  'preferred_tts_speed': instance.preferredTtsSpeed,
-  'high_contrast_mode': instance.highContrastMode,
-  'dark_mode_enabled': instance.darkModeEnabled,
-  'haptic_feedback_enabled': instance.hapticFeedbackEnabled,
-};
+      'visual_impairment_level': instance.visualImpairmentLevel,
+      'screen_reader_user': instance.screenReaderUser,
+      'preferred_tts_speed': instance.preferredTtsSpeed,
+      'high_contrast_mode': instance.highContrastMode,
+      'dark_mode_enabled': instance.darkModeEnabled,
+      'haptic_feedback_enabled': instance.hapticFeedbackEnabled,
+    };

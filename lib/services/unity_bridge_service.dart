@@ -1,41 +1,29 @@
 // lib/services/unity_bridge_service.dart
-// ✅ v3.1 — Fix: handleIntent() decodifica prefijos __unity:* de ConversationService
-//          Fix: isReady expuesto como ValueNotifier para reactividad en UI
-//          NEW: onTrackingStateChanged callback para tracking_state de ARCore
+// ✅ v3.2 — Fix: tts_request caía en onResponse con ok=false y se descartaba
 //
-//  CAMBIOS v3 → v3.1:
-//  ─────────────────────────────────────────────────────────────────────────
-//  1. Nuevo callback: onTrackingStateChanged(bool isStable, String state, String reason)
-//     Llamado cuando Unity envía action="tracking_state". No se propaga a
-//     onResponse para evitar que el coordinator hable por TTS sobre cada
-//     cambio de estado (sería muy ruidoso durante VIO fault).
+// ============================================================================
+//  CAMBIOS v3.1 → v3.2
+// ============================================================================
 //
-//  2. handleUnityMessage() — branch tracking_state con return temprano.
+//  BUG CORREGIDO — tts_request era descartado silenciosamente:
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v3.
+//    ANTES (v3.1):
+//      handleUnityMessage() parseaba el JSON y llamaba onResponse?.call(response).
+//      El JSON de tts_request NO tiene campo "ok" → UnityResponse.fromJson lo
+//      inicializaba con ok=false por defecto.
+//      ar_navigation_screen.dart tenía:
+//        _unityBridge.onResponse = (response) {
+//          if (!response.ok) { _logger.w('❌ ...'); return; }  ← cortocircuito aquí
+//        }
+//      → El mensaje nunca llegaba a VoiceNavigationService → silencio total.
 //
-//  ACCIONES QUE ENTIENDE Unity (FlutterUnityBridge.cs switch):
-//    navigate_to       → VoiceCommandAPI.NavigateTo(name)
-//    stop_navigation   → VoiceCommandAPI.StopNavigation()
-//    nav_status        → VoiceCommandAPI.GetNavigationStatus()
-//    list_waypoints    → VoiceCommandAPI.ListWaypoints()
-//    create_waypoint   → VoiceCommandAPI.CreateWaypointAtAgent(name)
-//    remove_waypoint   → VoiceCommandAPI.RemoveWaypoint(name)
-//    clear_waypoints   → VoiceCommandAPI.ClearWaypoints()
-//    save_session      → VoiceCommandAPI.SaveSession()
-//    load_session      → VoiceCommandAPI.LoadSession()
+//    AHORA (v3.2):
+//      Se añade return temprano en handleUnityMessage() para action="tts_request",
+//      igual que ya existía para action="tracking_state".
+//      Se añade callback onTTSRequest que VoiceNavigationService usa para
+//      suscribirse directamente, sin pasar por el stream broadcast ni por onResponse.
 //
-//  RESPUESTAS QUE ENVÍA Unity (canal OnUnityResponse):
-//    { "action": "...", "ok": true|false, "message": "...", ...extras }
-//    list_waypoints incluye además: "count": N, "waypoints": [...]
-//    tracking_state incluye: "stable": bool, "state": String, "reason": String
-//
-//  PREFIJOS INTERNOS de ConversationService (resueltos aquí):
-//    __unity:list_waypoints          → listWaypoints()
-//    __unity:save_session            → saveSession()
-//    __unity:load_session            → loadSession()
-//    __unity:create_waypoint:<name>  → createWaypoint(name)
-//    __unity:remove_waypoint:<name>  → removeWaypoint(name)
+//  TODO LO DEMÁS ES IDÉNTICO A v3.1.
 
 import 'dart:async';
 import 'dart:convert';
@@ -149,18 +137,21 @@ class UnityBridgeService {
   /// Llamado específicamente cuando llega la lista de waypoints
   Function(List<WaypointInfo>)? onWaypointsReceived;
 
-  /// ✅ v3.1: Llamado cuando Unity reporta cambio en el estado de tracking AR.
-  ///
-  /// Parámetros:
-  ///   isStable — true si ARCore tiene SessionTracking activo y confiable
-  ///   state    — ARSessionState: "SessionTracking", "SessionInitializing", etc.
-  ///   reason   — NotTrackingReason de ARCore: "ExcessiveMotion",
-  ///              "InsufficientFeatures", "InsufficientLight",
-  ///              "Relocalizing", "Initializing", "None", etc.
+  /// Llamado cuando Unity reporta cambio en el estado de tracking AR.
   ///
   /// NO se propaga a onResponse para evitar que NavigationCoordinator
   /// hable por TTS sobre cada cambio de estado de tracking.
   Function(bool isStable, String state, String reason)? onTrackingStateChanged;
+
+  /// ✅ v3.2: Llamado cuando Unity envía una solicitud TTS (action="tts_request").
+  ///
+  /// VoiceNavigationService se suscribe aquí directamente. El JSON de
+  /// tts_request no tiene campo "ok", por lo que NO debe pasar por onResponse
+  /// (que descartaría el mensaje al ver ok=false).
+  ///
+  /// JSON recibido:
+  ///   { "action": "tts_request", "text": "...", "priority": 2, "interrupt": false }
+  Function(UnityResponse)? onTTSRequest;
 
   // ─── Setup ───────────────────────────────────────────────────────────────
 
@@ -180,11 +171,11 @@ class UnityBridgeService {
     try {
       final response = UnityResponse.fromJson(raw);
 
-      // Notificar stream (todos los mensajes)
+      // Notificar stream broadcast (todos los mensajes — para suscriptores externos)
       if (!_responseStream.isClosed) _responseStream.add(response);
 
-      // ✅ v3.1: tracking_state se maneja por su propio callback.
-      // Return temprano — no llegar a onResponse (evita TTS ruidoso).
+      // ✅ v3.1: tracking_state — callback propio, return temprano.
+      // No llegar a onResponse (evita TTS ruidoso por cada cambio de estado AR).
       if (response.action == 'tracking_state') {
         final isStable = response.raw['stable'] as bool?   ?? true;
         final state    = response.raw['state']  as String? ?? '';
@@ -192,10 +183,27 @@ class UnityBridgeService {
         onTrackingStateChanged?.call(isStable, state, reason);
         _logger.d('[UnityBridge] tracking_state: stable=$isStable '
             'state=$state reason=$reason');
-        return;
+        return; // ← return temprano
       }
 
-      // Callbacks generales
+      // ✅ v3.2: tts_request — callback propio, return temprano.
+      //
+      // PROBLEMA QUE RESUELVE:
+      //   tts_request no tiene campo "ok" → UnityResponse.fromJson fija ok=false.
+      //   Si llegara a onResponse, ar_navigation_screen lo descartaría
+      //   inmediatamente en el branch `if (!response.ok)` y loguearía "❌".
+      //   El mensaje nunca alcanzaría VoiceNavigationService → silencio total.
+      //
+      // SOLUCIÓN:
+      //   Return temprano antes de onResponse. VoiceNavigationService se
+      //   conecta directamente a onTTSRequest en attachToUnityBridge().
+      if (response.action == 'tts_request') {
+        onTTSRequest?.call(response);
+        _logger.d('[UnityBridge] tts_request enrutado a onTTSRequest');
+        return; // ← return temprano
+      }
+
+      // Callbacks generales para el resto de acciones (navigate, waypoints, etc.)
       onResponse?.call(response);
 
       if (response.action == 'list_waypoints' && response.ok) {
@@ -359,6 +367,7 @@ class UnityBridgeService {
     _responseStream.close();
     isReadyNotifier.dispose();
     _controller = null;
+    onTTSRequest = null;
     isReadyNotifier.value = false;
   }
 }

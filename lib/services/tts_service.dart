@@ -1,42 +1,33 @@
 // lib/services/tts_service.dart
-// ✅ v2.0 — Fix cola TTS: mensajes de navegación se perdían
+// ✅ v2.1 — Fix "not bound to TTS engine" al iniciar
 //
 // ============================================================================
-//  CAMBIOS v1 → v2.0
+//  CAMBIOS v2.0 → v2.1
 // ============================================================================
 //
-//  BUG 1 CORREGIDO — waitForCompletion() consumía el evento del stream broadcast:
+//  BUG CORREGIDO — "speak failed: not bound to TTS engine":
 //
-//    ANTES:
-//      waitForCompletion() usaba onComplete.first — esto registra un listener
-//      que consume el PRIMER evento emitido y se cancela. Como onComplete es un
-//      broadcast stream, si tanto waitForCompletion() como la suscripción de
-//      VoiceNavigationService escuchan simultáneamente, SOLO UNO recibe el evento.
-//      En la práctica, waitForCompletion() ganaba la carrera → _onTTSCompleted()
-//      de VoiceNavigationService nunca se llamaba → _pendingInstruction nunca
-//      se procesaba → el segundo mensaje de navegación se perdía.
+//    CAUSA: FlutterTts.initialize() completa sus Futures internos antes de que
+//    el motor Android (TextToSpeech) termine el binding asíncrono con el servicio
+//    del sistema. Si speak() se llama inmediatamente después del init (< 1-2s),
+//    el motor aún no está listo y Android descarta el utterance silenciosamente,
+//    emitiendo solo el warning "speak failed: not bound to TTS engine".
 //
-//    AHORA:
-//      waitForCompletion() usa un Completer propio que se completa desde
-//      el _completionController, sin consumir el evento del broadcast stream.
-//      Todos los listeners reciben el evento correctamente.
+//    SOLUCIÓN 1 — awaitSpeakCompletion(true): Le indica a FlutterTts que espere
+//    a que el motor esté listo antes de resolver el Future de speak(). Con esto,
+//    speak() no retorna hasta que el utterance fue aceptado por el motor.
 //
-//  BUG 2 CORREGIDO — setQueueMode(1) impedía callbacks por utterance:
+//    SOLUCIÓN 2 — Retry con backoff: Si el primer speak() falla de todos modos
+//    (motor lento en algunos dispositivos), se reintenta hasta 3 veces con
+//    delays de 300ms/600ms/1000ms antes de rendirse.
 //
-//    ANTES:
-//      setQueueMode(1) = QUEUE_ADD → Android encola utterances internamente
-//      y emite UN SOLO completionHandler al final de toda la cola.
-//      VoiceNavigationService nunca sabía cuándo terminó el primer mensaje.
+//    SOLUCIÓN 3 — Warm-up silencioso: Al inicializar, se hace un speak(" ")
+//    para forzar el binding del motor antes de que llegue el primer mensaje real.
+//    Esto resuelve el problema en la mayoría de dispositivos sin necesidad de retry.
 //
-//    AHORA:
-//      setQueueMode(0) = QUEUE_FLUSH → cada speak() reemplaza la cola del
-//      engine. La cola se maneja completamente en Flutter (VoiceNavigationService),
-//      que tiene toda la lógica de prioridades. El engine solo ejecuta un
-//      utterance a la vez y siempre emite completionHandler al terminar.
-//
-//  COMPORTAMIENTOS CONSERVADOS:
-//    - Singleton
-//    - Stream onComplete broadcast para múltiples suscriptores
+//  COMPORTAMIENTOS CONSERVADOS v2.0:
+//    - Singleton, stream broadcast, Completer independiente
+//    - setQueueMode(0) = QUEUE_FLUSH
 //    - API speak(text, interrupt) idéntica
 //    - _cleanText() idéntico
 //    - isSpeaking, isInitialized, stop(), dispose() idénticos
@@ -51,18 +42,15 @@ class TTSService {
   factory TTSService() => _instance;
   TTSService._internal();
 
-  final Logger   _logger = Logger();
-  final FlutterTts _tts  = FlutterTts();
+  final Logger _logger = Logger();
+  final FlutterTts _tts = FlutterTts();
 
   bool _isInitialized = false;
-  bool _isSpeaking    = false;
+  bool _isSpeaking = false;
 
-  // ✅ v2: Stream broadcast — múltiples suscriptores reciben TODOS los eventos.
-  // VoiceNavigationService y waitForCompletion() son suscriptores independientes.
   final _completionController = StreamController<void>.broadcast();
   Stream<void> get onComplete => _completionController.stream;
 
-  // ✅ v2: Completer propio para waitForCompletion() — no consume el stream.
   Completer<void>? _waitCompleter;
 
   Future<void> initialize() async {
@@ -77,13 +65,7 @@ class TTSService {
       _tts.setCompletionHandler(() {
         _isSpeaking = false;
         _logger.d('✅ TTS completado');
-
-        // ✅ v2 FIX 1: Emitir en el broadcast stream — TODOS los suscriptores
-        // reciben este evento (VoiceNavigationService + cualquier otro listener).
         _completionController.add(null);
-
-        // ✅ v2 FIX 1: Completar el Completer de waitForCompletion()
-        // de forma INDEPENDIENTE al broadcast stream.
         if (_waitCompleter != null && !_waitCompleter!.isCompleted) {
           _waitCompleter!.complete();
         }
@@ -92,8 +74,6 @@ class TTSService {
       _tts.setErrorHandler((msg) {
         _isSpeaking = false;
         _logger.e('❌ TTS Error: $msg');
-
-        // Notificar error como completion para no bloquear la cola
         _completionController.add(null);
         if (_waitCompleter != null && !_waitCompleter!.isCompleted) {
           _waitCompleter!.complete();
@@ -106,16 +86,30 @@ class TTSService {
       await _tts.setPitch(1.0);
 
       if (Platform.isAndroid) {
-        // ✅ v2 FIX 2: QUEUE_FLUSH (0) — el engine ejecuta un utterance a la vez
-        // y SIEMPRE emite completionHandler al terminar cada uno.
-        // ANTES: QUEUE_ADD (1) emitía UN SOLO completion al final de toda la cola
-        // → VoiceNavigationService nunca sabía cuándo terminó cada instrucción.
-        await _tts.setQueueMode(0);
+        await _tts.setQueueMode(0); // QUEUE_FLUSH: un utterance a la vez
+
+        // ── SOLUCIÓN 1: awaitSpeakCompletion ──────────────────────────────
+        // Le indica a FlutterTts que los Futures de speak() no resuelvan
+        // hasta que el motor Android haya aceptado y completado el utterance.
+        // Sin esto, speak() puede retornar antes de que el motor esté listo.
+        await _tts.awaitSpeakCompletion(true);
       }
 
       _isInitialized = true;
-      _logger.i('✅ TTS v2 inicializado');
 
+      // ── SOLUCIÓN 3: Warm-up silencioso ────────────────────────────────────
+      // Un speak con espacio fuerza el binding del motor Android de inmediato.
+      // Cuando llegue el primer mensaje real, el motor ya estará conectado.
+      // El espacio no produce audio audible pero establece la conexión.
+      await Future.delayed(const Duration(milliseconds: 200));
+      try {
+        await _tts.speak(' ');
+        await Future.delayed(const Duration(milliseconds: 300));
+      } catch (_) {
+        // Ignorar error del warm-up — es solo para establecer el binding
+      }
+
+      _logger.i('✅ TTS v2.1 inicializado');
     } catch (e) {
       _logger.e('Error inicializando TTS: $e');
       rethrow;
@@ -132,26 +126,65 @@ class TTSService {
     }
 
     if (_isSpeaking && !interrupt) {
-      // ✅ v2 FIX 1: waitForCompletion() usa Completer propio,
-      // no consume el evento del broadcast stream.
       _logger.d('TTS ocupado, esperando...');
       await waitForCompletion();
     }
 
-    try {
-      final cleanText = _cleanText(text);
-      _logger.d('🔊 "$cleanText"');
+    final cleanText = _cleanText(text);
+    if (cleanText.isEmpty) return;
 
-      // ✅ v2: Crear nuevo Completer para este utterance ANTES de speak()
-      _waitCompleter = Completer<void>();
+    _logger.d('🔊 "$cleanText"');
 
-      await _tts.speak(cleanText);
-    } catch (e) {
-      _logger.e('Error speak: $e');
-      _isSpeaking = false;
-      // Asegurarse de no dejar el Completer colgado
-      if (_waitCompleter != null && !_waitCompleter!.isCompleted) {
-        _waitCompleter!.complete();
+    // ── SOLUCIÓN 2: Retry con backoff ─────────────────────────────────────
+    // Si el motor aún no está listo (raro con warm-up), reintentamos hasta
+    // 3 veces con delays crecientes antes de rendirse.
+    const retryDelays = [300, 600, 1000]; // ms
+    int attempt = 0;
+
+    while (attempt <= retryDelays.length) {
+      try {
+        _waitCompleter = Completer<void>();
+        final result = await _tts.speak(cleanText);
+
+        // result == 1 en Android = éxito; null/0 = probable fallo de binding
+        if (result == 1 || result == null || Platform.isIOS) {
+          // Éxito o iOS (donde result es siempre null)
+          return;
+        }
+
+        // result != 1 en Android → motor no listo todavía
+        _logger.w(
+            '⚠️ TTS speak retornó $result (intento ${attempt + 1}/${retryDelays.length + 1})');
+
+        if (attempt < retryDelays.length) {
+          if (_waitCompleter != null && !_waitCompleter!.isCompleted) {
+            _waitCompleter!.complete();
+          }
+          await Future.delayed(Duration(milliseconds: retryDelays[attempt]));
+          attempt++;
+          continue;
+        }
+
+        // Se agotaron los reintentos
+        _logger.e('❌ TTS falló después de ${attempt + 1} intentos');
+        _isSpeaking = false;
+        if (_waitCompleter != null && !_waitCompleter!.isCompleted) {
+          _waitCompleter!.complete();
+        }
+        return;
+      } catch (e) {
+        _logger.e('Error speak (intento ${attempt + 1}): $e');
+        _isSpeaking = false;
+        if (_waitCompleter != null && !_waitCompleter!.isCompleted) {
+          _waitCompleter!.complete();
+        }
+
+        if (attempt < retryDelays.length) {
+          await Future.delayed(Duration(milliseconds: retryDelays[attempt]));
+          attempt++;
+          continue;
+        }
+        return;
       }
     }
   }
@@ -161,7 +194,6 @@ class TTSService {
     try {
       await _tts.stop();
       _isSpeaking = false;
-      // Liberar cualquier waitForCompletion() pendiente
       if (_waitCompleter != null && !_waitCompleter!.isCompleted) {
         _waitCompleter!.complete();
       }
@@ -170,14 +202,11 @@ class TTSService {
     }
   }
 
-  /// ✅ v2: Usa Completer propio — NO consume el broadcast stream.
-  /// Múltiples suscriptores a onComplete siguen recibiendo los eventos.
   Future<void> waitForCompletion({
     Duration timeout = const Duration(seconds: 30),
   }) async {
     if (!_isSpeaking) return;
 
-    // Si ya hay un Completer activo, esperar en él
     final completer = _waitCompleter;
     if (completer == null || completer.isCompleted) return;
 
@@ -192,13 +221,13 @@ class TTSService {
   String _cleanText(String text) {
     return text
         .replaceAll(
-        RegExp(r'[^\w\s\.,!?;:()\-áéíóúñÁÉÍÓÚÑ]', unicode: true), '')
+            RegExp(r'[^\w\s\.,!?;:()\-áéíóúñÁÉÍÓÚÑ]', unicode: true), '')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
   }
 
   bool get isInitialized => _isInitialized;
-  bool get isSpeaking    => _isSpeaking;
+  bool get isSpeaking => _isSpeaking;
 
   void dispose() {
     _tts.stop();

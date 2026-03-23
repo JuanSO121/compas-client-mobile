@@ -3,9 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import '../../services/auth_service.dart';
-import '../../main.dart';
 import '../ar_navigation_screen.dart';
-import '../voice_navigation_screen.dart';
+import 'request_new_code_screen.dart';
 
 class LoginScreenIntegrated extends StatefulWidget {
   const LoginScreenIntegrated({super.key});
@@ -16,16 +15,26 @@ class LoginScreenIntegrated extends StatefulWidget {
 
 class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
     with TickerProviderStateMixin {
-  final TextEditingController _emailController = TextEditingController();
-  final FocusNode _emailFocusNode = FocusNode();
-  final TextEditingController _passwordController = TextEditingController();
-  final FocusNode _passwordFocusNode = FocusNode();
+  // ── Cada dígito del código tiene su propio controller y focusNode ──────
+  // Esto permite que el foco salte automáticamente al siguiente campo al
+  // escribir, lo que es más natural para todos pero especialmente para
+  // personas con discapacidad motriz que usan teclado externo o switch.
+  final List<TextEditingController> _digitControllers =
+      List.generate(6, (_) => TextEditingController());
+  final List<FocusNode> _digitFocusNodes =
+      List.generate(6, (_) => FocusNode());
+
+  // Controller alternativo: campo único (para quien prefiera pegar el código)
+  final TextEditingController _singleCodeController = TextEditingController();
+  final FocusNode _singleCodeFocusNode = FocusNode();
 
   final AuthService _authService = AuthService();
 
   bool _isLoading = false;
   String? _errorMessage;
-  bool _rememberMe = false;
+
+  // Modo de entrada: true = un campo por dígito, false = campo único
+  bool _useDigitFields = true;
 
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
@@ -40,10 +49,8 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
       duration: const Duration(milliseconds: 300),
       vsync: this,
     );
-    _fadeAnimation = CurvedAnimation(
-      parent: _fadeController,
-      curve: Curves.easeInOut,
-    );
+    _fadeAnimation =
+        CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut);
     _fadeController.forward();
 
     _shakeController = AnimationController(
@@ -54,21 +61,23 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
       CurvedAnimation(parent: _shakeController, curve: Curves.elasticIn),
     );
 
-    _emailController.addListener(() {
-      if (_errorMessage != null) {
-        setState(() => _errorMessage = null);
-      }
-    });
+    // Cuando el campo único cambia, sincronizar con los boxes individuales
+    _singleCodeController.addListener(_syncSingleToBoxes);
 
-    _passwordController.addListener(() {
-      if (_errorMessage != null) {
-        setState(() => _errorMessage = null);
-      }
+    // Limpiar error al escribir
+    for (final c in _digitControllers) {
+      c.addListener(() {
+        if (_errorMessage != null) setState(() => _errorMessage = null);
+      });
+    }
+    _singleCodeController.addListener(() {
+      if (_errorMessage != null) setState(() => _errorMessage = null);
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       SemanticsService.announce(
-        'Pantalla de inicio de sesión. Ingrese su correo electrónico y contraseña',
+        'Pantalla de inicio de sesión. '
+        'Ingrese el código de acceso de 6 dígitos que recibió en su email.',
         TextDirection.ltr,
       );
     });
@@ -76,27 +85,104 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
 
   @override
   void dispose() {
-    _emailController.dispose();
-    _passwordController.dispose();
-    _emailFocusNode.dispose();
-    _passwordFocusNode.dispose();
+    for (final c in _digitControllers) c.dispose();
+    for (final f in _digitFocusNodes) f.dispose();
+    _singleCodeController.dispose();
+    _singleCodeFocusNode.dispose();
     _fadeController.dispose();
     _shakeController.dispose();
     super.dispose();
   }
 
-  void _login() async {
-    final email = _emailController.text.trim();
-    final password = _passwordController.text;
+  // ── Sincronización entre modos de entrada ────────────────────────────────
 
-    if (email.isEmpty || password.isEmpty) {
-      setState(() => _errorMessage = 'Por favor complete todos los campos');
-      _showAccessibleSnackBar(_errorMessage!, isError: true);
-      if (email.isEmpty) {
-        _emailFocusNode.requestFocus();
-      } else {
-        _passwordFocusNode.requestFocus();
+  void _syncSingleToBoxes() {
+    final text = _singleCodeController.text.replaceAll(' ', '');
+    for (int i = 0; i < 6; i++) {
+      _digitControllers[i].text = i < text.length ? text[i] : '';
+    }
+  }
+
+  String _getCodeFromBoxes() {
+    return _digitControllers.map((c) => c.text).join();
+  }
+
+  String _getCode() {
+    if (_useDigitFields) {
+      return _getCodeFromBoxes();
+    } else {
+      return _singleCodeController.text.replaceAll(' ', '');
+    }
+  }
+
+  // ── Manejar entrada en cada caja de dígito ──────────────────────────────
+
+  void _onDigitChanged(int index, String value) {
+    if (value.length > 1) {
+      // El usuario pegó más de un dígito — distribuir en los campos restantes
+      _handlePaste(value, startIndex: index);
+      return;
+    }
+
+    if (value.isNotEmpty && index < 5) {
+      // Avanzar al siguiente campo automáticamente
+      _digitFocusNodes[index + 1].requestFocus();
+    }
+
+    // Si se borra con backspace y el campo está vacío, retroceder
+    if (value.isEmpty && index > 0) {
+      _digitFocusNodes[index - 1].requestFocus();
+    }
+
+    // Si el último dígito se llenó, hacer login automáticamente
+    if (index == 5 && value.isNotEmpty) {
+      final code = _getCodeFromBoxes();
+      if (code.length == 6) {
+        Future.delayed(const Duration(milliseconds: 100), _login);
       }
+    }
+
+    setState(() {});
+  }
+
+  void _handlePaste(String pasted, {int startIndex = 0}) {
+    final digits = pasted.replaceAll(RegExp(r'\D'), '');
+    for (int i = 0; i < digits.length && (startIndex + i) < 6; i++) {
+      _digitControllers[startIndex + i].text = digits[i];
+    }
+
+    // Foco al último campo llenado
+    final lastFilled = (startIndex + digits.length - 1).clamp(0, 5);
+    _digitFocusNodes[lastFilled].requestFocus();
+
+    setState(() {});
+
+    // Si se completó el código, hacer login
+    final code = _getCodeFromBoxes();
+    if (code.length == 6) {
+      Future.delayed(const Duration(milliseconds: 200), _login);
+    }
+  }
+
+  // ── Login principal ──────────────────────────────────────────────────────
+
+  void _login() async {
+    final code = _getCode();
+
+    if (code.length != 6) {
+      setState(
+          () => _errorMessage = 'Ingrese los 6 dígitos de su código de acceso');
+      _shakeController.forward(from: 0);
+      SemanticsService.announce(
+        'Error: Ingrese los 6 dígitos del código',
+        TextDirection.ltr,
+      );
+      _digitFocusNodes[code.length.clamp(0, 5)].requestFocus();
+      return;
+    }
+
+    if (!RegExp(r'^\d{6}$').hasMatch(code)) {
+      setState(() => _errorMessage = 'El código solo debe contener números');
       _shakeController.forward(from: 0);
       return;
     }
@@ -107,25 +193,28 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
     });
 
     try {
-      // Llamar al servicio de autenticación
-      final response = await _authService.login(
-        email: email,
-        password: password,
-        rememberMe: _rememberMe,
-      );
+      final response = await _authService.loginWithCode(code: code);
 
       if (!mounted) return;
 
       if (response.success && response.data != null) {
-        // Login exitoso
         HapticFeedback.heavyImpact();
 
-        final userName = response.data!.user.profile?.firstName ?? '';
-        final announcement = response.accessibilityInfo?.announcement ??
-            'Sesión iniciada exitosamente';
+        final user = response.data!.user;
+        final name = user.profile?.firstName ?? '';
+        final isFirstLogin = response.data!.firstLogin ?? false;
+
+        final announcement = isFirstLogin
+            ? 'Cuenta verificada. Bienvenido${name.isNotEmpty ? " $name" : ""}.'
+            : 'Sesión iniciada. Bienvenido de vuelta${name.isNotEmpty ? " $name" : ""}.';
 
         SemanticsService.announce(announcement, TextDirection.ltr);
-        _showAccessibleSnackBar('¡Bienvenido${userName.isNotEmpty ? ", $userName" : ""}!');
+        _showSnackBar(
+          isFirstLogin
+              ? '¡Cuenta verificada! Bienvenido${name.isNotEmpty ? ", $name" : ""}!'
+              : 'Bienvenido de vuelta${name.isNotEmpty ? ", $name" : ""}!',
+          isError: false,
+        );
 
         await Future.delayed(const Duration(milliseconds: 500));
         if (!mounted) return;
@@ -135,30 +224,20 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
           MaterialPageRoute(builder: (_) => const ArNavigationScreen()),
         );
       } else {
-        // Error en login
         setState(() {
           _errorMessage = response.message;
           _isLoading = false;
         });
 
-        final announcement = response.accessibilityInfo?.announcement ??
-            response.message;
-
+        final announcement =
+            response.accessibilityInfo?.announcement ?? response.message;
         SemanticsService.announce(announcement, TextDirection.ltr);
-        _showAccessibleSnackBar(_errorMessage!, isError: true);
+        _showSnackBar(_errorMessage!, isError: true);
         _shakeController.forward(from: 0);
 
-        // Focus en el campo apropiado según el error
-        if (response.errors != null && response.errors!.isNotEmpty) {
-          final firstError = response.errors!.first;
-          if (firstError.field == 'email') {
-            _emailFocusNode.requestFocus();
-          } else {
-            _passwordFocusNode.requestFocus();
-          }
-        } else {
-          _passwordFocusNode.requestFocus();
-        }
+        // Limpiar los campos para que el usuario reintente fácilmente
+        _clearDigits();
+        _digitFocusNodes[0].requestFocus();
       }
     } catch (e) {
       if (!mounted) return;
@@ -166,14 +245,21 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
         _errorMessage = 'Error de conexión. Intente nuevamente.';
         _isLoading = false;
       });
-      _showAccessibleSnackBar(_errorMessage!, isError: true);
+      _showSnackBar(_errorMessage!, isError: true);
       _shakeController.forward(from: 0);
     }
   }
 
-  void _showAccessibleSnackBar(String message, {bool isError = false}) {
-    SemanticsService.announce(message, TextDirection.ltr);
+  void _clearDigits() {
+    for (final c in _digitControllers) {
+      c.clear();
+    }
+    _singleCodeController.clear();
+    setState(() {});
+  }
 
+  void _showSnackBar(String message, {bool isError = false}) {
+    SemanticsService.announce(message, TextDirection.ltr);
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
@@ -187,11 +273,9 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: Text(
-                message,
-                style:
-                const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-              ),
+              child: Text(message,
+                  style: const TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.w600)),
             ),
           ],
         ),
@@ -205,6 +289,8 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
       ),
     );
   }
+
+  // ── Build ────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -225,12 +311,34 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
         ),
         title: Semantics(
           header: true,
-          label: 'Iniciar Sesión',
-          child: const Text(
-            'Iniciar Sesión',
-            style: TextStyle(fontWeight: FontWeight.bold),
-          ),
+          child: const Text('Iniciar Sesión',
+              style: TextStyle(fontWeight: FontWeight.bold)),
         ),
+        actions: [
+          // Botón para cambiar entre modo caja y modo campo único
+          Semantics(
+            label: _useDigitFields
+                ? 'Cambiar a campo único para pegar el código'
+                : 'Cambiar a cajas individuales por dígito',
+            button: true,
+            child: IconButton(
+              icon: Icon(
+                _useDigitFields ? Icons.input_rounded : Icons.grid_view_rounded,
+                size: 24,
+              ),
+              tooltip: _useDigitFields ? 'Modo campo único' : 'Modo cajas',
+              onPressed: () {
+                setState(() => _useDigitFields = !_useDigitFields);
+                SemanticsService.announce(
+                  _useDigitFields
+                      ? 'Modo cajas individuales activado'
+                      : 'Puedes dicar tu código.',
+                  TextDirection.ltr,
+                );
+              },
+            ),
+          ),
+        ],
       ),
       body: SafeArea(
         child: FadeTransition(
@@ -239,74 +347,100 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
             padding: const EdgeInsets.symmetric(horizontal: 32),
             child: Column(
               children: [
-                const SizedBox(height: 40),
+                const SizedBox(height: 32),
 
-                // TÍTULO
+                // ── ÍCONO ────────────────────────────────────────────
                 Semantics(
-                  label: 'Ingrese sus credenciales para acceder',
+                  label: 'Llave de acceso',
+                  excludeSemantics: true,
+                  child: Container(
+                    width: 90,
+                    height: 90,
+                    decoration: BoxDecoration(
+                      color:
+                          theme.colorScheme.primary.withOpacity(0.12),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(
+                      Icons.vpn_key_rounded,
+                      size: 44,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 28),
+
+                // ── TÍTULO ───────────────────────────────────────────
+                Semantics(
+                  header: true,
+                  label: 'Ingrese su código de acceso de 6 dígitos',
                   child: Text(
-                    'Bienvenido de nuevo',
+                    'Tu código de acceso',
                     style: theme.textTheme.titleLarge?.copyWith(
-                      fontSize: 28,
+                      fontSize: 26,
                       fontWeight: FontWeight.bold,
                     ),
                     textAlign: TextAlign.center,
                   ),
                 ),
 
-                const SizedBox(height: 16),
+                const SizedBox(height: 12),
 
                 Semantics(
-                  label: 'Ingrese su email y contraseña para continuar',
+                  label:
+                      'Ingrese el código de 6 dígitos que recibió en su email al registrarse',
                   child: Text(
-                    'Accede a tu cuenta',
+                    'Ingrese el código de 6 dígitos\nque recibió en su email',
                     style: theme.textTheme.bodyLarge?.copyWith(
-                      fontSize: 17,
+                      fontSize: 16,
                       color: theme.colorScheme.onSurface.withOpacity(0.6),
+                      height: 1.5,
                     ),
                     textAlign: TextAlign.center,
                   ),
                 ),
 
-                const SizedBox(height: 48),
+                const SizedBox(height: 40),
 
-                // CAMPO EMAIL
-                _buildTextField(
-                  controller: _emailController,
-                  focusNode: _emailFocusNode,
-                  label: 'Correo electrónico',
-                  hint: 'ejemplo@correo.com',
-                  icon: Icons.email_rounded,
-                  keyboardType: TextInputType.emailAddress,
-                  textInputAction: TextInputAction.next,
-                  onSubmitted: (_) => _passwordFocusNode.requestFocus(),
+                // ── ENTRADA DE CÓDIGO ────────────────────────────────
+                AnimatedBuilder(
+                  animation: _shakeAnimation,
+                  builder: (context, child) => Transform.translate(
+                    offset: Offset(_shakeAnimation.value, 0),
+                    child: child,
+                  ),
+                  child: _useDigitFields
+                      ? _buildDigitBoxes(theme)
+                      : _buildSingleField(theme),
                 ),
 
-                const SizedBox(height: 20),
+                const SizedBox(height: 8),
 
-                // CAMPO CONTRASEÑA
-                _buildTextField(
-                  controller: _passwordController,
-                  focusNode: _passwordFocusNode,
-                  label: 'Contraseña',
-                  hint: 'Tu contraseña',
-                  icon: Icons.lock_rounded,
-                  obscureText: true,
-                  textInputAction: TextInputAction.done,
-                  onSubmitted: (_) => _login(),
+                // Hint de modo
+                Text(
+                  _useDigitFields
+                      ? 'También puede pegar el código — toque el ícono ↗ para cambiar'
+                      : 'Modo campo único. Puede pegar directamente el código.',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurface.withOpacity(0.4),
+                    fontSize: 12,
+                  ),
+                  textAlign: TextAlign.center,
                 ),
 
-                // MENSAJE DE ERROR
+                // ── ERROR ────────────────────────────────────────────
                 if (_errorMessage != null) ...[
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 20),
                   Semantics(
-                    label: 'Error: $_errorMessage',
                     liveRegion: true,
+                    label: 'Error: $_errorMessage',
                     child: Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 16, vertical: 12),
                       decoration: BoxDecoration(
-                        color: theme.colorScheme.error.withOpacity(0.1),
+                        color:
+                            theme.colorScheme.error.withOpacity(0.1),
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(
                           color: theme.colorScheme.error.withOpacity(0.3),
@@ -315,11 +449,9 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
                       ),
                       child: Row(
                         children: [
-                          Icon(
-                            Icons.warning_rounded,
-                            size: 20,
-                            color: theme.colorScheme.error,
-                          ),
+                          Icon(Icons.warning_rounded,
+                              size: 20,
+                              color: theme.colorScheme.error),
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
@@ -339,59 +471,47 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
 
                 const SizedBox(height: 32),
 
-                // BOTÓN LOGIN
+                // ── BOTÓN INGRESAR ───────────────────────────────────
                 Semantics(
-                  label: 'Botón: Iniciar sesión',
-                  hint: 'Presione para ingresar a su cuenta',
+                  label: 'Botón: Ingresar a la aplicación',
+                  hint: 'Presione para ingresar con su código de acceso',
                   button: true,
-                  child: _buildActionButton(
-                    label: 'Iniciar Sesión',
-                    icon: Icons.login_rounded,
-                    onPressed: _isLoading ? null : _login,
-                    isLoading: _isLoading,
-                  ),
+                  child: _buildLoginButton(theme),
                 ),
 
                 const SizedBox(height: 24),
 
-                // INFO DE SEGURIDAD
+                // ── LINK: OLVIDÉ MI CÓDIGO ───────────────────────────
                 Semantics(
-                  label:
-                  'Información: Conexión segura con encriptación de extremo a extremo',
-                  child: Container(
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.secondary.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(
-                        color: theme.colorScheme.secondary.withOpacity(0.3),
-                        width: 2,
+                  label: 'Olvidé mi código. Solicitar nuevo código de acceso.',
+                  button: true,
+                  child: TextButton.icon(
+                    onPressed: _isLoading
+                        ? null
+                        : () {
+                            HapticFeedback.lightImpact();
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) =>
+                                    const RequestNewCodeScreen(),
+                              ),
+                            );
+                          },
+                    icon: Icon(Icons.refresh_rounded,
+                        size: 20,
+                        color: theme.colorScheme.primary),
+                    label: Text(
+                      'Olvidé mi código — Solicitar uno nuevo',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: theme.colorScheme.primary,
                       ),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.security_rounded,
-                          size: 24,
-                          color: theme.colorScheme.secondary,
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Text(
-                            'Conexión segura. Tus datos están protegidos.',
-                            style: TextStyle(
-                              fontSize: 15,
-                              color: theme.colorScheme.onSurface,
-                              height: 1.4,
-                            ),
-                          ),
-                        ),
-                      ],
                     ),
                   ),
                 ),
-
-                const SizedBox(height: 32),
+                const SizedBox(height: 16),
               ],
             ),
           ),
@@ -400,129 +520,177 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
     );
   }
 
-  Widget _buildTextField({
-    required TextEditingController controller,
-    required FocusNode focusNode,
-    required String label,
-    required String hint,
-    required IconData icon,
-    bool obscureText = false,
-    TextInputType? keyboardType,
-    TextInputAction? textInputAction,
-    void Function(String)? onSubmitted,
-  }) {
-    final theme = Theme.of(context);
+  // ── Widgets de entrada ───────────────────────────────────────────────────
 
-    return AnimatedBuilder(
-      animation: _shakeAnimation,
-      builder: (context, child) {
-        return Transform.translate(
-          offset: Offset(_shakeAnimation.value, 0),
-          child: child,
-        );
-      },
-      child: Semantics(
-        label: 'Campo de texto para $label',
-        textField: true,
-        hint: hint,
+  Widget _buildDigitBoxes(ThemeData theme) {
+    return Semantics(
+      label: 'Código de acceso. 6 cajas para ingresar cada dígito.',
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: List.generate(6, (index) {
+          return Padding(
+            padding: EdgeInsets.only(right: index < 5 ? 10 : 0),
+            child: _buildSingleDigitBox(theme, index),
+          );
+        }),
+      ),
+    );
+  }
+
+  Widget _buildSingleDigitBox(ThemeData theme, int index) {
+    final hasValue = _digitControllers[index].text.isNotEmpty;
+    final hasError = _errorMessage != null;
+
+    return Semantics(
+      label: 'Dígito ${index + 1} de 6',
+      textField: true,
+      child: SizedBox(
+        width: 48,
+        height: 64,
         child: Container(
           decoration: BoxDecoration(
-            color: theme.cardColor,
-            borderRadius: BorderRadius.circular(20),
+            color: hasValue
+                ? theme.colorScheme.primary.withOpacity(0.1)
+                : theme.cardColor,
+            borderRadius: BorderRadius.circular(14),
             border: Border.all(
-              color: _errorMessage != null
+              color: hasError
                   ? theme.colorScheme.error
-                  : theme.colorScheme.primary.withOpacity(0.3),
-              width: 3,
+                  : hasValue
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.primary.withOpacity(0.3),
+              width: hasValue ? 3 : 2,
             ),
-            boxShadow: [
-              BoxShadow(
-                color: _errorMessage != null
-                    ? theme.colorScheme.error.withOpacity(0.2)
-                    : Colors.black.withOpacity(0.05),
-                blurRadius: 12,
-                offset: const Offset(0, 4),
-              ),
-            ],
           ),
           child: TextField(
-            controller: controller,
-            focusNode: focusNode,
-            obscureText: obscureText,
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-            keyboardType: keyboardType,
-            textInputAction: textInputAction,
-            decoration: InputDecoration(
-              hintText: hint,
-              hintStyle: TextStyle(
-                fontSize: 18,
-                color: theme.colorScheme.onSurface.withOpacity(0.3),
-              ),
-              prefixIcon: Icon(
-                _errorMessage != null ? Icons.error_outline_rounded : icon,
-                size: 26,
-                color: _errorMessage != null
-                    ? theme.colorScheme.error
-                    : theme.colorScheme.primary,
-              ),
-              border: InputBorder.none,
-              contentPadding: const EdgeInsets.all(20),
+            controller: _digitControllers[index],
+            focusNode: _digitFocusNodes[index],
+            textAlign: TextAlign.center,
+            keyboardType: TextInputType.number,
+            maxLength: 1,
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+              color: theme.colorScheme.onSurface,
             ),
-            onSubmitted: onSubmitted,
+            inputFormatters: [
+              FilteringTextInputFormatter.digitsOnly,
+            ],
+            decoration: const InputDecoration(
+              border: InputBorder.none,
+              counterText: '',
+              contentPadding: EdgeInsets.zero,
+            ),
+            onChanged: (value) => _onDigitChanged(index, value),
           ),
         ),
       ),
     );
   }
 
-  Widget _buildActionButton({
-    required String label,
-    required IconData icon,
-    required VoidCallback? onPressed,
-    bool isLoading = false,
-  }) {
-    final theme = Theme.of(context);
-    final isEnabled = onPressed != null && !isLoading;
+  Widget _buildSingleField(ThemeData theme) {
+    return Semantics(
+      label: 'Campo de código de acceso. Ingrese o pegue los 6 dígitos.',
+      textField: true,
+      child: Container(
+        decoration: BoxDecoration(
+          color: theme.cardColor,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: _errorMessage != null
+                ? theme.colorScheme.error
+                : theme.colorScheme.primary.withOpacity(0.3),
+            width: 3,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.05),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: TextField(
+          controller: _singleCodeController,
+          focusNode: _singleCodeFocusNode,
+          keyboardType: TextInputType.number,
+          textAlign: TextAlign.center,
+          maxLength: 6,
+          style: const TextStyle(
+            fontSize: 32,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 16,
+          ),
+          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+          decoration: InputDecoration(
+            hintText: '000000',
+            hintStyle: TextStyle(
+              fontSize: 32,
+              letterSpacing: 16,
+              color: theme.colorScheme.onSurface.withOpacity(0.2),
+            ),
+            counterText: '',
+            border: InputBorder.none,
+            contentPadding:
+                const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+            prefixIcon: Icon(
+              Icons.dialpad_rounded,
+              size: 26,
+              color: theme.colorScheme.primary,
+            ),
+          ),
+          onSubmitted: (_) => _login(),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLoginButton(ThemeData theme) {
+    final code = _getCode();
+    final isComplete = code.length == 6;
+    final isEnabled = !_isLoading && isComplete;
 
     return Material(
       color: isEnabled
           ? theme.colorScheme.primary
-          : theme.colorScheme.primary.withOpacity(0.5),
+          : theme.colorScheme.primary.withOpacity(0.45),
       borderRadius: BorderRadius.circular(20),
       elevation: isEnabled ? 2 : 0,
       child: InkWell(
-        onTap: onPressed,
+        onTap: isEnabled ? _login : null,
         borderRadius: BorderRadius.circular(20),
-        child: Container(
+        child: SizedBox(
           width: double.infinity,
           height: 72,
-          child: isLoading
+          child: _isLoading
               ? const Center(
-            child: SizedBox(
-              width: 32,
-              height: 32,
-              child: CircularProgressIndicator(
-                strokeWidth: 4,
-                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-              ),
-            ),
-          )
+                  child: SizedBox(
+                    width: 32,
+                    height: 32,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 4,
+                      valueColor:
+                          AlwaysStoppedAnimation<Color>(Colors.white),
+                    ),
+                  ),
+                )
               : Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, size: 28, color: Colors.white),
-              const SizedBox(width: 16),
-              Text(
-                label,
-                style: const TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                  letterSpacing: 0.5,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.login_rounded,
+                        size: 28, color: Colors.white),
+                    const SizedBox(width: 16),
+                    Text(
+                      isComplete ? 'Ingresar' : 'Ingrese su código',
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                  ],
                 ),
-              ),
-            ],
-          ),
         ),
       ),
     );

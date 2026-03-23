@@ -156,18 +156,11 @@ class NavigationCoordinator {
 
   Future<void> _initializeWakeWord() async {
     try {
-      _logger.i('🔍 VERIFICANDO WAKE WORD...');
+      _logger.i('🔍 INICIALIZANDO WAKE WORD (speech_to_text v3)...');
 
-      final key = ApiConfig.picovoiceAccessKey;
-
-      if (key.isEmpty || key.contains('...') || key.length < 20) {
-        _logger.w('❌ Access Key inválido → Wake word desactivado');
-        _wakeWordAvailable = false;
-        return;
-      }
-
+      // ✅ v3: accessKey y modelPath ignorados — sin licencia Picovoice
       await _wakeWordService.initialize(
-        accessKey: key,
+        accessKey: 'speech_to_text_no_key_needed_v3',
         config: const WakeWordConfig.custom(
           keyword:   'oye compas',
           modelPath: 'assets/wake_words/oye_compas_android.ppn',
@@ -182,20 +175,10 @@ class NavigationCoordinator {
       };
 
       _wakeWordAvailable = true;
-      _logger.i('✅ Wake word "Oye COMPAS" ACTIVO');
+      _logger.i('✅ Wake word "Oye COMPAS" ACTIVO (speech_to_text)');
     } catch (e, stack) {
       _logger.e('❌ Error wake word: $e\n$stack');
       _wakeWordAvailable = false;
-
-      final errorStr = e.toString();
-      if (errorStr.contains('ActivationRefused') ||
-          errorStr.contains('ActivationLimit') ||
-          errorStr.contains('00000136')) {
-        _logger.w('⚠️ PICOVOICE KEY AGOTADA O EXPIRADA.');
-        _logger.w('   Solución: Ve a console.picovoice.ai y genera una nueva key.');
-        _logger.w('   El sistema continúa en modo manual (botón de micrófono).');
-      }
-
       _logger.w('⚠️ Continuando sin wake word (modo manual activado)');
     }
   }
@@ -454,8 +437,8 @@ class NavigationCoordinator {
     }
   }
 
-  /// ✅ v5: [suppressSTT] — si true y no hay wake word, NO reactiva el STT.
-  /// Evita que el eco del TTS se capture como nuevo comando durante navegación.
+    /// ✅ v5: [suppressSTT] — si true y no hay wake word, NO reactiva el STT.
+    /// Evita que el eco del TTS se capture como nuevo comando durante navegación.
   Future<void> _completeAndReturnToIdle({bool suppressSTT = false}) async {
     _commandTimeoutTimer?.cancel();
     _partialText = '';
@@ -468,17 +451,23 @@ class NavigationCoordinator {
     _state = CoordinatorState.idle;
 
     if (_wakeWordAvailable && _isActive) {
-      // Con wake word: siempre reactivar (Porcupine no escucha comandos,
-      // solo la palabra clave — el eco no puede activarlo accidentalmente).
-      try {
-        _voiceService.setWakeWordActive(true);
-        await _wakeWordService.resume();
-        onStatusUpdate?.call('Esperando "Oye COMPAS"...');
-      } catch (e) {
-        _logger.e('❌ Error reanudando wake word: $e');
+      // ✅ v3 speech_to_text: aplicar suppressSTT igual que sin wake word.
+      // A diferencia de Porcupine, speech_to_text SÍ puede captar el eco
+      // del TTS y disparar una detección falsa.
+      if (!suppressSTT) {
+        try {
+          _voiceService.setWakeWordActive(true);
+          await _wakeWordService.resume();
+          onStatusUpdate?.call('Esperando "Oye COMPAS"...');
+        } catch (e) {
+          _logger.e('❌ Error reanudando wake word: $e');
+        }
+      } else {
+        _logger.d('[Coordinator] Navegación activa — wake word en pausa');
+        onStatusUpdate?.call('Navegando...');
       }
     } else if (!suppressSTT && _isActive) {
-      // ✅ v5: Sin wake word y sin navegación activa → reactivar STT manual
+      // Sin wake word y sin navegación activa → reactivar STT manual
       try {
         await Future.delayed(const Duration(milliseconds: 600));
         if (_voiceService.sessionManager.canStart()) {
@@ -490,7 +479,7 @@ class NavigationCoordinator {
         _logger.e('❌ Error reactivando STT: $e');
       }
     } else {
-      // ✅ v5: Navegación activa — no reactivar STT; esperar resetNavigation()
+      // Navegación activa — no reactivar STT; esperar resetNavigation()
       _logger.d('[Coordinator] Navegación activa — STT en pausa');
       onStatusUpdate?.call('Navegando...');
     }
@@ -644,6 +633,7 @@ class NavigationCoordinator {
   bool              get isSpeaking        => _ttsService.isSpeaking;
   String?           get lastUserInput     => _lastUserInput;
   bool              get navigationActive  => _navigationActive;
+  WakeWordService get wakeWordService => _wakeWordService;
 
   Future<void> speak(String message) async {
     if (message.isEmpty) return;

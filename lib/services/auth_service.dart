@@ -9,7 +9,86 @@ class AuthService {
   final ApiClient _apiClient = ApiClient();
   final TokenService _tokenService = TokenService();
 
-  // ===== REGISTRO =====
+  // ════════════════════════════════════════════════════════════
+  // LOGIN CON CÓDIGO PERMANENTE — FLUJO PRINCIPAL
+  // ════════════════════════════════════════════════════════════
+  /// El usuario solo ingresa el código de 6 dígitos que recibió por email.
+  /// No necesita email ni contraseña.
+  /// Si es el primer login, el backend verifica la cuenta automáticamente.
+  Future<ApiResponse<AuthData>> loginWithCode({
+    required String code,
+  }) async {
+    try {
+      debugPrint('🔑 Login con código permanente');
+
+      final response = await _apiClient.post<AuthData>(
+        ApiConfig.loginWithCode,
+        body: {'code': code.trim()},
+        fromJson: (data) => AuthData.fromJson(data as Map<String, dynamic>),
+      );
+
+      if (response.success && response.data != null) {
+        await _tokenService.saveTokens(
+          accessToken: response.data!.tokens.accessToken,
+          refreshToken: response.data!.tokens.refreshToken,
+          tokenType: response.data!.tokens.tokenType,
+          expiresIn: response.data!.tokens.expiresIn,
+        );
+        debugPrint('✅ Login con código exitoso — tokens guardados');
+      }
+
+      return response;
+    } catch (e) {
+      debugPrint('❌ Error en loginWithCode: $e');
+      return ApiResponse(
+        success: false,
+        message: 'Error al iniciar sesión: ${e.toString()}',
+        accessibilityInfo: AccessibilityInfo(
+          announcement: 'Error al iniciar sesión',
+          hapticPattern: 'error',
+        ),
+      );
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  // SOLICITAR NUEVO CÓDIGO — RECUPERACIÓN
+  // ════════════════════════════════════════════════════════════
+  /// El usuario olvidó su código. Ingresa email + contraseña para verificar
+  /// su identidad y el backend genera un nuevo código permanente y lo envía.
+  /// El código anterior deja de funcionar inmediatamente.
+  Future<ApiResponse<void>> requestNewCode({
+    required String email,
+    required String password,
+  }) async {
+    try {
+      debugPrint('📧 Solicitando nuevo código de acceso para $email');
+
+      final response = await _apiClient.post<void>(
+        ApiConfig.requestNewCode,
+        body: {
+          'email': email.trim(),
+          'password': password,
+        },
+      );
+
+      return response;
+    } catch (e) {
+      debugPrint('❌ Error en requestNewCode: $e');
+      return ApiResponse(
+        success: false,
+        message: 'Error al solicitar nuevo código: ${e.toString()}',
+        accessibilityInfo: AccessibilityInfo(
+          announcement: 'Error al solicitar código',
+          hapticPattern: 'error',
+        ),
+      );
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  // REGISTRO
+  // ════════════════════════════════════════════════════════════
   Future<ApiResponse<Map<String, dynamic>>> register({
     required String email,
     required String password,
@@ -39,7 +118,7 @@ class AuthService {
       );
 
       if (response.success) {
-        debugPrint('✅ Usuario registrado exitosamente');
+        debugPrint('✅ Usuario registrado. Código enviado al email.');
       }
 
       return response;
@@ -56,7 +135,9 @@ class AuthService {
     }
   }
 
-  // ===== LOGIN =====
+  // ════════════════════════════════════════════════════════════
+  // LOGIN CON EMAIL + CONTRASEÑA — SECUNDARIO / ADMIN
+  // ════════════════════════════════════════════════════════════
   Future<ApiResponse<AuthData>> login({
     required String email,
     required String password,
@@ -69,7 +150,7 @@ class AuthService {
         rememberMe: rememberMe,
       );
 
-      debugPrint('🔑 Iniciando sesión: $email');
+      debugPrint('🔑 Iniciando sesión con email: $email');
 
       final response = await _apiClient.post<AuthData>(
         ApiConfig.login,
@@ -101,21 +182,15 @@ class AuthService {
     }
   }
 
-  // ===== LOGOUT (completo: servidor + local) =====
-  // Usar este método cuando el usuario presiona "Cerrar sesión"
-  // manualmente desde la UI, ya que en ese caso sí tiene un
-  // access token válido para autenticar el request al servidor.
+  // ════════════════════════════════════════════════════════════
+  // LOGOUT COMPLETO (servidor + local)
+  // ════════════════════════════════════════════════════════════
   Future<ApiResponse<void>> logout() async {
     try {
       debugPrint('👋 Cerrando sesión');
-
-      final response = await _apiClient.post<void>(
-        ApiConfig.logout,
-      );
-
+      final response = await _apiClient.post<void>(ApiConfig.logout);
       await _tokenService.clearTokens();
       debugPrint('✅ Sesión cerrada exitosamente');
-
       return response;
     } catch (e) {
       debugPrint('❌ Error en logout: $e');
@@ -131,13 +206,9 @@ class AuthService {
     }
   }
 
-  // ===== LIMPIAR SESIÓN LOCAL (sin llamar al servidor) =====
-  // Usar cuando el refresh token falla o expira.
-  // NO llama al endpoint /logout del servidor porque:
-  //   1. El access token puede estar expirado (el servidor lo rechazaría)
-  //   2. Llamar /logout en este caso registraba un logout en los logs
-  //      del servidor justo después del refresh, confundiendo el flujo
-  //      y haciendo que la sesión pareciera no guardarse.
+  // ════════════════════════════════════════════════════════════
+  // LIMPIAR SESIÓN LOCAL (sin llamar al servidor)
+  // ════════════════════════════════════════════════════════════
   Future<void> clearLocalSession() async {
     try {
       await _tokenService.clearTokens();
@@ -147,7 +218,9 @@ class AuthService {
     }
   }
 
-  // ===== RENOVAR TOKEN =====
+  // ════════════════════════════════════════════════════════════
+  // RENOVAR TOKEN
+  // ════════════════════════════════════════════════════════════
   Future<ApiResponse<TokenPair>> refreshToken() async {
     try {
       final storedRefreshToken = await _tokenService.getRefreshToken();
@@ -170,13 +243,9 @@ class AuthService {
         body: {'refresh_token': storedRefreshToken},
         fromJson: (data) {
           final map = data as Map<String, dynamic>;
-
-          // El backend retorna data: { tokens: { access_token, refresh_token, ... } }
           if (map.containsKey('tokens')) {
             return TokenPair.fromJson(map['tokens'] as Map<String, dynamic>);
           }
-
-          // Fallback: si data es directamente el TokenPair
           return TokenPair.fromJson(map);
         },
       );
@@ -205,17 +274,16 @@ class AuthService {
     }
   }
 
-  // ===== OLVIDÉ MI CONTRASEÑA =====
+  // ════════════════════════════════════════════════════════════
+  // OLVIDÉ MI CONTRASEÑA / RESETEAR CONTRASEÑA
+  // ════════════════════════════════════════════════════════════
   Future<ApiResponse<void>> forgotPassword(String email) async {
     try {
       debugPrint('📧 Solicitando reseteo de contraseña: $email');
-
-      final response = await _apiClient.post<void>(
+      return await _apiClient.post<void>(
         ApiConfig.forgotPassword,
         body: {'email': email},
       );
-
-      return response;
     } catch (e) {
       debugPrint('❌ Error en forgot password: $e');
       return ApiResponse(
@@ -229,7 +297,6 @@ class AuthService {
     }
   }
 
-  // ===== RESETEAR CONTRASEÑA =====
   Future<ApiResponse<void>> resetPassword({
     required String token,
     required String newPassword,
@@ -237,8 +304,7 @@ class AuthService {
   }) async {
     try {
       debugPrint('🔐 Reseteando contraseña');
-
-      final response = await _apiClient.post<void>(
+      return await _apiClient.post<void>(
         ApiConfig.resetPassword,
         body: {
           'token': token,
@@ -246,8 +312,6 @@ class AuthService {
           'confirm_password': confirmPassword,
         },
       );
-
-      return response;
     } catch (e) {
       debugPrint('❌ Error en reset password: $e');
       return ApiResponse(
@@ -261,32 +325,20 @@ class AuthService {
     }
   }
 
-  // ===== VERIFICAR EMAIL =====
-  Future<ApiResponse<void>> verifyEmail(String token) async {
-    try {
-      debugPrint('✉️ Verificando email');
-
-      final response = await _apiClient.post<void>(
-        ApiConfig.verifyEmail,
-        body: {'token': token},
-      );
-
-      return response;
-    } catch (e) {
-      debugPrint('❌ Error en verify email: $e');
-      return ApiResponse(
-        success: false,
-        message: 'Error al verificar email: ${e.toString()}',
-        accessibilityInfo: AccessibilityInfo(
-          announcement: 'Error al verificar email',
-          hapticPattern: 'error',
-        ),
-      );
-    }
-  }
-
-  // ===== VERIFICAR SI ESTÁ AUTENTICADO =====
+  // ════════════════════════════════════════════════════════════
+  // VERIFICAR AUTENTICACIÓN
+  // ════════════════════════════════════════════════════════════
   Future<bool> isAuthenticated() async {
     return await _tokenService.hasTokens();
+  }
+
+  /// Verifica si el access token sigue siendo válido sin llamar al servidor.
+  Future<bool> isAccessTokenValid() async {
+    return await _tokenService.isAccessTokenValid();
+  }
+
+  /// Verifica si hay refresh token disponible para renovar.
+  Future<bool> hasRefreshToken() async {
+    return await _tokenService.hasRefreshToken();
   }
 }

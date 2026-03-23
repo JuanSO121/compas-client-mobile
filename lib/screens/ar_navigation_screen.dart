@@ -1,47 +1,26 @@
 // lib/screens/ar_navigation_screen.dart
-// ✅ v8.0 — Inicialización por etapas: Unity no recibe comandos hasta que
-//           el usuario confirma que está listo.
+// ✅ v8.1 — Fix: WakeWord da error_client al pausar/reanudar la app
 //
 // ============================================================================
-//  CAMBIOS v7.2 → v8.0
+//  CAMBIOS v8.0 → v8.1
 // ============================================================================
 //
-//  PROBLEMA v7.2:
-//    Al entrar a la pantalla, _initializeServices() y _onUnityCreated()
-//    disparaban listWaypoints() y loadSession() inmediatamente, sin esperar
-//    a que Unity terminara de cargar el entorno AR ni a que el usuario
-//    estuviera presente. Causaba race conditions y solicitudes ignoradas.
+//  BUG CORREGIDO — error_client / STT en estado inconsistente tras pause/resume:
 //
-//  SOLUCIÓN v8.0 — Máquina de estados _AppReadyState con 4 etapas:
+//    CAUSA: Cuando la app va a background (Unity onPause, cambio de actividad,
+//    pantalla apagada), el ciclo STT del WakeWordService seguía corriendo.
+//    Android cancelaba el reconocimiento abruptamente → error_client.
+//    Al volver, el _loopActive seguía true pero el STT interno estaba
+//    en estado muerto → el bucle nunca recuperaba escucha real.
 //
-//    [initializing] → Servicios Flutter inicializando / Unity cargando.
-//                     Unity NO recibe ningún comando.
-//                     UI: spinner "Cargando AR..."
+//    SOLUCIÓN: WidgetsBindingObserver en _ArNavigationScreenState.
+//      - AppLifecycleState.paused / inactive → _wakeWordService.pause()
+//        (detiene _stt.stop() limpiamente, marca _isPaused=true)
+//      - AppLifecycleState.resumed → delay 800ms (Unity necesita tiempo
+//        para estabilizarse) y luego _wakeWordService.resume()
+//        (el bucle retoma desde _isPaused=false en el siguiente ciclo)
 //
-//    [waitingUser]  → Flutter listo + Unity lista. Esperando al usuario.
-//                     UI: overlay de bienvenida con botón "Estoy listo"
-//                         (botón de testing; en producción solo wake word).
-//
-//    [loadingSession] → Usuario confirmó. Se envía load_session a Unity.
-//                       Timeout de 8s como seguridad.
-//                       UI: spinner "Cargando sesión..."
-//
-//    [ready]        → Sesión cargada (o timeout). Waypoints solicitados.
-//                     TTS habla confirmación.
-//                     UI: overlay de navegación normal.
-//
-//  CAMBIOS CLAVE:
-//    - _onUnityCreated(): NO llama listWaypoints() ni loadSession().
-//      Solo marca _unityReady = true y llama _tryAdvanceToWaitingUser().
-//    - _initializeServices(): NO llama listWaypoints() al final.
-//      Solo marca _flutterServicesReady = true y llama _tryAdvanceToWaitingUser().
-//    - _tryAdvanceToWaitingUser(): avanza solo si AMBOS flags están listos.
-//    - _onUserReady(): punto de entrada único (botón + voz).
-//    - _onSessionLoadResponse(): maneja session_loaded / session_load_failed
-//      y el timeout de 8s.
-//    - dispose(): cancela _sessionLoadTimeout.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v7.2.
+//  TODO LO DEMÁS ES IDÉNTICO A v8.0.
 
 import 'dart:async';
 import 'package:flutter/material.dart' hide NavigationMode;
@@ -75,8 +54,9 @@ class ArNavigationScreen extends StatefulWidget {
   State<ArNavigationScreen> createState() => _ArNavigationScreenState();
 }
 
+// ✅ v8.1: WidgetsBindingObserver para detectar pause/resume de la app
 class _ArNavigationScreenState extends State<ArNavigationScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
 
   // ─── Servicios ────────────────────────────────────────────
   final NavigationCoordinator  _coordinator      = NavigationCoordinator();
@@ -134,9 +114,41 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // ✅ v8.1
     _setupAnimations();
     _setupUnityBridgeCallbacks();
     _initializeServices();
+  }
+
+  // ✅ v8.1: Pausar/reanudar wake word con el ciclo de vida de la app
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+
+    if (!_wakeWordAvailable || !_isInitialized) return;
+
+    switch (state) {
+      case AppLifecycleState.paused:
+      case AppLifecycleState.inactive:
+        // App va a background — pausar STT limpiamente para evitar error_client
+        _coordinator.wakeWordService.pause();
+        _logger.d('[Lifecycle] App pausada — wake word pausado');
+        break;
+
+      case AppLifecycleState.resumed:
+        // App vuelve al frente — esperar a que Unity se estabilice (≈800ms)
+        // antes de reanudar el STT para evitar conflictos de audio
+        Future.delayed(const Duration(milliseconds: 800), () {
+          if (mounted && _isActive && _wakeWordAvailable) {
+            _coordinator.wakeWordService.resume();
+            _logger.d('[Lifecycle] App reanudada — wake word reanudado');
+          }
+        });
+        break;
+
+      default:
+        break;
+    }
   }
 
   void _setupAnimations() {
@@ -170,7 +182,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _unityBridge.onResponse = (response) {
       if (!mounted) return;
 
-      // v8.0: interceptar respuestas de carga de sesión
       if (response.action == 'session_loaded' ||
           response.action == 'session_load_failed') {
         _sessionLoadTimeout?.cancel();
@@ -220,7 +231,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
   // ─── Máquina de estados de inicialización ────────────────────────────────
 
-  /// Avanza a [waitingUser] solo cuando ambos (Flutter + Unity) están listos.
   void _tryAdvanceToWaitingUser() {
     if (!mounted) return;
     if (_appState != _AppReadyState.initializing) return;
@@ -234,7 +244,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _coordinator.speak('Bienvenido. Di "Estoy listo" cuando quieras comenzar.');
   }
 
-  /// Punto de entrada único: botón de testing + comando de voz "Estoy listo".
   void _onUserReady() {
     if (_appState != _AppReadyState.waitingUser) return;
 
@@ -246,7 +255,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
     _unityBridge.loadSession();
 
-    // Timeout de seguridad: si Unity no responde en 8s, continuar igual
     _sessionLoadTimeout = Timer(const Duration(seconds: 8), () {
       _logger.w('[AppState] Timeout esperando session_loaded — avanzando a ready');
       _onSessionLoadResponse(
@@ -256,7 +264,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     });
   }
 
-  /// Llamado cuando Unity confirma (o falla) la carga, o por timeout.
   void _onSessionLoadResponse({required bool success, required String message}) {
     if (!mounted) return;
     if (_appState != _AppReadyState.loadingSession) return;
@@ -264,7 +271,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _logger.i('[AppState] loadingSession → ready (success: $success)');
     setState(() => _appState = _AppReadyState.ready);
 
-    // Solicitar waypoints ahora que la sesión está lista
     if (_unityBridge.isReady) {
       _logger.i('[AppState] Solicitando waypoints...');
       _unityBridge.listWaypoints();
@@ -386,7 +392,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           _voiceNav.stop();
         }
 
-        // v8.0: el coordinator puede interpretar "Estoy listo" como intent
         if (intent.target == '__app:user_ready' &&
             _appState == _AppReadyState.waitingUser) {
           _onUserReady();
@@ -406,11 +411,14 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       await _voiceNav.initialize(_coordinator.ttsService);
       _voiceNav.attachToUnityBridge(_unityBridge);
 
-      _logger.i('[Screen] ✅ VoiceNavigationService v5.0 inicializado.');
+      if (_coordinator.wakeWordAvailable) {
+        _voiceNav.attachWakeWordService(_coordinator.wakeWordService);
+      }
+
+      _logger.i('[Screen] ✅ VoiceNavigationService v5.8.1 inicializado.');
 
       setState(() => _isInitialized = true);
 
-      // v8.0: Flutter listo — evaluar si avanzar a waitingUser
       _flutterServicesReady = true;
       _tryAdvanceToWaitingUser();
 
@@ -433,8 +441,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     setState(() => _unityLoaded = true);
     _logger.i('✅ Unity AR lista');
 
-    // v8.0: Unity lista — NO pedir waypoints ni sesión aquí.
-    // Eso ocurre en _onUserReady() → _onSessionLoadResponse().
     _unityReady = true;
     _tryAdvanceToWaitingUser();
   }
@@ -588,6 +594,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this); // ✅ v8.1
     _sessionLoadTimeout?.cancel();
     _trackingWarningTimer?.cancel();
     _pulseController.dispose();
@@ -611,7 +618,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // Unity siempre renderiza en background mientras el usuario espera
           Positioned.fill(
             child: UnityWidget(
               onUnityCreated:        _onUnityCreated,
@@ -621,7 +627,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             ),
           ),
 
-          // Etapa 1: Unity aún no terminó de inicializar el widget
           if (!_unityLoaded)
             Container(
               color: const Color(0xFF00162D),
@@ -638,19 +643,15 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               ),
             ),
 
-          // Etapa 2: Esperando confirmación del usuario
           if (_unityLoaded && _appState == _AppReadyState.waitingUser)
             _buildWaitingUserOverlay(),
 
-          // Etapa 3: Cargando sesión en Unity
           if (_unityLoaded && _appState == _AppReadyState.loadingSession)
             _buildLoadingSessionOverlay(),
 
-          // Etapa 4: Navegación activa
           if (_unityLoaded && _appState == _AppReadyState.ready && _showVoiceOverlay)
             _buildVoiceOverlay(),
 
-          // Badge de tracking AR (solo en ready)
           if (_unityLoaded && _appState == _AppReadyState.ready && !_arTrackingStable)
             Positioned(
               top: MediaQuery.of(context).padding.top + 50,
@@ -683,7 +684,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               ),
             ),
 
-          // Botones de UI (solo en ready)
           if (_unityLoaded && _appState == _AppReadyState.ready) ...[
             Positioned(
               top: MediaQuery.of(context).padding.top + 8,
@@ -713,7 +713,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
-  // ─── Overlays de inicialización ───────────────────────────────────────────
+  // ─── Overlays ────────────────────────────────────────────────────────────
 
   Widget _buildWaitingUserOverlay() {
     return Container(
@@ -754,13 +754,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   ),
                 ),
                 const SizedBox(height: 36),
-
-                // ── Botón de testing (quitar en producción) ───────────────
                 GestureDetector(
                   onTap: _onUserReady,
                   child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 32, vertical: 16),
+                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
                     decoration: BoxDecoration(
                       color: const Color(0xFFFF6B00),
                       borderRadius: BorderRadius.circular(16),
@@ -786,7 +783,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     ),
                   ),
                 ),
-
                 const SizedBox(height: 16),
                 if (_wakeWordAvailable)
                   Text(
@@ -822,7 +818,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
-  // ─── Overlay de voz (etapa ready) ────────────────────────────────────────
+  // ─── Overlay de voz ──────────────────────────────────────────────────────
 
   Widget _buildVoiceOverlay() {
     return SafeArea(
@@ -988,8 +984,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   if (!_wakeWordAvailable) ...[
                     const SizedBox(height: 10),
                     Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                       decoration: BoxDecoration(
                         color: Colors.orange.withOpacity(0.15),
                         borderRadius: BorderRadius.circular(8),
@@ -997,11 +992,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                       ),
                       child: const Row(
                         children: [
-                          Icon(Icons.warning_amber_rounded,
-                              color: Colors.orange, size: 14),
+                          Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 14),
                           SizedBox(width: 6),
                           Expanded(child: Text(
-                            'Wake word inactivo.\nRenueva tu Picovoice key.',
+                            'Wake word inactivo (speech_to_text v3)',
                             style: TextStyle(color: Colors.orange, fontSize: 11),
                           )),
                         ],
@@ -1015,21 +1009,18 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     builder: (_, __) {
                       if (!_waypointContext.hasWaypoints) {
                         return Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 7),
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
                           decoration: BoxDecoration(
                             color: Colors.blue.withOpacity(0.08),
                             borderRadius: BorderRadius.circular(8),
                             border: Border.all(color: Colors.blue.withOpacity(0.3)),
                           ),
                           child: const Row(children: [
-                            Icon(Icons.info_outline,
-                                color: Colors.lightBlueAccent, size: 13),
+                            Icon(Icons.info_outline, color: Colors.lightBlueAccent, size: 13),
                             SizedBox(width: 6),
                             Expanded(child: Text(
                               'Groq aún no conoce las balizas.\nPulsa "Listar balizas" para cargar.',
-                              style: TextStyle(
-                                  color: Colors.lightBlueAccent, fontSize: 10),
+                              style: TextStyle(color: Colors.lightBlueAccent, fontSize: 10),
                             )),
                           ]),
                         );
@@ -1037,20 +1028,17 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                       final names = _waypointContext.navigableWaypoints
                           .map((w) => w.name).join(', ');
                       return Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 7),
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
                         decoration: BoxDecoration(
                           color: Colors.green.withOpacity(0.08),
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: Colors.green.withOpacity(0.3)),
                         ),
                         child: Row(children: [
-                          const Icon(Icons.location_on,
-                              color: Colors.greenAccent, size: 13),
+                          const Icon(Icons.location_on, color: Colors.greenAccent, size: 13),
                           const SizedBox(width: 6),
                           Expanded(child: Text('Groq conoce: $names',
-                            style: const TextStyle(
-                                color: Colors.greenAccent, fontSize: 10),
+                            style: const TextStyle(color: Colors.greenAccent, fontSize: 10),
                             maxLines: 2, overflow: TextOverflow.ellipsis,
                           )),
                         ]),
@@ -1237,11 +1225,9 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             style: const TextStyle(color: Colors.white, fontSize: 13),
             decoration: InputDecoration(
               hintText: hint,
-              hintStyle: TextStyle(
-                  color: Colors.white.withOpacity(0.35), fontSize: 12),
+              hintStyle: TextStyle(color: Colors.white.withOpacity(0.35), fontSize: 12),
               border: InputBorder.none,
-              contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 10, vertical: 10),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
               isDense: true,
             ),
           ),
@@ -1264,9 +1250,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             child: Row(mainAxisSize: MainAxisSize.min, children: [
               Icon(buttonIcon, color: accentColor, size: 15),
               const SizedBox(width: 5),
-              Text(buttonLabel,
-                  style: TextStyle(color: accentColor, fontSize: 12,
-                      fontWeight: FontWeight.w600)),
+              Text(buttonLabel, style: TextStyle(
+                  color: accentColor, fontSize: 12, fontWeight: FontWeight.w600)),
             ]),
           ),
         ),

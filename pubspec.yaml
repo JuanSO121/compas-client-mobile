@@ -23,12 +23,12 @@ dependencies:
   # ══════════════════════════════════════════════════════════
   speech_to_text: ^7.0.0        # STT
   flutter_tts: ^4.0.2           # TTS
-  porcupine_flutter: ^4.0.0 # Wake word detection
+  # porcupine_flutter: ^4.0.0 # Wake word detection
 
   # ══════════════════════════════════════════════════════════
   # ✅ AUDIO (OPCIONAL - para grabar)
   # ══════════════════════════════════════════════════════════
-  record: ^5.1.2
+  record: ^6.0.0
   audioplayers: ^6.1.0
   audio_session: ^0.1.16
 
