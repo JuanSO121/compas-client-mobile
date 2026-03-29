@@ -1,26 +1,70 @@
 // lib/screens/ar_navigation_screen.dart
-// ✅ v8.1 — Fix: WakeWord da error_client al pausar/reanudar la app
+// ✅ v8.3 — Fix sobreescritura de onVoiceStatusReceived del coordinator
 //
 // ============================================================================
-//  CAMBIOS v8.0 → v8.1
+//  CAMBIOS v8.2 → v8.3
 // ============================================================================
 //
-//  BUG CORREGIDO — error_client / STT en estado inconsistente tras pause/resume:
+//  BUG CRÍTICO — onVoiceStatusReceived del coordinator era sobreescrito
+//  por el callback de la screen.
 //
-//    CAUSA: Cuando la app va a background (Unity onPause, cambio de actividad,
-//    pantalla apagada), el ciclo STT del WakeWordService seguía corriendo.
-//    Android cancelaba el reconocimiento abruptamente → error_client.
-//    Al volver, el _loopActive seguía true pero el STT interno estaba
-//    en estado muerto → el bucle nunca recuperaba escucha real.
+//  PROBLEMA EN v8.2:
+//    En _setupUnityBridgeCallbacks() (llamado en initState), la screen
+//    asignaba:
+//      _unityBridge.onVoiceStatusReceived = (info) { _showSnackBar(...); }
 //
-//    SOLUCIÓN: WidgetsBindingObserver en _ArNavigationScreenState.
-//      - AppLifecycleState.paused / inactive → _wakeWordService.pause()
-//        (detiene _stt.stop() limpiamente, marca _isPaused=true)
-//      - AppLifecycleState.resumed → delay 800ms (Unity necesita tiempo
-//        para estabilizarse) y luego _wakeWordService.resume()
-//        (el bucle retoma desde _isPaused=false en el siguiente ciclo)
+//    Más tarde, en _onUnityCreated() (llamado cuando Unity arranca):
+//      _coordinator.attachUnityBridge(_unityBridge)
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v8.0.
+//    attachUnityBridge() hace:
+//      bridge.onVoiceStatusReceived = _onVoiceStatusReceived  ← coordinator
+//
+//    Esto SOBREESCRIBÍA el callback de la screen, que es lo correcto.
+//    Pero el orden era el correcto: screen primero, coordinator después → ok.
+//
+//    EL PROBLEMA REAL: si _onUnityCreated() se llama ANTES de
+//    _setupUnityBridgeCallbacks() (por timing de Unity vs initState),
+//    o si _coordinator.attachUnityBridge() se llama de nuevo en algún
+//    hot-reload o restart, el callback del coordinator queda, pero la
+//    screen había puesto el suyo en _setupUnityBridgeCallbacks() que
+//    NUNCA se llama de nuevo después del attachUnityBridge().
+//
+//    MÁS IMPORTANTE: aunque el orden fuera siempre correcto, la screen
+//    asignaba onVoiceStatusReceived DOS VECES:
+//      1. En _setupUnityBridgeCallbacks() → callback de la screen
+//      2. En _coordinator.attachUnityBridge() → callback del coordinator
+//    El callback de la screen (el #1) era borrado por el #2. Así que
+//    el snackbar de depuración nunca aparecía, lo que era correcto para
+//    producción pero confuso para testing.
+//
+//    EL VERDADERO BUG QUE ROMPÍA STATUS:
+//    NavigationCoordinator.attachUnityBridge() asigna:
+//      bridge.onVoiceStatusReceived = _onVoiceStatusReceived
+//    Pero si la screen llamaba _setupUnityBridgeCallbacks() DESPUÉS de
+//    _onUnityCreated() (lo cual NO ocurre en el código actual, porque
+//    _setupUnityBridgeCallbacks() se llama en initState que es antes),
+//    el callback de la screen habría sobreescrito el del coordinator,
+//    causando que _voiceStatusCompleter nunca se completara → timeout
+//    en STATUS siempre.
+//
+//    Para hacer el código robusto frente a cualquier orden de llamada
+//    y para mantener AMBOS callbacks (coordinator + screen para debug),
+//    se implementa un callback compuesto que llama a los dos.
+//
+//  FIX EN v8.3:
+//    _setupUnityBridgeCallbacks() ya NO asigna onVoiceStatusReceived.
+//    En su lugar, después de _coordinator.attachUnityBridge(), se
+//    encadena el callback de debug de la screen SIN sobreescribir el
+//    del coordinator — usando un wrapper que llama al coordinator primero
+//    y luego muestra el snackbar.
+//
+//    El encadenamiento se hace en _onUnityCreated() que es donde ya
+//    está attachUnityBridge(). Orden garantizado:
+//      1. _coordinator.attachUnityBridge() → asigna callback coordinator
+//      2. Inmediatamente después: wrappear con callback screen
+//    No hay más riesgo de sobreescritura en ningún orden.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v8.2.
 
 import 'dart:async';
 import 'package:flutter/material.dart' hide NavigationMode;
@@ -54,7 +98,6 @@ class ArNavigationScreen extends StatefulWidget {
   State<ArNavigationScreen> createState() => _ArNavigationScreenState();
 }
 
-// ✅ v8.1: WidgetsBindingObserver para detectar pause/resume de la app
 class _ArNavigationScreenState extends State<ArNavigationScreen>
     with TickerProviderStateMixin, WidgetsBindingObserver {
 
@@ -95,6 +138,9 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   bool _showTestPanel = false;
   final TextEditingController _waypointNameController   = TextEditingController(text: 'Baliza 1');
   final TextEditingController _navigateTargetController = TextEditingController(text: 'Entrada');
+  final TextEditingController _ttsTestController        = TextEditingController(
+    text: 'Claro, ¿en qué puedo ayudarte?',
+  );
   int _waypointCounter = 1;
 
   // ─── Historial ────────────────────────────────────────────
@@ -114,13 +160,12 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // ✅ v8.1
+    WidgetsBinding.instance.addObserver(this);
     _setupAnimations();
     _setupUnityBridgeCallbacks();
     _initializeServices();
   }
 
-  // ✅ v8.1: Pausar/reanudar wake word con el ciclo de vida de la app
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
@@ -130,14 +175,11 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     switch (state) {
       case AppLifecycleState.paused:
       case AppLifecycleState.inactive:
-        // App va a background — pausar STT limpiamente para evitar error_client
         _coordinator.wakeWordService.pause();
         _logger.d('[Lifecycle] App pausada — wake word pausado');
         break;
 
       case AppLifecycleState.resumed:
-        // App vuelve al frente — esperar a que Unity se estabilice (≈800ms)
-        // antes de reanudar el STT para evitar conflictos de audio
         Future.delayed(const Duration(milliseconds: 800), () {
           if (mounted && _isActive && _wakeWordAvailable) {
             _coordinator.wakeWordService.resume();
@@ -227,6 +269,11 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     };
 
     _unityBridge.onTrackingStateChanged = _onTrackingStateChanged;
+
+    // ✅ v8.3: onVoiceStatusReceived ya NO se asigna aquí.
+    // Se asigna en _onUnityCreated() DESPUÉS de attachUnityBridge(),
+    // como wrapper que llama al coordinator primero y luego hace debug.
+    // Ver _onUnityCreated() para el callback compuesto.
   }
 
   // ─── Máquina de estados de inicialización ────────────────────────────────
@@ -415,7 +462,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         _voiceNav.attachWakeWordService(_coordinator.wakeWordService);
       }
 
-      _logger.i('[Screen] ✅ VoiceNavigationService v5.8.1 inicializado.');
+      _logger.i('[Screen] ✅ VoiceNavigationService inicializado.');
 
       setState(() => _isInitialized = true);
 
@@ -438,8 +485,42 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   void _onUnityCreated(UnityWidgetController controller) {
     _unityBridge.setController(controller);
     _voiceNav.setUnityController(controller);
+
+    // ✅ v8.3 FIX: attachUnityBridge() PRIMERO, luego envolver el callback.
+    //
+    // attachUnityBridge() asigna:
+    //   bridge.onVoiceStatusReceived = coordinator._onVoiceStatusReceived
+    //
+    // Inmediatamente después guardamos ese callback del coordinator y lo
+    // envolvemos con el callback de debug de la screen, de modo que:
+    //   1. El coordinator procesa el voice_status (completa _voiceStatusCompleter)
+    //   2. La screen muestra el snackbar de debug
+    //
+    // Así NUNCA se sobreescribe el callback del coordinator. El orden es
+    // siempre determinístico independientemente de cuándo Unity llame
+    // a _onUnityCreated.
+    _coordinator.attachUnityBridge(_unityBridge);
+
+    // Capturar el callback del coordinator recién asignado
+    final coordinatorCallback = _unityBridge.onVoiceStatusReceived;
+
+    // Envolver: coordinator primero, luego debug screen
+    _unityBridge.onVoiceStatusReceived = (info) {
+      // 1. Coordinator procesa → _voiceStatusCompleter se completa
+      coordinatorCallback?.call(info);
+
+      // 2. Debug snackbar para testing (no bloquea al coordinator)
+      if (!mounted) return;
+      final msg = info.isGuiding
+          ? '📊 Guiando → ${info.destination} (${info.remainingSteps} pasos)'
+          : info.isPreprocessing
+              ? '📊 Calculando ruta...'
+              : '📊 Sin navegación activa';
+      _showSnackBar(msg);
+    };
+
     setState(() => _unityLoaded = true);
-    _logger.i('✅ Unity AR lista');
+    _logger.i('✅ Unity AR lista — bridge conectado al coordinator (v8.3)');
 
     _unityReady = true;
     _tryAdvanceToWaitingUser();
@@ -592,9 +673,39 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     HapticFeedback.lightImpact();
   }
 
+  void _testRepeatInstruction() {
+    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
+    _unityBridge.repeatInstruction();
+    _showSnackBar('🔁 TEST: repeat_instruction enviado');
+    HapticFeedback.lightImpact();
+  }
+
+  void _testStopVoice() {
+    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
+    _unityBridge.stopVoice();
+    _showSnackBar('🔇 TEST: stop_voice enviado');
+    HapticFeedback.lightImpact();
+  }
+
+  void _testVoiceStatus() {
+    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
+    _unityBridge.requestVoiceStatus();
+    _showSnackBar('📊 TEST: voice_status solicitado — espera snackbar de respuesta');
+    HapticFeedback.lightImpact();
+  }
+
+  void _testTTSSpeak() {
+    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
+    final text = _ttsTestController.text.trim();
+    if (text.isEmpty) { _showSnackBar('⚠️ Escribe un texto', isError: true); return; }
+    _unityBridge.speakArbitraryText(text, priority: 1, interrupt: false);
+    _showSnackBar('💬 TEST: tts_speak enviado (p=1)');
+    HapticFeedback.lightImpact();
+  }
+
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this); // ✅ v8.1
+    WidgetsBinding.instance.removeObserver(this);
     _sessionLoadTimeout?.cancel();
     _trackingWarningTimer?.cancel();
     _pulseController.dispose();
@@ -602,6 +713,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _testPanelController.dispose();
     _waypointNameController.dispose();
     _navigateTargetController.dispose();
+    _ttsTestController.dispose();
     _coordinator.dispose();
     _aiModeController.dispose();
     _unityBridge.dispose();
@@ -915,7 +1027,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         return Container(
           width: 290,
           constraints: BoxConstraints(
-              maxHeight: MediaQuery.of(context).size.height * 0.60),
+              maxHeight: MediaQuery.of(context).size.height * 0.65),
           decoration: BoxDecoration(
             color: const Color(0xFF0D0D1A).withOpacity(0.96),
             borderRadius: BorderRadius.circular(20),
@@ -1143,6 +1255,43 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   ),
 
                   const SizedBox(height: 14),
+                  _testSectionDivider('GUÍA DE VOZ (Unity v4)'),
+                  const SizedBox(height: 10),
+                  _buildTestActionButton(
+                    label: 'Repetir instrucción',
+                    icon: Icons.replay_rounded,
+                    color: const Color(0xFF004D40),
+                    accentColor: const Color(0xFF80CBC4),
+                    onPressed: isReady ? _testRepeatInstruction : null,
+                  ),
+                  const SizedBox(height: 8),
+                  _buildTestActionButton(
+                    label: 'Silenciar guía de voz',
+                    icon: Icons.voice_over_off_rounded,
+                    color: const Color(0xFF37474F),
+                    accentColor: const Color(0xFFB0BEC5),
+                    onPressed: isReady ? _testStopVoice : null,
+                  ),
+                  const SizedBox(height: 8),
+                  _buildTestActionButton(
+                    label: 'Estado de guía (voice_status)',
+                    icon: Icons.info_outline_rounded,
+                    color: const Color(0xFF1A237E),
+                    accentColor: const Color(0xFF90CAF9),
+                    onPressed: isReady ? _testVoiceStatus : null,
+                  ),
+                  const SizedBox(height: 8),
+                  _buildTestInputRow(
+                    controller: _ttsTestController,
+                    hint: 'Texto para COMPAS TTS',
+                    buttonLabel: 'Hablar',
+                    buttonIcon: Icons.record_voice_over_rounded,
+                    color: const Color(0xFF4A148C),
+                    accentColor: const Color(0xFFCE93D8),
+                    onPressed: isReady ? _testTTSSpeak : null,
+                  ),
+
+                  const SizedBox(height: 14),
                   _testSectionDivider('SISTEMA'),
                   const SizedBox(height: 10),
                   _buildTestActionButton(
@@ -1160,6 +1309,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                         _waypointCounter = 1;
                         _waypointNameController.text   = 'Baliza 1';
                         _navigateTargetController.text = 'Entrada';
+                        _ttsTestController.text        = 'Claro, ¿en qué puedo ayudarte?';
                       });
                       _showSnackBar('🔄 Reset completo del sistema');
                       HapticFeedback.mediumImpact();

@@ -1,32 +1,4 @@
 // lib/services/AI/integrated_voice_command_service.dart
-// ✅ v3 — Fix condición de carrera STT/Porcupine + sessionManager corrupto
-//
-//  BUGS CORREGIDOS (v2 → v3):
-//  ─────────────────────────────────────────────────────────────────────────
-//  BUG 1: _onSpeechStatus('notListening'/'done') ponía _isListening=false
-//    pero NO llamaba _sessionManager.markIdle(). El coordinator veía
-//    sessionManager.isIdle==false y entraba en _returnToIdle() intentando
-//    detener un STT que ya había terminado solo → bucle de errores y el
-//    siguiente ciclo de escucha nunca arrancaba bien.
-//    FIX: markIdle() en _onSpeechStatus cuando status es done/notListening.
-//
-//  BUG 2: _processCommand() llamaba onCommandDetected + onCommandExecuted
-//    en el mismo tick síncrono. NavigationCoordinator asume que son eventos
-//    separados en el tiempo (onCommandDetected captura el texto, luego
-//    onCommandExecuted lo procesa). Al llegar juntos, capturedText=null
-//    cuando se ejecuta onCommandExecuted.
-//    FIX: onCommandExecuted se llama con microtask (un tick después).
-//
-//  BUG 3 (el bug del "Oye compas"): Cuando Porcupine está activo,
-//    el STT NO debería estar corriendo. Pero si por cualquier razón el STT
-//    captura el wake word, _processCommand lo enviaba al coordinator que
-//    estaba en CoordinatorState.idle → "Estado incorrecto".
-//    FIX: filtro de wake word en _processCommand. Si el texto es solo
-//    "oye compas" (o variantes), lo ignoramos silenciosamente.
-//    Además: exponer wakeWordActive setter para que el coordinator
-//    informe a este servicio si Porcupine está activo.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v2.
 
 import 'dart:async';
 import 'package:logger/logger.dart';

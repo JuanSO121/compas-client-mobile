@@ -1,63 +1,45 @@
 // lib/services/AI/navigation_coordinator.dart
-// ✅ v5 — Fix: NavigateTo se disparaba múltiples veces + TTS del coordinator
-//          bloqueaba instrucciones de Unity
+// ✅ v7.2 — Fuzzy matching de waypoints + logs limpios + fix bloqueo post-error
 //
 // ============================================================================
-//  CAMBIOS v4 → v5
+//  CAMBIOS v7.1 → v7.2
 // ============================================================================
 //
-//  BUG 1 CORREGIDO — NavigateTo llegaba a Unity 2-3 veces:
+//  BUG CORREGIDO — El texto hablado por el usuario se enviaba crudo a Unity
+//  sin validar contra los waypoints reales, causando que Unity respondiera
+//  ok=false y el sistema quedara bloqueado sin poder recibir más comandos.
 //
-//    ANTES (v4):
-//      _processUserInput() hacía:
-//        onIntentDetected?.call(intent)    → ar_navigation_screen lo ignoraba
-//                                            pero NavigationCoordinator lo usaba
-//        await waitForCompletion()
-//        onCommandExecuted?.call(intent)   → ar_navigation_screen llamaba
-//                                            _unityBridge.handleIntent() → NavigateTo #1
-//      Y _completeAndReturnToIdle() hacía resume del wake word → STT detectaba
-//      eco del TTS → procesaba de nuevo → NavigateTo #2 y #3.
+//  CAMBIOS:
 //
-//    AHORA (v5):
-//      onIntentDetected solo notifica la UI (para mostrar el comando en pantalla).
-//      onCommandExecuted se llama UNA SOLA VEZ, DESPUÉS de waitForCompletion().
-//      Se añade _navigationExecuted flag para garantizar idempotencia.
+//  1. _resolveWaypointName() — fuzzy matching en 3 niveles:
+//       a) Exacto normalizado (sin tildes, minúsculas, sin símbolos)
+//       b) Uno contiene al otro (completo)
+//       c) Score por palabras clave (≥3 chars) — resuelve "segundo piso"
+//          → "2° Piso" porque comparten "piso" + "habitacion"
 //
-//  BUG 2 CORREGIDO — TTS del coordinator bloqueaba instrucciones de Unity:
+//  2. _normalizeWaypoint() — normalización consistente para comparación.
 //
-//    ANTES:
-//      El coordinator hablaba "¿A qué baliza quieres ir? ..." con interrupt:true.
-//      Luego enviaba NavigateTo a Unity.
-//      Unity respondía inmediatamente con instrucciones de voz.
-//      Pero el coordinator aún tenía el TTS activo (speak sin terminar) →
-//      VoiceNavigationService no podía adquirir el engine.
+//  3. _processUserInput() — bloque de navegación normal ahora valida
+//     el target contra _unityBridge.cachedWaypoints antes de enviar a Unity.
+//     Si no hay match: avisa al usuario con TTS y vuelve a idle limpiamente
+//     (no bloquea el sistema).
+//     Prefijos __unity:* siguen pasando directo (son comandos internos).
 //
-//    AHORA:
-//      Se espera waitForCompletion() ANTES de enviar el intent a Unity.
-//      Unity solo recibe la orden cuando el TTS del coordinator ya terminó.
-//      VoiceNavigationService puede hablar libremente desde ese momento.
+//  4. Logger reemplazado por wrapper de dos niveles:
+//       _log()      → solo en debug builds (assert — eliminado en release)
+//       _logError() → siempre (errores críticos reales)
+//     Elimina el ruido de logs en producción sin cambiar ninguna lógica.
 //
-//  BUG 3 CORREGIDO — Echo de TTS activaba el STT en modo sin wake word:
-//
-//    ANTES:
-//      En modo manual (sin wake word), después de _completeAndReturnToIdle()
-//      el STT volvía a escuchar inmediatamente y captaba el eco del TTS
-//      ("¿A qué baliza...") como nuevo comando → procesamiento duplicado.
-//
-//    AHORA:
-//      Si hay un intent de navegación activo, _completeAndReturnToIdle()
-//      NO reactiva el STT hasta que se llama explícitamente resetNavigation().
-//      En modo sin wake word, el STT solo se reactiva si no hay navegación activa.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v4.
+//  TODO LO DEMÁS ES IDÉNTICO A v7.1.
 
-import 'package:logger/logger.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'dart:async';
 
 import '../../models/shared_models.dart';
 import '../../config/api_config.dart';
 import '../tts_service.dart';
+import '../unity_bridge_service.dart';
 import 'conversation_service.dart';
 import 'integrated_voice_command_service.dart';
 import 'wake_word_service.dart';
@@ -73,11 +55,23 @@ enum CoordinatorState {
 
 class NavigationCoordinator {
   static final NavigationCoordinator _instance =
-  NavigationCoordinator._internal();
+      NavigationCoordinator._internal();
   factory NavigationCoordinator() => _instance;
   NavigationCoordinator._internal();
 
-  final Logger _logger = Logger();
+  // ─── Logging ──────────────────────────────────────────────────────────────
+  // _log()      → solo en debug (assert eliminado en release por el compilador)
+  // _logError() → siempre (errores críticos reales)
+  static void _log(String msg) {
+    assert(() {
+      debugPrint('[NavCoord] $msg');
+      return true;
+    }());
+  }
+
+  static void _logError(String msg) => debugPrint('[NavCoord] ❌ $msg');
+
+  // ─── Dependencias ─────────────────────────────────────────────────────────
 
   final ConversationService           _conversationService = ConversationService();
   final IntegratedVoiceCommandService _voiceService        = IntegratedVoiceCommandService();
@@ -85,24 +79,34 @@ class NavigationCoordinator {
   final TTSService                    _ttsService          = TTSService();
   final AIModeController              _aiModeController    = AIModeController();
 
+  UnityBridgeService? _unityBridge;
+
+  // ─── Estado ───────────────────────────────────────────────────────────────
+
   CoordinatorState _state             = CoordinatorState.idle;
   bool             _isInitialized     = false;
   bool             _isActive          = false;
   bool             _wakeWordAvailable = false;
 
-  // ✅ v5: flag para garantizar que onCommandExecuted se llama una sola vez
   bool _navigationExecuted = false;
-  // ✅ v5: true mientras hay una navegación activa (evita reactivar STT por eco)
   bool _navigationActive   = false;
 
-  Timer?           _commandTimeoutTimer;
-  static const Duration _commandTimeout = Duration(seconds: 15);
-  static const Duration _ttsEchoDelay   = Duration(milliseconds: 500);
+  Completer<VoiceStatusInfo?>? _voiceStatusCompleter;
+  Completer<void>?             _voiceNavCompleter;
+
+  Timer? _commandTimeoutTimer;
+
+  static const Duration _commandTimeout      = Duration(seconds: 15);
+  static const Duration _ttsEchoDelay        = Duration(milliseconds: 500);
+  static const Duration _voiceStatusTimeout  = Duration(seconds: 3);
+  static const Duration _ttsEchoWaitTimeout  = Duration(seconds: 5);
 
   NavigationIntent? _currentIntent;
   NavigationMode    _mode = NavigationMode.eventBased;
   String?           _lastUserInput;
   String            _partialText = '';
+
+  // ─── Callbacks públicos ───────────────────────────────────────────────────
 
   Function(String)?           onStatusUpdate;
   Function(NavigationIntent)? onIntentDetected;
@@ -110,19 +114,18 @@ class NavigationCoordinator {
   Function(String)?           onCommandRejected;
   Function(String)?           onConversationalResponse;
 
-  // ✅ v4+: Getter expuesto para que VoiceNavigationService use el mismo engine
   TTSService get ttsService => _ttsService;
 
   // ─── Inicialización ───────────────────────────────────────────────────────
 
   Future<void> initialize() async {
     if (_isInitialized) {
-      _logger.w('Ya inicializado');
+      _log('Ya inicializado — skip');
       return;
     }
 
     try {
-      _logger.i('🚀 Inicializando NavigationCoordinator v5...');
+      _log('Inicializando NavigationCoordinator v7.2...');
 
       await _ttsService.initialize();
       await _aiModeController.initialize();
@@ -135,12 +138,9 @@ class NavigationCoordinator {
       _isInitialized = true;
       _state = CoordinatorState.idle;
 
-      _logger.i('═══════════════════════════════════════');
-      _logger.i('✅ SISTEMA CONVERSACIONAL v5 INICIALIZADO');
-      _logger.i('   Wake Word : ${_wakeWordAvailable ? "✅ ACTIVO" : "❌ INACTIVO"}');
-      _logger.i('   Modo IA   : ${_aiModeController.getModeDescription()}');
-      _logger.i('   Timeout   : ${_commandTimeout.inSeconds}s (dinámico)');
-      _logger.i('═══════════════════════════════════════');
+      _log('SISTEMA v7.2 INICIALIZADO — '
+          'WakeWord: ${_wakeWordAvailable ? "ACTIVO" : "INACTIVO"} — '
+          'Modo: ${_aiModeController.getModeDescription()}');
 
       onStatusUpdate?.call(
         _wakeWordAvailable
@@ -148,17 +148,69 @@ class NavigationCoordinator {
             : '✅ Presiona Play para hablar',
       );
     } catch (e, stack) {
-      _logger.e('❌ Error inicializando: $e');
-      _logger.e('Stack: $stack');
+      _logError('Error inicializando: $e\n$stack');
       throw Exception('Fallo al inicializar: $e');
     }
   }
 
+  void attachUnityBridge(UnityBridgeService bridge) {
+    _unityBridge = bridge;
+    bridge.onVoiceStatusReceived = _onVoiceStatusReceived;
+    _log('UnityBridgeService conectado');
+  }
+
+  // ─── voice_status ─────────────────────────────────────────────────────────
+
+  void _onVoiceStatusReceived(VoiceStatusInfo info) {
+    _log('voice_status: $info');
+    _voiceStatusCompleter?.complete(info);
+    _voiceStatusCompleter = null;
+  }
+
+  Future<VoiceStatusInfo?> _fetchVoiceStatus() async {
+    if (_unityBridge == null) return null;
+
+    _voiceStatusCompleter = Completer<VoiceStatusInfo?>();
+    _unityBridge!.requestVoiceStatus();
+
+    try {
+      return await _voiceStatusCompleter!.future
+          .timeout(_voiceStatusTimeout, onTimeout: () {
+        _log('voice_status timeout');
+        return null;
+      });
+    } catch (e) {
+      _logError('_fetchVoiceStatus: $e');
+      return null;
+    } finally {
+      _voiceStatusCompleter = null;
+    }
+  }
+
+  String _buildVoiceStatusPhrase(VoiceStatusInfo info) {
+    if (!info.isGuiding && !info.isPreprocessing) {
+      return 'No hay navegación activa en este momento.';
+    }
+    if (info.isPreprocessing) {
+      return 'Calculando la ruta'
+          '${info.destination.isNotEmpty ? " a ${info.destination}" : ""}. '
+          'Un momento.';
+    }
+
+    final sb = StringBuffer();
+    if (info.destination.isNotEmpty)    sb.write('Vas hacia ${info.destination}. ');
+    if (info.remainingSteps > 0)        sb.write('Quedan ${info.remainingSteps} pasos. ');
+    if (info.nextInstruction.isNotEmpty) sb.write('Próxima indicación: ${info.nextInstruction}');
+    else if (info.ttsBusy)              sb.write('La guía de voz está hablando.');
+
+    final result = sb.toString().trim();
+    return result.isNotEmpty ? result : 'Navegación activa.';
+  }
+
+  // ─── Wake word ────────────────────────────────────────────────────────────
+
   Future<void> _initializeWakeWord() async {
     try {
-      _logger.i('🔍 INICIALIZANDO WAKE WORD (speech_to_text v3)...');
-
-      // ✅ v3: accessKey y modelPath ignorados — sin licencia Picovoice
       await _wakeWordService.initialize(
         accessKey: 'speech_to_text_no_key_needed_v3',
         config: const WakeWordConfig.custom(
@@ -170,16 +222,15 @@ class NavigationCoordinator {
 
       _wakeWordService.onWakeWordDetected = _onWakeWordDetected;
       _wakeWordService.onError = (error) {
-        _logger.e('❌ Wake word error: $error');
+        _logError('Wake word error: $error');
         onStatusUpdate?.call('Error wake word: $error');
       };
 
       _wakeWordAvailable = true;
-      _logger.i('✅ Wake word "Oye COMPAS" ACTIVO (speech_to_text)');
+      _log('Wake word "Oye COMPAS" activo');
     } catch (e, stack) {
-      _logger.e('❌ Error wake word: $e\n$stack');
+      _logError('Wake word no disponible: $e\n$stack');
       _wakeWordAvailable = false;
-      _logger.w('⚠️ Continuando sin wake word (modo manual activado)');
     }
   }
 
@@ -197,12 +248,10 @@ class NavigationCoordinator {
 
     _voiceService.onCommandDetected = (intent) {
       capturedText = intent.suggestedResponse;
-      _logger.d('📝 Texto capturado: "$capturedText"');
     };
 
     _voiceService.onCommandExecuted = (intent) async {
       if (_state != CoordinatorState.listeningCommand) {
-        _logger.w('⚠️ Estado incorrecto al recibir resultado: $_state — ignorando');
         capturedText = null;
         _partialText = '';
         return;
@@ -219,7 +268,6 @@ class NavigationCoordinator {
     };
 
     _voiceService.onCommandRejected = (reason) {
-      _logger.w('⛔ Rechazado: $reason');
       capturedText = null;
       _partialText = '';
       _returnToIdle();
@@ -231,9 +279,7 @@ class NavigationCoordinator {
   void _resetCommandTimeout() {
     _commandTimeoutTimer?.cancel();
     _commandTimeoutTimer = Timer(_commandTimeout, () {
-      _logger.w('⏱️ Timeout por silencio (${_commandTimeout.inSeconds}s)');
       if (_partialText.isNotEmpty) {
-        _logger.i('💡 Procesando texto parcial: "$_partialText"');
         final textToProcess = _partialText;
         _partialText = '';
         _processUserInput(textToProcess);
@@ -243,24 +289,117 @@ class NavigationCoordinator {
     });
   }
 
+  // ─── Esperar que VoiceNavigationService termine de hablar ─────────────────
+
+  Future<void> _waitForVoiceNavCompletion() async {
+    if (_voiceNavCompleter != null && !_voiceNavCompleter!.isCompleted) {
+      _voiceNavCompleter!.complete();
+    }
+    _voiceNavCompleter = Completer<void>();
+
+    late StreamSubscription<void> sub;
+    sub = _ttsService.onComplete.listen((_) {
+      if (_voiceNavCompleter != null && !_voiceNavCompleter!.isCompleted) {
+        _voiceNavCompleter!.complete();
+      }
+      sub.cancel();
+    });
+
+    try {
+      await _voiceNavCompleter!.future.timeout(
+        _ttsEchoWaitTimeout,
+        onTimeout: () {
+          _log('_waitForVoiceNavCompletion timeout — continuando');
+        },
+      );
+    } catch (e) {
+      _logError('_waitForVoiceNavCompletion: $e');
+    } finally {
+      sub.cancel();
+      _voiceNavCompleter = null;
+    }
+  }
+
+  // ─── Fuzzy matching de waypoints ──────────────────────────────────────────
+
+  /// Normaliza texto para comparación: minúsculas, sin tildes, sin símbolos.
+  String _normalizeWaypoint(String text) => text
+      .toLowerCase()
+      .replaceAll('°', ' ')
+      .replaceAll('á', 'a').replaceAll('é', 'e')
+      .replaceAll('í', 'i').replaceAll('ó', 'o')
+      .replaceAll('ú', 'u').replaceAll('ñ', 'n')
+      .replaceAll(RegExp(r'[^\w\s]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+
+  /// Resuelve el nombre hablado al waypoint real más cercano.
+  ///
+  /// Niveles de matching (en orden):
+  ///   1. Exacto normalizado
+  ///   2. Uno contiene al otro completo
+  ///   3. Score por palabras clave (≥3 chars) — al menos 1 en común
+  ///
+  /// Ejemplo: "Habitación segundo piso" → normaliza → "habitacion segundo piso"
+  ///   vs "Habitación 2° Piso" → normaliza → "habitacion 2 piso"
+  ///   Palabras comunes: {"habitacion", "piso"} → score 2 → match.
+  ///
+  /// Retorna null si no hay match aceptable → el caller avisa al usuario.
+  String? _resolveWaypointName(String spoken, List<WaypointInfo> waypoints) {
+    if (waypoints.isEmpty) return null;
+
+    final input = _normalizeWaypoint(spoken);
+
+    // Nivel 1: exacto normalizado
+    for (final wp in waypoints) {
+      if (_normalizeWaypoint(wp.name) == input) return wp.name;
+    }
+
+    // Nivel 2: uno contiene al otro completo
+    for (final wp in waypoints) {
+      final norm = _normalizeWaypoint(wp.name);
+      if (norm.contains(input) || input.contains(norm)) return wp.name;
+    }
+
+    // Nivel 3: score por palabras clave
+    final inputWords = input.split(' ')
+        .where((w) => w.length >= 3)
+        .toSet();
+
+    String? bestMatch;
+    int bestScore = 0;
+
+    for (final wp in waypoints) {
+      final wpWords = _normalizeWaypoint(wp.name)
+          .split(' ')
+          .where((w) => w.length >= 3)
+          .toSet();
+      final score = inputWords.intersection(wpWords).length;
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = wp.name;
+      }
+    }
+
+    return bestScore >= 1 ? bestMatch : null;
+  }
+
   // ─── Procesamiento principal ──────────────────────────────────────────────
 
   Future<void> _processUserInput(String userInput) async {
     if (_state != CoordinatorState.listeningCommand &&
         _state != CoordinatorState.processing) {
-      _logger.w('⚠️ Estado incorrecto para procesar: $_state');
       return;
     }
 
     if (userInput.trim().isEmpty) {
-      _logger.w('⚠️ Texto vacío, volviendo a idle');
       await _returnToIdle();
       return;
     }
 
-    _lastUserInput    = userInput;
-    _navigationExecuted = false; // ✅ v5: reset antes de cada procesamiento
-    _logger.i('💬 Usuario: "$userInput"');
+    _lastUserInput      = userInput;
+    _navigationExecuted = false;
+    _log('Usuario: "$userInput"');
     onStatusUpdate?.call('Procesando: "$userInput"');
 
     try {
@@ -274,49 +413,133 @@ class NavigationCoordinator {
       await _aiModeController.verifyInternetNow();
 
       final response = await _conversationService.chat(userInput);
-      _logger.i('🤖 Bot (${response.type.name}): "${response.message}"');
+      _log('COMPAS (${response.type.name}): "${response.message}"');
 
       _state = CoordinatorState.speaking;
 
-      // ✅ v5: Hablar respuesta del coordinator
-      await _ttsService.speak(response.message, interrupt: true);
+      // ── Intents con navegación ────────────────────────────────────────────
 
-      if (response.shouldNavigate) {
-        _logger.i('🎯 Navegación detectada: ${response.intent!.target}');
-        _currentIntent = response.intent;
+      if (response.shouldNavigate && response.intent != null) {
+        final target = response.intent!.target;
 
-        // ✅ v5: Notificar UI (solo visual — NO dispara handleIntent)
-        onIntentDetected?.call(response.intent!);
+        // ── REPEAT ──────────────────────────────────────────────────────────
+        if (target == '__unity:repeat_instruction') {
+          _unityBridge?.repeatInstruction();
+          await _completeAndReturnToIdle(suppressSTT: _navigationActive);
+          return;
+        }
 
-        // ✅ v5: ESPERAR a que el TTS del coordinator termine COMPLETAMENTE
-        // antes de enviar la orden a Unity. Esto garantiza que:
-        // 1. El engine TTS está libre para instrucciones de Unity
-        // 2. El STT no capta el eco del TTS como nuevo comando
+        // ── STATUS ──────────────────────────────────────────────────────────
+        if (target == '__unity:voice_status') {
+          final statusInfo = await _fetchVoiceStatus();
+          final phrase = statusInfo != null
+              ? _buildVoiceStatusPhrase(statusInfo)
+              : 'No pude obtener el estado de la navegación.';
+          await _ttsService.speak(phrase, interrupt: false);
+          await _ttsService.waitForCompletion();
+          onConversationalResponse?.call(phrase);
+          await _completeAndReturnToIdle(suppressSTT: _navigationActive);
+          return;
+        }
+
+        // ── STOP_VOICE ───────────────────────────────────────────────────────
+        if (target == '__unity:stop_voice') {
+          _unityBridge?.stopVoice();
+          final confirmMsg = response.message.isNotEmpty
+              ? response.message
+              : 'Guía de voz detenida.';
+          await _ttsService.speak(confirmMsg, interrupt: false);
+          await _ttsService.waitForCompletion();
+          await _completeAndReturnToIdle(suppressSTT: _navigationActive);
+          return;
+        }
+
+        // ── Otros prefijos __unity:* (comandos internos — pasan directo) ────
+        if (target.startsWith('__unity:')) {
+          await _ttsService.speak(response.message, interrupt: true);
+          onIntentDetected?.call(response.intent!);
+          await _ttsService.waitForCompletion();
+          await Future.delayed(_ttsEchoDelay);
+          if (!_navigationExecuted) {
+            _navigationExecuted = true;
+            _navigationActive   = true;
+            onCommandExecuted?.call(response.intent!);
+          }
+          return;
+        }
+
+        // ── NAVEGACIÓN NORMAL — validar contra waypoints reales ──────────────
+        final waypoints = _unityBridge?.cachedWaypoints ?? [];
+        final resolved  = _resolveWaypointName(target, waypoints);
+
+        if (resolved == null) {
+          // No hay match → avisar al usuario y volver a idle limpiamente
+          final names = waypoints.isNotEmpty
+              ? waypoints.map((w) => w.name).join(', ')
+              : 'ninguno cargado aún';
+          final errMsg = waypoints.isNotEmpty
+              ? 'No encontré ese destino. Los disponibles son: $names.'
+              : 'Aún no tengo la lista de destinos. Intenta en un momento.';
+
+          _logError('Waypoint no resuelto: "$target" — disponibles: $names');
+          await _ttsService.speak(errMsg, interrupt: true);
+          await _ttsService.waitForCompletion();
+          await _completeAndReturnToIdle(suppressSTT: _navigationActive);
+          return; // ← libera el flujo, no bloquea
+        }
+
+        _log('Waypoint resuelto: "$target" → "$resolved"');
+
+        final resolvedIntent = NavigationIntent(
+          type:              response.intent!.type,
+          target:            resolved,
+          priority:          response.intent!.priority,
+          suggestedResponse: response.intent!.suggestedResponse,
+        );
+
+        await _ttsService.speak(response.message, interrupt: true);
+        onIntentDetected?.call(resolvedIntent);
         await _ttsService.waitForCompletion();
-
-        // ✅ v5: Delay extra para silencio de eco del micrófono
         await Future.delayed(_ttsEchoDelay);
 
-        // ✅ v5: Enviar orden a Unity UNA SOLA VEZ con flag de idempotencia
         if (!_navigationExecuted) {
           _navigationExecuted = true;
           _navigationActive   = true;
-          _logger.i('🎯 Ejecutando navegación: ${response.intent!.target}');
-          onCommandExecuted?.call(response.intent!);
+          onCommandExecuted?.call(resolvedIntent);
         }
+
       } else {
-        // ✅ v5: Respuesta conversacional — esperar TTS y volver a idle
+        // ── RESPUESTA CONVERSACIONAL (HELP, UNKNOWN, etc.) ────────────────────
+
+        final bridgeReady = _unityBridge != null &&
+            _unityBridge!.isReady &&
+            response.message.isNotEmpty;
+
+        if (bridgeReady) {
+          _unityBridge!.speakArbitraryText(
+            response.message,
+            priority: 1,
+            interrupt: false,
+          );
+          await _waitForVoiceNavCompletion();
+        } else {
+          await _ttsService.speak(response.message, interrupt: false);
+          await _ttsService.waitForCompletion();
+        }
+
         onConversationalResponse?.call(response.message);
-        await _ttsService.waitForCompletion();
+        await _completeAndReturnToIdle(suppressSTT: _navigationActive);
       }
 
-      // ✅ v5: Si hay navegación activa, NO reactivar STT automáticamente
-      // para evitar que el eco active comandos duplicados.
-      await _completeAndReturnToIdle(suppressSTT: _navigationActive);
-
     } catch (e, stack) {
-      _logger.e('❌ Error procesando entrada: $e\n$stack');
+      _logError('Error procesando entrada: $e\n$stack');
       _state = CoordinatorState.speaking;
+
+      if (_voiceNavCompleter != null && !_voiceNavCompleter!.isCompleted) {
+        _voiceNavCompleter!.complete();
+        _voiceNavCompleter = null;
+      }
+
       await _ttsService.speak(
         'Lo siento, hubo un error. ¿Puedes repetir?',
         interrupt: true,
@@ -330,12 +553,9 @@ class NavigationCoordinator {
   // ─── Wake word ────────────────────────────────────────────────────────────
 
   void _onWakeWordDetected() async {
-    if (_state != CoordinatorState.idle) {
-      _logger.w('⚠️ Wake word ignorado — Estado: $_state');
-      return;
-    }
+    if (_state != CoordinatorState.idle) return;
 
-    _logger.i('🎯 "Oye COMPAS" detectado!');
+    _log('"Oye COMPAS" detectado');
     HapticFeedback.heavyImpact();
     await _transitionToListeningCommand();
   }
@@ -345,7 +565,6 @@ class NavigationCoordinator {
       _state = CoordinatorState.wakeWordDetected;
 
       if (_voiceService.isListening || !_voiceService.sessionManager.isIdle) {
-        _logger.w('⚠️ STT no estaba limpio, forzando detención...');
         await _voiceService.stopListening();
         await _voiceService.sessionManager.waitUntilIdle(
           timeout: const Duration(seconds: 2),
@@ -369,19 +588,17 @@ class NavigationCoordinator {
       _partialText = '';
 
       if (!_voiceService.sessionManager.canStart()) {
-        _logger.e('❌ Session manager no permite inicio');
+        _logError('Session manager no permite inicio');
         await _returnToIdle();
         return;
       }
 
       _voiceService.setWakeWordActive(false);
       await _voiceService.startListening();
-      _logger.i('🎤 Escuchando...');
       onStatusUpdate?.call('Escuchando...');
-
       _resetCommandTimeout();
     } catch (e) {
-      _logger.e('❌ Error en transición: $e');
+      _logError('Error en transición: $e');
       await _returnToIdle();
     }
   }
@@ -389,13 +606,7 @@ class NavigationCoordinator {
   // ─── Utilidades ───────────────────────────────────────────────────────────
 
   String _getRandomGreeting() {
-    const greetings = [
-      'Dime',
-      '¿Sí?',
-      'Te escucho',
-      '¿En qué puedo ayudarte?',
-      'Aquí estoy',
-    ];
+    const greetings = ['Dime', '¿Sí?', 'Te escucho', '¿En qué puedo ayudarte?', 'Aquí estoy'];
     return greetings[DateTime.now().millisecond % greetings.length];
   }
 
@@ -404,11 +615,14 @@ class NavigationCoordinator {
         _wakeWordService.isListening &&
         _isActive) return;
 
-    _logger.d('🔄 $_state → IDLE');
-
     try {
       _commandTimeoutTimer?.cancel();
       _partialText = '';
+
+      if (_voiceNavCompleter != null && !_voiceNavCompleter!.isCompleted) {
+        _voiceNavCompleter!.complete();
+        _voiceNavCompleter = null;
+      }
 
       if (_voiceService.isListening || !_voiceService.sessionManager.isIdle) {
         await _voiceService.stopListening();
@@ -431,17 +645,20 @@ class NavigationCoordinator {
         onStatusUpdate?.call('Esperando "Oye COMPAS"...');
       }
     } catch (e) {
-      _logger.e('❌ Error crítico volviendo a IDLE: $e');
+      _logError('Error crítico volviendo a IDLE: $e');
       _state = CoordinatorState.idle;
       _voiceService.sessionManager.forceReset();
     }
   }
 
-    /// ✅ v5: [suppressSTT] — si true y no hay wake word, NO reactiva el STT.
-    /// Evita que el eco del TTS se capture como nuevo comando durante navegación.
   Future<void> _completeAndReturnToIdle({bool suppressSTT = false}) async {
     _commandTimeoutTimer?.cancel();
     _partialText = '';
+
+    if (_voiceNavCompleter != null && !_voiceNavCompleter!.isCompleted) {
+      _voiceNavCompleter!.complete();
+      _voiceNavCompleter = null;
+    }
 
     if (_voiceService.isListening || !_voiceService.sessionManager.isIdle) {
       await _voiceService.stopListening();
@@ -451,23 +668,18 @@ class NavigationCoordinator {
     _state = CoordinatorState.idle;
 
     if (_wakeWordAvailable && _isActive) {
-      // ✅ v3 speech_to_text: aplicar suppressSTT igual que sin wake word.
-      // A diferencia de Porcupine, speech_to_text SÍ puede captar el eco
-      // del TTS y disparar una detección falsa.
       if (!suppressSTT) {
         try {
           _voiceService.setWakeWordActive(true);
           await _wakeWordService.resume();
           onStatusUpdate?.call('Esperando "Oye COMPAS"...');
         } catch (e) {
-          _logger.e('❌ Error reanudando wake word: $e');
+          _logError('Error reanudando wake word: $e');
         }
       } else {
-        _logger.d('[Coordinator] Navegación activa — wake word en pausa');
         onStatusUpdate?.call('Navegando...');
       }
     } else if (!suppressSTT && _isActive) {
-      // Sin wake word y sin navegación activa → reactivar STT manual
       try {
         await Future.delayed(const Duration(milliseconds: 600));
         if (_voiceService.sessionManager.canStart()) {
@@ -476,45 +688,36 @@ class NavigationCoordinator {
           onStatusUpdate?.call('Escuchando...');
         }
       } catch (e) {
-        _logger.e('❌ Error reactivando STT: $e');
+        _logError('Error reactivando STT: $e');
       }
     } else {
-      // Navegación activa — no reactivar STT; esperar resetNavigation()
-      _logger.d('[Coordinator] Navegación activa — STT en pausa');
       onStatusUpdate?.call('Navegando...');
     }
   }
 
   // ─── API pública ──────────────────────────────────────────────────────────
 
-  /// ✅ v5: Llamar desde ar_navigation_screen cuando la navegación termina
-  /// (navigation_arrived) para reactivar el STT/wake word.
   void resetNavigation() {
     _navigationActive   = false;
     _navigationExecuted = false;
     _currentIntent      = null;
-    _logger.i('[Coordinator] Navegación terminada — STT reactivado');
+    _log('Navegación terminada — STT reactivado');
 
     if (!_isActive) return;
 
-    if (_wakeWordAvailable) {
-      // El wake word ya debería estar escuchando — no hacer nada
-    } else {
-      // Sin wake word: reactivar STT manual
+    if (!_wakeWordAvailable) {
       _completeAndReturnToIdle(suppressSTT: false);
     }
   }
 
   Future<void> start({NavigationMode mode = NavigationMode.eventBased}) async {
     if (!_isInitialized) throw Exception('No inicializado');
-    if (_isActive) { _logger.w('Ya activo'); return; }
+    if (_isActive) return;
 
     try {
       _mode     = mode;
       _isActive = true;
       _state    = CoordinatorState.idle;
-
-      _logger.i('🚀 INICIANDO — Modo: ${mode.name} — Wake word: $_wakeWordAvailable');
 
       if (_wakeWordAvailable) {
         _voiceService.setWakeWordActive(true);
@@ -524,7 +727,6 @@ class NavigationCoordinator {
         await _ttsService.speak('Sistema conversacional activado');
         await _ttsService.waitForCompletion();
       } else {
-        _logger.w('⚠️ Modo manual (sin wake word)');
         _voiceService.setWakeWordActive(false);
         await _voiceService.sessionManager.waitUntilIdle();
         await Future.delayed(const Duration(milliseconds: 500));
@@ -534,7 +736,7 @@ class NavigationCoordinator {
       }
     } catch (e) {
       _isActive = false;
-      _logger.e('❌ Error start: $e');
+      _logError('Error start: $e');
       rethrow;
     }
   }
@@ -543,11 +745,15 @@ class NavigationCoordinator {
     if (!_isActive) return;
 
     try {
-      _logger.i('🛑 Deteniendo...');
       _isActive         = false;
       _navigationActive = false;
       _commandTimeoutTimer?.cancel();
       _partialText = '';
+
+      if (_voiceNavCompleter != null && !_voiceNavCompleter!.isCompleted) {
+        _voiceNavCompleter!.complete();
+        _voiceNavCompleter = null;
+      }
 
       _voiceService.setWakeWordActive(false);
 
@@ -561,14 +767,11 @@ class NavigationCoordinator {
       await _ttsService.speak('Sistema detenido', interrupt: true);
       await _ttsService.waitForCompletion();
     } catch (e) {
-      _logger.e('❌ Error stop: $e');
+      _logError('Error stop: $e');
     }
   }
 
-  void setMode(NavigationMode mode) {
-    _mode = mode;
-    _logger.i('🔄 Modo: $_mode');
-  }
+  void setMode(NavigationMode mode) => _mode = mode;
 
   Future<void> setWakeWordSensitivity(double sensitivity) async {
     if (!_wakeWordAvailable) return;
@@ -579,13 +782,12 @@ class NavigationCoordinator {
           sensitivity, ApiConfig.picovoiceAccessKey);
       if (wasActive) await start(mode: _mode);
     } catch (e) {
-      _logger.e('❌ Error sensibilidad: $e');
+      _logError('Error sensibilidad: $e');
     }
   }
 
   void clearConversationHistory() {
     _conversationService.clearHistory();
-    _logger.i('🗑️ Historial limpiado');
   }
 
   Map<String, dynamic> getStatistics() => {
@@ -596,14 +798,15 @@ class NavigationCoordinator {
         : {'enabled': false},
     'ai_mode':              _aiModeController.getStatistics(),
     'system': {
-      'is_active':           _isActive,
-      'mode':                _mode.toString(),
-      'state':               _state.name,
-      'wake_word_available': _wakeWordAvailable,
-      'is_speaking':         _ttsService.isSpeaking,
-      'last_user_input':     _lastUserInput,
-      'timeout_seconds':     _commandTimeout.inSeconds,
-      'navigation_active':   _navigationActive,
+      'is_active':              _isActive,
+      'mode':                   _mode.toString(),
+      'state':                  _state.name,
+      'wake_word_available':    _wakeWordAvailable,
+      'is_speaking':            _ttsService.isSpeaking,
+      'last_user_input':        _lastUserInput,
+      'navigation_active':      _navigationActive,
+      'unity_bridge_connected': _unityBridge != null,
+      'waypoints_cached':       _unityBridge?.cachedWaypoints.length ?? 0,
     },
   };
 
@@ -618,12 +821,37 @@ class NavigationCoordinator {
     _partialText        = '';
     _navigationExecuted = false;
     _navigationActive   = false;
-    _state              = CoordinatorState.idle;
+    _voiceStatusCompleter?.complete(null);
+    _voiceStatusCompleter = null;
+    if (_voiceNavCompleter != null && !_voiceNavCompleter!.isCompleted) {
+      _voiceNavCompleter!.complete();
+    }
+    _voiceNavCompleter = null;
+    _state             = CoordinatorState.idle;
     _commandTimeoutTimer?.cancel();
-    _logger.i('🔄 Reset completo');
   }
 
-  // Getters
+  void dispose() {
+    stop();
+    _commandTimeoutTimer?.cancel();
+    _voiceStatusCompleter?.complete(null);
+    _voiceStatusCompleter = null;
+    if (_voiceNavCompleter != null && !_voiceNavCompleter!.isCompleted) {
+      _voiceNavCompleter!.complete();
+    }
+    _voiceNavCompleter = null;
+    if (_unityBridge != null) {
+      _unityBridge!.onVoiceStatusReceived = null;
+    }
+    _voiceService.dispose();
+    _wakeWordService.dispose();
+    _ttsService.dispose();
+    _conversationService.dispose();
+    _aiModeController.dispose();
+  }
+
+  // ─── Getters ──────────────────────────────────────────────────────────────
+
   bool              get isInitialized     => _isInitialized;
   bool              get isActive          => _isActive;
   bool              get wakeWordAvailable => _wakeWordAvailable;
@@ -633,21 +861,10 @@ class NavigationCoordinator {
   bool              get isSpeaking        => _ttsService.isSpeaking;
   String?           get lastUserInput     => _lastUserInput;
   bool              get navigationActive  => _navigationActive;
-  WakeWordService get wakeWordService => _wakeWordService;
+  WakeWordService   get wakeWordService   => _wakeWordService;
 
   Future<void> speak(String message) async {
     if (message.isEmpty) return;
     await _ttsService.speak(message, interrupt: false);
-  }
-
-  void dispose() {
-    stop();
-    _commandTimeoutTimer?.cancel();
-    _voiceService.dispose();
-    _wakeWordService.dispose();
-    _ttsService.dispose();
-    _conversationService.dispose();
-    _aiModeController.dispose();
-    _logger.i('NavigationCoordinator disposed');
   }
 }

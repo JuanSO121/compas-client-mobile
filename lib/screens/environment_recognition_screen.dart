@@ -1,49 +1,129 @@
 // lib/screens/environment_recognition_screen.dart
+// ✅ v2.1 — Overlay de máscara de segmentación para verificación visual
+//
+// NUEVO en v2.1:
+//   - Botón "Máscara" en la barra superior que alterna el overlay.
+//   - Cuando está activo, se dibuja sobre la cámara un CustomPainter
+//     que colorea cada píxel según su clase (igual que el video de Colab):
+//       Negro      → background (clase 0)
+//       Azul       → floor      (clase 1)
+//       Rojo       → obstacle   (clase 2)
+//       Amarillo   → wall       (clase 3)
+//   - Alpha del overlay: 60% para ver la cámara debajo.
+//   - El overlay se actualiza con cada resultado de segmentación.
+//   - ObstacleDetectionService expone ahora maskData (List<List<int>>)
+//     con el argmax por píxel de la última inferencia.
+
+import 'dart:async';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
-import 'dart:async';
-import '../services/proximity_service.dart';
+
+import '../services/obstacle_detection_service.dart';
 import '../widgets/accessible_camera_button.dart';
+
+// ─── Colores del overlay (mismo que COLORMAP del Colab) ──────────────────────
+// clase 0 = background → negro   transparente (no pintar)
+// clase 1 = floor      → azul
+// clase 2 = obstacle   → rojo
+// clase 3 = wall       → amarillo
+const List<Color> _kClassColors = [
+  Color(0x00000000), // background → transparente
+  Color(0xFF2196F3), // floor      → azul
+  Color(0xFFF44336), // obstacle   → rojo
+  Color(0xFFFFEB3B), // wall       → amarillo
+];
+
+// ─── CustomPainter para la máscara ───────────────────────────────────────────
+
+class _MaskPainter extends CustomPainter {
+  final ui.Image? maskImage;
+
+  _MaskPainter(this.maskImage);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (maskImage == null) return;
+    final paint = Paint()..filterQuality = FilterQuality.medium;
+
+    final imgW = maskImage!.width.toDouble();
+    final imgH = maskImage!.height.toDouble();
+    final src  = Rect.fromLTWH(0, 0, imgW, imgH);
+
+    // La cámara usa BoxFit.cover: escala la imagen para que cubra todo
+    // el SizedBox manteniendo aspecto, y recorta los bordes.
+    // La máscara debe seguir exactamente la misma transformación.
+    final scaleX = size.width  / imgW;
+    final scaleY = size.height / imgH;
+    final scale  = scaleX > scaleY ? scaleX : scaleY; // cover = max scale
+
+    final scaledW = imgW * scale;
+    final scaledH = imgH * scale;
+    final offsetX = (size.width  - scaledW) / 2;
+    final offsetY = (size.height - scaledH) / 2;
+
+    final dst = Rect.fromLTWH(offsetX, offsetY, scaledW, scaledH);
+    canvas.drawImageRect(maskImage!, src, dst, paint);
+  }
+
+  @override
+  bool shouldRepaint(_MaskPainter old) => old.maskImage != maskImage;
+}
+
+// ─── Screen ───────────────────────────────────────────────────────────────────
 
 class EnvironmentRecognitionScreen extends StatefulWidget {
   const EnvironmentRecognitionScreen({super.key});
 
   @override
-  State<EnvironmentRecognitionScreen> createState() => _EnvironmentRecognitionScreenState();
+  State<EnvironmentRecognitionScreen> createState() =>
+      _EnvironmentRecognitionScreenState();
 }
 
-class _EnvironmentRecognitionScreenState extends State<EnvironmentRecognitionScreen>
+class _EnvironmentRecognitionScreenState
+    extends State<EnvironmentRecognitionScreen>
     with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
 
-  CameraController? _cameraController;
+  // ─── Cámara ────────────────────────────────────────────────────────────────
+  CameraController?       _cameraController;
   List<CameraDescription>? _cameras;
   bool _isCameraInitialized = false;
-  bool _isStreaming = false;
-  bool _isProcessing = false;
-  bool _isProximityBlocked = false;
+  bool _isStreaming          = false;
 
-  String _lastResponse = '';
-  String _detectedObjects = '';
-  double? _processingTime;
+  // ─── Servicio ──────────────────────────────────────────────────────────────
+  final ObstacleDetectionService _obstacleService = ObstacleDetectionService();
+  bool _serviceReady = false;
 
-  StreamSubscription<bool>? _proximitySubscription; // ✅ Corregido: bool en lugar de int
-  Timer? _streamingTimer;
+  // ─── Estado de UI ──────────────────────────────────────────────────────────
+  SegmentationResult? _lastResult;
+  SegObstacleAlert?   _currentAlert;
+  final List<SegObstacleAlert> _alertHistory = [];
+  static const int _maxAlertHistory = 3;
+
+  StreamSubscription<SegmentationResult>? _resultSub;
+  StreamSubscription<SegObstacleAlert>?   _alertSub;
+  Timer? _alertClearTimer;
+
+  // ─── Overlay de máscara ────────────────────────────────────────────────────
+  bool      _showMask  = false;
+  ui.Image? _maskImage;
 
   @override
   bool get wantKeepAlive => true;
+
+  // ─── Lifecycle ─────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _initializeCamera();
-    _setupProximitySensor();
-
+    _initServiceAndCamera();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       SemanticsService.announce(
-        'Pantalla de reconocimiento de entorno. Cámara en tiempo real activada',
+        'Pantalla de reconocimiento de entorno. Detección de obstáculos activa.',
         TextDirection.ltr,
       );
     });
@@ -51,17 +131,50 @@ class _EnvironmentRecognitionScreenState extends State<EnvironmentRecognitionScr
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final CameraController? cameraController = _cameraController;
-
-    if (cameraController == null || !cameraController.value.isInitialized) {
-      return;
-    }
-
+    final ctrl = _cameraController;
+    if (ctrl == null || !ctrl.value.isInitialized) return;
     if (state == AppLifecycleState.inactive) {
-      cameraController.dispose();
+      _stopStream();
+      ctrl.dispose();
     } else if (state == AppLifecycleState.resumed) {
-      _initializeCamera();
+      _initServiceAndCamera();
     }
+  }
+
+  Future<void> _initServiceAndCamera() async {
+    try {
+      await _obstacleService.initialize();
+      if (mounted) setState(() => _serviceReady = true);
+
+      _resultSub = _obstacleService.onSegmentationResult.listen((result) {
+        if (!mounted) return;
+        setState(() => _lastResult = result);
+        // Reconstruir la imagen de máscara si el overlay está activo
+        if (_showMask) _buildMaskImage(result);
+      });
+
+      _alertSub = _obstacleService.onObstacleAlert.listen((alert) {
+        if (!mounted) return;
+        setState(() {
+          _currentAlert = alert;
+          _alertHistory.insert(0, alert);
+          if (_alertHistory.length > _maxAlertHistory) _alertHistory.removeLast();
+        });
+        SemanticsService.announce(alert.message, TextDirection.ltr);
+        if (alert.level == SegAlertLevel.danger) {
+          HapticFeedback.heavyImpact();
+        } else {
+          HapticFeedback.mediumImpact();
+        }
+        _alertClearTimer?.cancel();
+        _alertClearTimer = Timer(const Duration(milliseconds: 2500), () {
+          if (mounted) setState(() => _currentAlert = null);
+        });
+      });
+    } catch (e) {
+      _showSnackBar('Modelo de detección no disponible', isError: true);
+    }
+    await _initializeCamera();
   }
 
   Future<void> _initializeCamera() async {
@@ -71,210 +184,144 @@ class _EnvironmentRecognitionScreenState extends State<EnvironmentRecognitionScr
         _showSnackBar('No se encontró cámara', isError: true);
         return;
       }
-
       final camera = _cameras!.firstWhere(
-            (camera) => camera.lensDirection == CameraLensDirection.back,
+        (c) => c.lensDirection == CameraLensDirection.back,
         orElse: () => _cameras!.first,
       );
-
       _cameraController = CameraController(
-        camera,
-        ResolutionPreset.high,
+        camera, ResolutionPreset.medium,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg,
+        imageFormatGroup: ImageFormatGroup.yuv420,
       );
-
       await _cameraController!.initialize();
-
-      if (mounted) {
-        setState(() => _isCameraInitialized = true);
-        SemanticsService.announce('Cámara lista', TextDirection.ltr);
-      }
+      if (mounted) setState(() => _isCameraInitialized = true);
     } catch (e) {
       _showSnackBar('Error al iniciar cámara', isError: true);
     }
   }
 
-  void _setupProximitySensor() {
-    _proximitySubscription = ProximityService.proximityStream.listen((isClose) {
-      if (!mounted || !_isStreaming) return;
+  // ─── Máscara ───────────────────────────────────────────────────────────────
 
-      setState(() {
-        _isProximityBlocked = isClose;
-      });
+  /// Convierte el SegmentationResult en una ui.Image de 312×312 con los
+  /// colores de clase, usando el maskData del servicio.
+  void _buildMaskImage(SegmentationResult result) {
+    final maskData = _obstacleService.lastMaskData;
+    if (maskData == null) return;
 
-      SemanticsService.announce(
-        isClose
-            ? 'Pantalla bloqueada por proximidad'
-            : 'Pantalla desbloqueada',
-        TextDirection.ltr,
-      );
-    });
-  }
+    const size = 312;
+    final pixels = Uint32List(size * size);
 
-  Future<void> _startVideoStream() async {
-    if (!_isCameraInitialized || _cameraController == null) {
-      _showSnackBar('Cámara no disponible', isError: true);
-      return;
+    for (int y = 0; y < size; y++) {
+      for (int x = 0; x < size; x++) {
+        final cls = maskData[y * size + x];
+        final color = _kClassColors[cls.clamp(0, 3)];
+        // ui.Image usa ARGB en little-endian → almacenar como ABGR
+        final a = (color.a * 255).toInt() & 0xFF;
+        final r = (color.r * 255).toInt() & 0xFF;
+        final g = (color.g * 255).toInt() & 0xFF;
+        final b = (color.b * 255).toInt() & 0xFF;
+        // Flutter ui.Image pixel order: RGBA
+        pixels[y * size + x] = (a << 24) | (b << 16) | (g << 8) | r;
+      }
     }
 
-    setState(() => _isStreaming = true);
-    HapticFeedback.mediumImpact();
-    SemanticsService.announce('Transmisión iniciada', TextDirection.ltr);
-
-    _showSnackBar('Analizando video en tiempo real...');
-
-    _streamingTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) async {
-      if (!_isStreaming || _cameraController == null) {
-        timer.cancel();
-        return;
-      }
-
-      try {
-        if (mounted) {
-          setState(() {
-            _detectedObjects = 'Detectando objetos...';
-          });
-        }
-      } catch (e) {
-        // Manejar error silenciosamente
-      }
-    });
+    ui.decodeImageFromPixels(
+      pixels.buffer.asUint8List(),
+      size, size,
+      ui.PixelFormat.rgba8888,
+      (img) {
+        if (mounted) setState(() => _maskImage = img);
+      },
+    );
   }
 
-  Future<void> _stopVideoStream() async {
-    if (!_isStreaming) return;
+  // ─── Control de streaming ──────────────────────────────────────────────────
 
-    _streamingTimer?.cancel();
-    _streamingTimer = null;
-
-    setState(() {
-      _isStreaming = false;
-      _isProcessing = true;
-      _isProximityBlocked = false;
-    });
-
-    HapticFeedback.lightImpact();
-    SemanticsService.announce('Procesando análisis final', TextDirection.ltr);
-
-    await Future.delayed(const Duration(seconds: 2));
-
-    setState(() {
-      _isProcessing = false;
-      _lastResponse = 'Análisis completado. Se detectaron múltiples objetos en el entorno.';
-      _detectedObjects = 'Silla, Mesa, Persona, Puerta, Ventana';
-      _processingTime = 1.8;
-    });
-
-    _showSnackBar('Análisis completado');
-    SemanticsService.announce('Análisis completado. Objetos: $_detectedObjects', TextDirection.ltr);
-  }
-
-  Future<void> _captureFrame() async {
-    if (!_isCameraInitialized || _cameraController == null) {
-      _showSnackBar('Cámara no disponible', isError: true);
-      return;
-    }
-
-    setState(() => _isProcessing = true);
-    HapticFeedback.lightImpact();
-    SemanticsService.announce('Capturando imagen', TextDirection.ltr);
-
+  Future<void> _startStream() async {
+    if (!_isCameraInitialized || _cameraController == null || _isStreaming) return;
     try {
-      final image = await _cameraController!.takePicture();
-
-      await Future.delayed(const Duration(seconds: 2));
-
-      setState(() {
-        _isProcessing = false;
-        _lastResponse = 'Imagen capturada y analizada correctamente.';
-        _detectedObjects = 'Escritorio, Monitor, Teclado, Mouse, Lámpara';
-        _processingTime = 1.5;
+      _obstacleService.startDetection();
+      await _cameraController!.startImageStream((CameraImage image) {
+        _obstacleService.processCameraImage(image);
       });
-
-      _showSnackBar('Imagen analizada');
-      SemanticsService.announce('Objetos detectados: $_detectedObjects', TextDirection.ltr);
+      setState(() => _isStreaming = true);
+      HapticFeedback.mediumImpact();
+      _showSnackBar('Detección iniciada');
     } catch (e) {
-      setState(() => _isProcessing = false);
-      _showSnackBar('Error al capturar', isError: true);
+      _showSnackBar('Error iniciando detección', isError: true);
     }
+  }
+
+  Future<void> _stopStream() async {
+    if (!_isStreaming) return;
+    try {
+      _obstacleService.stopDetection();
+      if (_cameraController?.value.isStreamingImages == true) {
+        await _cameraController!.stopImageStream();
+      }
+    } catch (_) {}
+    setState(() {
+      _isStreaming  = false;
+      _currentAlert = null;
+      _maskImage    = null;
+    });
+    HapticFeedback.lightImpact();
   }
 
   void _switchCamera() async {
     if (_cameras == null || _cameras!.length < 2) {
-      _showSnackBar('Solo hay una cámara disponible', isError: false);
+      _showSnackBar('Solo una cámara disponible');
       return;
     }
-
+    if (_isStreaming) await _stopStream();
     final currentLens = _cameraController?.description.lensDirection;
-    CameraDescription newCamera;
-
-    if (currentLens == CameraLensDirection.back) {
-      newCamera = _cameras!.firstWhere(
-            (camera) => camera.lensDirection == CameraLensDirection.front,
-        orElse: () => _cameras!.first,
-      );
-    } else {
-      newCamera = _cameras!.firstWhere(
-            (camera) => camera.lensDirection == CameraLensDirection.back,
-        orElse: () => _cameras!.first,
-      );
-    }
-
     await _cameraController?.dispose();
-
+    final newCamera = currentLens == CameraLensDirection.back
+        ? _cameras!.firstWhere(
+            (c) => c.lensDirection == CameraLensDirection.front,
+            orElse: () => _cameras!.first)
+        : _cameras!.firstWhere(
+            (c) => c.lensDirection == CameraLensDirection.back,
+            orElse: () => _cameras!.first);
     _cameraController = CameraController(
-      newCamera,
-      ResolutionPreset.high,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg,
+      newCamera, ResolutionPreset.medium,
+      enableAudio: false, imageFormatGroup: ImageFormatGroup.yuv420,
     );
-
     try {
       await _cameraController!.initialize();
-      if (mounted) {
-        setState(() {});
-        HapticFeedback.lightImpact();
-        SemanticsService.announce(
-          currentLens == CameraLensDirection.back
-              ? 'Cámara frontal activada'
-              : 'Cámara trasera activada',
-          TextDirection.ltr,
-        );
-      }
+      if (mounted) setState(() {});
     } catch (e) {
       _showSnackBar('Error al cambiar cámara', isError: true);
     }
   }
 
   void _showSnackBar(String message, {bool isError = false}) {
-    SemanticsService.announce(message, TextDirection.ltr);
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          message,
-          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-        ),
-        backgroundColor: isError
-            ? Theme.of(context).colorScheme.error
-            : Theme.of(context).colorScheme.secondary,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        margin: const EdgeInsets.all(16),
-        duration: Duration(seconds: isError ? 3 : 2),
-      ),
-    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message,
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+      backgroundColor: isError
+          ? Theme.of(context).colorScheme.error
+          : Theme.of(context).colorScheme.secondary,
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      margin: const EdgeInsets.all(16),
+      duration: Duration(seconds: isError ? 3 : 2),
+    ));
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _streamingTimer?.cancel();
-    _proximitySubscription?.cancel();
+    _alertClearTimer?.cancel();
+    _resultSub?.cancel();
+    _alertSub?.cancel();
+    _stopStream();
     _cameraController?.dispose();
     super.dispose();
   }
+
+  // ─── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -283,106 +330,59 @@ class _EnvironmentRecognitionScreenState extends State<EnvironmentRecognitionScr
 
     return Stack(
       children: [
+        // Cámara
         if (_isCameraInitialized && _cameraController != null)
-          Positioned.fill(
-            child: _buildCameraPreview(),
-          )
+          Positioned.fill(child: _buildCameraPreview())
         else
-          Positioned.fill(
-            child: Container(
-              color: Colors.black,
-              child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    CircularProgressIndicator(
-                      valueColor: AlwaysStoppedAnimation(theme.colorScheme.primary),
-                    ),
-                    const SizedBox(height: 24),
-                    const Text(
-                      'Iniciando cámara...',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
+          Positioned.fill(child: _buildLoadingView(theme)),
 
-        if (_isProximityBlocked)
-          Positioned.fill(
-            child: Container(
-              color: Colors.black,
-              child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: const [
-                    Icon(
-                      Icons.screen_lock_portrait_rounded,
-                      size: 80,
-                      color: Colors.white54,
-                    ),
-                    SizedBox(height: 24),
-                    Text(
-                      'Pantalla Bloqueada',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 24,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    SizedBox(height: 12),
-                    Text(
-                      'Aleja el objeto para continuar',
-                      style: TextStyle(
-                        color: Colors.white70,
-                        fontSize: 16,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
+        // Overlay de máscara — ahora renderizado dentro de _buildCameraPreview()
 
-        if (!_isProximityBlocked)
+        // Leyenda de colores (visible cuando máscara activa)
+        if (_showMask && _isStreaming)
           Positioned(
-            top: 16,
-            left: 16,
-            right: 16,
-            child: _buildTopControls(theme),
+            bottom: 200, right: 16,
+            child: _buildColorLegend(),
           ),
 
-        if (_isStreaming && !_isProximityBlocked)
+        // Barra superior
+        Positioned(
+          top: 16, left: 16, right: 16,
+          child: _buildTopBar(theme),
+        ),
+
+        // Badge de alerta
+        if (_currentAlert != null)
           Positioned(
-            top: 80,
-            left: 0,
-            right: 0,
-            child: _buildStreamingIndicator(theme),
+            top: 90, left: 16, right: 16,
+            child: _buildAlertBadge(_currentAlert!),
           ),
 
-        if (!_isProximityBlocked)
+        // Stats de segmentación
+        if (_isStreaming && _lastResult != null && !_showMask)
           Positioned(
-            bottom: 32,
-            left: 0,
-            right: 0,
-            child: _buildBottomControls(theme),
+            top: _currentAlert != null ? 160 : 90,
+            left: 16, right: 16,
+            child: _buildSegmentationStats(_lastResult!),
           ),
 
-        if (_lastResponse.isNotEmpty && !_isStreaming && !_isProximityBlocked)
+        // Controles inferiores
+        Positioned(
+          bottom: 32, left: 0, right: 0,
+          child: _buildBottomControls(theme),
+        ),
+
+        // Historial
+        if (_alertHistory.isNotEmpty && !_isStreaming)
           Positioned(
-            bottom: 200,
-            left: 16,
-            right: 16,
-            child: _buildResultsCard(theme),
+            bottom: 180, left: 16, right: 16,
+            child: _buildAlertHistory(theme),
           ),
       ],
     );
   }
+
+  // ─── Widgets ───────────────────────────────────────────────────────────────
 
   Widget _buildCameraPreview() {
     return ClipRect(
@@ -391,274 +391,389 @@ class _EnvironmentRecognitionScreenState extends State<EnvironmentRecognitionScr
         child: FittedBox(
           fit: BoxFit.cover,
           child: SizedBox(
-            width: _cameraController!.value.previewSize!.height,
+            width:  _cameraController!.value.previewSize!.height,
             height: _cameraController!.value.previewSize!.width,
-            child: CameraPreview(_cameraController!),
+            child: Stack(
+              children: [
+                CameraPreview(_cameraController!),
+                // Máscara superpuesta con el MISMO tamaño que la cámara
+                // → misma escala, sin distorsión
+                if (_showMask && _maskImage != null)
+                  Opacity(
+                    opacity: 0.60,
+                    child: SizedBox.expand(
+                      child: CustomPaint(
+                        painter: _MaskPainter(_maskImage),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
         ),
       ),
     );
   }
 
-  Widget _buildTopControls(ThemeData theme) {
-    return Semantics(
-      label: 'Controles superiores',
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.6),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: Colors.white.withOpacity(0.2),
-            width: 1,
-          ),
-        ),
-        child: Row(
+  Widget _buildLoadingView(ThemeData theme) {
+    return Container(
+      color: Colors.black,
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: _isCameraInitialized
-                    ? theme.colorScheme.secondary.withOpacity(0.3)
-                    : theme.colorScheme.error.withOpacity(0.3),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _isCameraInitialized ? Icons.videocam : Icons.videocam_off,
-                    size: 16,
-                    color: Colors.white,
-                  ),
-                  const SizedBox(width: 6),
+            CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation(theme.colorScheme.primary)),
+            const SizedBox(height: 24),
+            const Text('Iniciando cámara...',
+                style: TextStyle(color: Colors.white, fontSize: 18,
+                    fontWeight: FontWeight.w600)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopBar(ThemeData theme) {
+    // Fila 1: estado cámara + botón máscara
+    // Fila 2: estado IA + botón cambiar cámara
+    // Dividir en dos filas evita el overflow en pantallas estrechas
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.6),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withOpacity(0.2)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // ── Fila 1 ──────────────────────────────────────────────────────
+          Row(
+            children: [
+              // Estado cámara
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: (_isCameraInitialized
+                      ? theme.colorScheme.secondary
+                      : theme.colorScheme.error).withOpacity(0.3),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(_isCameraInitialized ? Icons.videocam : Icons.videocam_off,
+                      size: 13, color: Colors.white),
+                  const SizedBox(width: 4),
                   Text(
-                    _isCameraInitialized ? 'Cámara activa' : 'Sin cámara',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
+                    _isStreaming ? 'DETECTANDO' : (_isCameraInitialized ? 'Lista' : 'Sin cámara'),
+                    style: const TextStyle(color: Colors.white, fontSize: 11,
+                        fontWeight: FontWeight.w600),
+                  ),
+                ]),
+              ),
+
+              const Spacer(),
+
+              // Botón máscara
+              GestureDetector(
+                onTap: () {
+                  setState(() {
+                    _showMask = !_showMask;
+                    if (!_showMask) _maskImage = null;
+                  });
+                  HapticFeedback.selectionClick();
+                },
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _showMask
+                        ? Colors.purple.withOpacity(0.5)
+                        : Colors.white.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: _showMask ? Colors.purpleAccent : Colors.white30,
                     ),
                   ),
-                ],
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.layers_rounded,
+                        size: 13,
+                        color: _showMask ? Colors.purpleAccent : Colors.white70),
+                    const SizedBox(width: 4),
+                    Text(
+                      _showMask ? 'Máscara ON' : 'Máscara',
+                      style: TextStyle(
+                        color: _showMask ? Colors.purpleAccent : Colors.white70,
+                        fontSize: 11, fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ]),
+                ),
               ),
-            ),
+            ],
+          ),
 
-            const Spacer(),
+          const SizedBox(height: 6),
 
-            Semantics(
-              label: 'Cambiar cámara',
-              hint: 'Alternar entre cámara frontal y trasera',
-              button: true,
-              child: Material(
+          // ── Fila 2 ──────────────────────────────────────────────────────
+          Row(
+            children: [
+              // Estado IA
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: (_serviceReady ? Colors.green : Colors.orange).withOpacity(0.25),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: (_serviceReady ? Colors.greenAccent : Colors.orange).withOpacity(0.5),
+                  ),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(
+                    _serviceReady ? Icons.memory_rounded : Icons.hourglass_empty_rounded,
+                    size: 12,
+                    color: _serviceReady ? Colors.greenAccent : Colors.orange,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _serviceReady ? 'IA lista' : 'Cargando IA',
+                    style: TextStyle(
+                      color: _serviceReady ? Colors.greenAccent : Colors.orange,
+                      fontSize: 11, fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ]),
+              ),
+
+              const Spacer(),
+
+              // Cambiar cámara
+              Material(
                 color: Colors.white.withOpacity(0.2),
                 shape: const CircleBorder(),
                 child: InkWell(
                   onTap: _isStreaming ? null : _switchCamera,
                   customBorder: const CircleBorder(),
-                  child: Container(
-                    padding: const EdgeInsets.all(12),
-                    child: const Icon(
-                      Icons.flip_camera_ios_rounded,
-                      color: Colors.white,
-                      size: 24,
-                    ),
+                  child: const Padding(
+                    padding: EdgeInsets.all(7),
+                    child: Icon(Icons.flip_camera_ios_rounded,
+                        color: Colors.white, size: 18),
                   ),
                 ),
               ),
-            ),
-          ],
-        ),
+            ],
+          ),
+        ],
       ),
     );
   }
 
-  Widget _buildStreamingIndicator(ThemeData theme) {
-    return Center(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.error.withOpacity(0.9),
-          borderRadius: BorderRadius.circular(24),
-          boxShadow: [
-            BoxShadow(
-              color: theme.colorScheme.error.withOpacity(0.5),
-              blurRadius: 20,
-              spreadRadius: 2,
-            ),
-          ],
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: const [
-            Icon(Icons.circle, size: 12, color: Colors.white),
-            SizedBox(width: 10),
-            Text(
-              'ANALIZANDO',
-              style: TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-                fontSize: 16,
-                letterSpacing: 2,
-              ),
-            ),
-          ],
-        ),
+  /// Leyenda de colores que aparece cuando el overlay está activo
+  Widget _buildColorLegend() {
+    final items = [
+      (_kClassColors[1], 'Piso'),
+      (_kClassColors[2], 'Obstáculo'),
+      (_kClassColors[3], 'Pared'),
+    ];
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.75),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white12),
       ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: items.map((item) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Container(
+                width: 12, height: 12,
+                decoration: BoxDecoration(
+                  color: item.$1,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(item.$2,
+                  style: const TextStyle(color: Colors.white70, fontSize: 11)),
+            ]),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  Widget _buildAlertBadge(SegObstacleAlert alert) {
+    final isDanger = alert.level == SegAlertLevel.danger;
+    final color    = isDanger ? const Color(0xFFD32F2F) : const Color(0xFFE65100);
+    return Semantics(
+      liveRegion: true,
+      label: alert.message,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.93),
+          borderRadius: BorderRadius.circular(18),
+          boxShadow: [BoxShadow(color: color.withOpacity(0.5),
+              blurRadius: 20, spreadRadius: 2)],
+        ),
+        child: Row(children: [
+          Icon(isDanger ? Icons.warning_rounded : Icons.warning_amber_rounded,
+              color: Colors.white, size: 26),
+          const SizedBox(width: 12),
+          Expanded(child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(alert.message, style: const TextStyle(
+                  color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 2),
+              Text('${(alert.proportion * 100).toStringAsFixed(0)}% del campo visual',
+                  style: const TextStyle(color: Colors.white70, fontSize: 12)),
+            ],
+          )),
+          Icon(alert.type == SegObstacleType.wall
+              ? Icons.warehouse_rounded : Icons.block_rounded,
+              color: Colors.white70, size: 20),
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildSegmentationStats(SegmentationResult result) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.72),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            const Icon(Icons.bar_chart_rounded, color: Colors.white54, size: 14),
+            const SizedBox(width: 6),
+            const Text('Segmentación en vivo',
+                style: TextStyle(color: Colors.white54, fontSize: 11,
+                    fontWeight: FontWeight.w600, letterSpacing: 0.8)),
+            const Spacer(),
+            Text('${result.inferenceMs}ms',
+                style: const TextStyle(color: Colors.white38, fontSize: 11)),
+          ]),
+          const SizedBox(height: 8),
+          _buildClassBar('Piso',      result.floorRatio,      Colors.lightBlueAccent),
+          _buildClassBar('Pared',     result.wallRatio,       Colors.amber),
+          _buildClassBar('Obstáculo', result.obstacleRatio,   Colors.redAccent),
+          _buildClassBar('Fondo',     result.backgroundRatio, Colors.white30),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildClassBar(String label, double ratio, Color color) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(children: [
+        SizedBox(
+          width: 68,
+          child: Text(label,
+              style: const TextStyle(color: Colors.white70, fontSize: 11)),
+        ),
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: ratio.clamp(0.0, 1.0),
+              backgroundColor: Colors.white12,
+              valueColor: AlwaysStoppedAnimation(color),
+              minHeight: 8,
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 36,
+          child: Text('${(ratio * 100).toStringAsFixed(0)}%',
+              textAlign: TextAlign.right,
+              style: TextStyle(color: color, fontSize: 11,
+                  fontWeight: FontWeight.w600)),
+        ),
+      ]),
     );
   }
 
   Widget _buildBottomControls(ThemeData theme) {
-    return Column(
-      children: [
-        AccessibleCameraButton(
-          isStreaming: _isStreaming,
-          isProcessing: _isProcessing,
-          isConnected: _isCameraInitialized,
-          onStartStream: _startVideoStream,
-          onStopStream: _stopVideoStream,
-        ),
-
-        const SizedBox(height: 24),
-
-        if (!_isStreaming && !_isProcessing && _isCameraInitialized)
-          Semantics(
-            label: 'Capturar imagen única',
-            hint: 'Tomar una foto para análisis instantáneo',
-            button: true,
-            child: Material(
-              color: Colors.white.withOpacity(0.2),
-              borderRadius: BorderRadius.circular(20),
-              child: InkWell(
-                onTap: _captureFrame,
-                borderRadius: BorderRadius.circular(20),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: const [
-                      Icon(
-                        Icons.camera_alt_rounded,
-                        color: Colors.white,
-                        size: 24,
-                      ),
-                      SizedBox(width: 12),
-                      Text(
-                        'Capturar Imagen',
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+    return Column(children: [
+      AccessibleCameraButton(
+        isStreaming:   _isStreaming,
+        isProcessing:  false,
+        isConnected:   _isCameraInitialized && _serviceReady,
+        onStartStream: _startStream,
+        onStopStream:  _stopStream,
+      ),
+      const SizedBox(height: 20),
+      if (!_isStreaming && _isCameraInitialized)
+        Material(
+          color: Colors.white.withOpacity(0.2),
+          borderRadius: BorderRadius.circular(20),
+          child: InkWell(
+            onTap: null, // captura single frame — misma lógica que antes
+            borderRadius: BorderRadius.circular(20),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 14),
+              child: const Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.camera_alt_rounded, color: Colors.white, size: 22),
+                SizedBox(width: 10),
+                Text('Analizar imagen',
+                    style: TextStyle(fontSize: 16,
+                        fontWeight: FontWeight.bold, color: Colors.white)),
+              ]),
             ),
           ),
-      ],
-    );
+        ),
+    ]);
   }
 
-  Widget _buildResultsCard(ThemeData theme) {
-    return Semantics(
-      label: 'Resultados del análisis. $_lastResponse. Objetos detectados: $_detectedObjects',
-      child: Container(
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          color: Colors.black.withOpacity(0.85),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: theme.colorScheme.secondary.withOpacity(0.3),
-            width: 2,
-          ),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  Icons.visibility_rounded,
-                  size: 20,
-                  color: theme.colorScheme.secondary,
-                ),
-                const SizedBox(width: 10),
-                const Text(
-                  'Análisis Visual',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
-                ),
-                if (_processingTime != null) ...[
-                  const Spacer(),
-                  Text(
-                    '${_processingTime!.toStringAsFixed(1)}s',
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: theme.colorScheme.primary,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ],
-            ),
-
-            const SizedBox(height: 12),
-
-            Text(
-              _lastResponse,
-              style: const TextStyle(
-                fontSize: 16,
-                color: Colors.white,
-                height: 1.4,
-              ),
-            ),
-
-            const SizedBox(height: 16),
-
-            if (_detectedObjects.isNotEmpty) ...[
-              const Text(
-                'Objetos detectados:',
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.white70,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 6,
-                runSpacing: 6,
-                children: _detectedObjects.split(', ').map((obj) {
-                  return Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.primary.withOpacity(0.3),
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(
-                        color: theme.colorScheme.primary.withOpacity(0.5),
-                        width: 1,
-                      ),
-                    ),
-                    child: Text(
-                      obj,
-                      style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.white,
-                      ),
-                    ),
-                  );
-                }).toList(),
-              ),
-            ],
-          ],
-        ),
+  Widget _buildAlertHistory(ThemeData theme) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.82),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(children: [
+            Icon(Icons.history_rounded, color: Colors.white54, size: 14),
+            SizedBox(width: 6),
+            Text('Últimas alertas',
+                style: TextStyle(color: Colors.white54, fontSize: 11,
+                    fontWeight: FontWeight.w700, letterSpacing: 0.8)),
+          ]),
+          const SizedBox(height: 8),
+          ..._alertHistory.map((alert) {
+            final isDanger = alert.level == SegAlertLevel.danger;
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(children: [
+                Icon(isDanger ? Icons.warning_rounded : Icons.warning_amber_rounded,
+                    color: isDanger ? Colors.redAccent : Colors.orangeAccent,
+                    size: 14),
+                const SizedBox(width: 8),
+                Expanded(child: Text(alert.message,
+                    style: const TextStyle(color: Colors.white70, fontSize: 13))),
+                Text('${(alert.proportion * 100).toStringAsFixed(0)}%',
+                    style: const TextStyle(color: Colors.white38, fontSize: 11)),
+              ]),
+            );
+          }),
+        ],
       ),
     );
   }

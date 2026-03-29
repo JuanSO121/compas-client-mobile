@@ -37,6 +37,8 @@ dependencies:
   # ══════════════════════════════════════════════════════════
   camera: ^0.11.0+2
 
+  image: ^4.2.0
+
   # ══════════════════════════════════════════════════════════
   # ✅ NETWORKING
   # ══════════════════════════════════════════════════════════
@@ -94,3 +96,4 @@ flutter:
     - .env
     - assets/images/
     - assets/images/compas_V3.png
+    - assets/models/deeplabv3_plus.tflite

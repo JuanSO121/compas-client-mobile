@@ -15,26 +15,13 @@ class LoginScreenIntegrated extends StatefulWidget {
 
 class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
     with TickerProviderStateMixin {
-  // ── Cada dígito del código tiene su propio controller y focusNode ──────
-  // Esto permite que el foco salte automáticamente al siguiente campo al
-  // escribir, lo que es más natural para todos pero especialmente para
-  // personas con discapacidad motriz que usan teclado externo o switch.
-  final List<TextEditingController> _digitControllers =
-      List.generate(6, (_) => TextEditingController());
-  final List<FocusNode> _digitFocusNodes =
-      List.generate(6, (_) => FocusNode());
-
-  // Controller alternativo: campo único (para quien prefiera pegar el código)
-  final TextEditingController _singleCodeController = TextEditingController();
-  final FocusNode _singleCodeFocusNode = FocusNode();
+  final TextEditingController _codeController = TextEditingController();
+  final FocusNode _codeFocusNode = FocusNode();
 
   final AuthService _authService = AuthService();
 
   bool _isLoading = false;
   String? _errorMessage;
-
-  // Modo de entrada: true = un campo por dígito, false = campo único
-  bool _useDigitFields = true;
 
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
@@ -61,23 +48,15 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
       CurvedAnimation(parent: _shakeController, curve: Curves.elasticIn),
     );
 
-    // Cuando el campo único cambia, sincronizar con los boxes individuales
-    _singleCodeController.addListener(_syncSingleToBoxes);
-
-    // Limpiar error al escribir
-    for (final c in _digitControllers) {
-      c.addListener(() {
-        if (_errorMessage != null) setState(() => _errorMessage = null);
-      });
-    }
-    _singleCodeController.addListener(() {
+    _codeController.addListener(() {
       if (_errorMessage != null) setState(() => _errorMessage = null);
+      setState(() {});
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       SemanticsService.announce(
         'Pantalla de inicio de sesión. '
-        'Ingrese el código de acceso de 6 dígitos que recibió en su email.',
+        'Ingrese su código de acceso de 6 dígitos.',
         TextDirection.ltr,
       );
     });
@@ -85,86 +64,14 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
 
   @override
   void dispose() {
-    for (final c in _digitControllers) c.dispose();
-    for (final f in _digitFocusNodes) f.dispose();
-    _singleCodeController.dispose();
-    _singleCodeFocusNode.dispose();
+    _codeController.dispose();
+    _codeFocusNode.dispose();
     _fadeController.dispose();
     _shakeController.dispose();
     super.dispose();
   }
 
-  // ── Sincronización entre modos de entrada ────────────────────────────────
-
-  void _syncSingleToBoxes() {
-    final text = _singleCodeController.text.replaceAll(' ', '');
-    for (int i = 0; i < 6; i++) {
-      _digitControllers[i].text = i < text.length ? text[i] : '';
-    }
-  }
-
-  String _getCodeFromBoxes() {
-    return _digitControllers.map((c) => c.text).join();
-  }
-
-  String _getCode() {
-    if (_useDigitFields) {
-      return _getCodeFromBoxes();
-    } else {
-      return _singleCodeController.text.replaceAll(' ', '');
-    }
-  }
-
-  // ── Manejar entrada en cada caja de dígito ──────────────────────────────
-
-  void _onDigitChanged(int index, String value) {
-    if (value.length > 1) {
-      // El usuario pegó más de un dígito — distribuir en los campos restantes
-      _handlePaste(value, startIndex: index);
-      return;
-    }
-
-    if (value.isNotEmpty && index < 5) {
-      // Avanzar al siguiente campo automáticamente
-      _digitFocusNodes[index + 1].requestFocus();
-    }
-
-    // Si se borra con backspace y el campo está vacío, retroceder
-    if (value.isEmpty && index > 0) {
-      _digitFocusNodes[index - 1].requestFocus();
-    }
-
-    // Si el último dígito se llenó, hacer login automáticamente
-    if (index == 5 && value.isNotEmpty) {
-      final code = _getCodeFromBoxes();
-      if (code.length == 6) {
-        Future.delayed(const Duration(milliseconds: 100), _login);
-      }
-    }
-
-    setState(() {});
-  }
-
-  void _handlePaste(String pasted, {int startIndex = 0}) {
-    final digits = pasted.replaceAll(RegExp(r'\D'), '');
-    for (int i = 0; i < digits.length && (startIndex + i) < 6; i++) {
-      _digitControllers[startIndex + i].text = digits[i];
-    }
-
-    // Foco al último campo llenado
-    final lastFilled = (startIndex + digits.length - 1).clamp(0, 5);
-    _digitFocusNodes[lastFilled].requestFocus();
-
-    setState(() {});
-
-    // Si se completó el código, hacer login
-    final code = _getCodeFromBoxes();
-    if (code.length == 6) {
-      Future.delayed(const Duration(milliseconds: 200), _login);
-    }
-  }
-
-  // ── Login principal ──────────────────────────────────────────────────────
+  String _getCode() => _codeController.text.replaceAll(' ', '');
 
   void _login() async {
     final code = _getCode();
@@ -177,7 +84,7 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
         'Error: Ingrese los 6 dígitos del código',
         TextDirection.ltr,
       );
-      _digitFocusNodes[code.length.clamp(0, 5)].requestFocus();
+      _codeFocusNode.requestFocus();
       return;
     }
 
@@ -235,9 +142,8 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
         _showSnackBar(_errorMessage!, isError: true);
         _shakeController.forward(from: 0);
 
-        // Limpiar los campos para que el usuario reintente fácilmente
-        _clearDigits();
-        _digitFocusNodes[0].requestFocus();
+        _codeController.clear();
+        _codeFocusNode.requestFocus();
       }
     } catch (e) {
       if (!mounted) return;
@@ -248,14 +154,6 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
       _showSnackBar(_errorMessage!, isError: true);
       _shakeController.forward(from: 0);
     }
-  }
-
-  void _clearDigits() {
-    for (final c in _digitControllers) {
-      c.clear();
-    }
-    _singleCodeController.clear();
-    setState(() {});
   }
 
   void _showSnackBar(String message, {bool isError = false}) {
@@ -290,8 +188,6 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
     );
   }
 
-  // ── Build ────────────────────────────────────────────────────────────────
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -314,31 +210,6 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
           child: const Text('Iniciar Sesión',
               style: TextStyle(fontWeight: FontWeight.bold)),
         ),
-        actions: [
-          // Botón para cambiar entre modo caja y modo campo único
-          Semantics(
-            label: _useDigitFields
-                ? 'Cambiar a campo único para pegar el código'
-                : 'Cambiar a cajas individuales por dígito',
-            button: true,
-            child: IconButton(
-              icon: Icon(
-                _useDigitFields ? Icons.input_rounded : Icons.grid_view_rounded,
-                size: 24,
-              ),
-              tooltip: _useDigitFields ? 'Modo campo único' : 'Modo cajas',
-              onPressed: () {
-                setState(() => _useDigitFields = !_useDigitFields);
-                SemanticsService.announce(
-                  _useDigitFields
-                      ? 'Modo cajas individuales activado'
-                      : 'Puedes dicar tu código.',
-                  TextDirection.ltr,
-                );
-              },
-            ),
-          ),
-        ],
       ),
       body: SafeArea(
         child: FadeTransition(
@@ -357,8 +228,7 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
                     width: 90,
                     height: 90,
                     decoration: BoxDecoration(
-                      color:
-                          theme.colorScheme.primary.withOpacity(0.12),
+                      color: theme.colorScheme.primary.withOpacity(0.12),
                       shape: BoxShape.circle,
                     ),
                     child: Icon(
@@ -389,7 +259,7 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
 
                 Semantics(
                   label:
-                      'Ingrese el código de 6 dígitos que recibió en su email al registrarse',
+                      'Ingrese el código de 6 dígitos que recibió en su email',
                   child: Text(
                     'Ingrese el código de 6 dígitos\nque recibió en su email',
                     style: theme.textTheme.bodyLarge?.copyWith(
@@ -403,30 +273,14 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
 
                 const SizedBox(height: 40),
 
-                // ── ENTRADA DE CÓDIGO ────────────────────────────────
+                // ── CAMPO DE CÓDIGO ──────────────────────────────────
                 AnimatedBuilder(
                   animation: _shakeAnimation,
                   builder: (context, child) => Transform.translate(
                     offset: Offset(_shakeAnimation.value, 0),
                     child: child,
                   ),
-                  child: _useDigitFields
-                      ? _buildDigitBoxes(theme)
-                      : _buildSingleField(theme),
-                ),
-
-                const SizedBox(height: 8),
-
-                // Hint de modo
-                Text(
-                  _useDigitFields
-                      ? 'También puede pegar el código — toque el ícono ↗ para cambiar'
-                      : 'Modo campo único. Puede pegar directamente el código.',
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: theme.colorScheme.onSurface.withOpacity(0.4),
-                    fontSize: 12,
-                  ),
-                  textAlign: TextAlign.center,
+                  child: _buildCodeField(theme),
                 ),
 
                 // ── ERROR ────────────────────────────────────────────
@@ -439,8 +293,7 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
                       padding: const EdgeInsets.symmetric(
                           horizontal: 16, vertical: 12),
                       decoration: BoxDecoration(
-                        color:
-                            theme.colorScheme.error.withOpacity(0.1),
+                        color: theme.colorScheme.error.withOpacity(0.1),
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(
                           color: theme.colorScheme.error.withOpacity(0.3),
@@ -450,8 +303,7 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
                       child: Row(
                         children: [
                           Icon(Icons.warning_rounded,
-                              size: 20,
-                              color: theme.colorScheme.error),
+                              size: 20, color: theme.colorScheme.error),
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
@@ -493,14 +345,12 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
                             Navigator.push(
                               context,
                               MaterialPageRoute(
-                                builder: (_) =>
-                                    const RequestNewCodeScreen(),
+                                builder: (_) => const RequestNewCodeScreen(),
                               ),
                             );
                           },
                     icon: Icon(Icons.refresh_rounded,
-                        size: 20,
-                        color: theme.colorScheme.primary),
+                        size: 20, color: theme.colorScheme.primary),
                     label: Text(
                       'Olvidé mi código — Solicitar uno nuevo',
                       style: TextStyle(
@@ -520,77 +370,11 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
     );
   }
 
-  // ── Widgets de entrada ───────────────────────────────────────────────────
+  // ── Campo único para código ──────────────────────────────────────────────
 
-  Widget _buildDigitBoxes(ThemeData theme) {
+  Widget _buildCodeField(ThemeData theme) {
     return Semantics(
-      label: 'Código de acceso. 6 cajas para ingresar cada dígito.',
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: List.generate(6, (index) {
-          return Padding(
-            padding: EdgeInsets.only(right: index < 5 ? 10 : 0),
-            child: _buildSingleDigitBox(theme, index),
-          );
-        }),
-      ),
-    );
-  }
-
-  Widget _buildSingleDigitBox(ThemeData theme, int index) {
-    final hasValue = _digitControllers[index].text.isNotEmpty;
-    final hasError = _errorMessage != null;
-
-    return Semantics(
-      label: 'Dígito ${index + 1} de 6',
-      textField: true,
-      child: SizedBox(
-        width: 48,
-        height: 64,
-        child: Container(
-          decoration: BoxDecoration(
-            color: hasValue
-                ? theme.colorScheme.primary.withOpacity(0.1)
-                : theme.cardColor,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: hasError
-                  ? theme.colorScheme.error
-                  : hasValue
-                      ? theme.colorScheme.primary
-                      : theme.colorScheme.primary.withOpacity(0.3),
-              width: hasValue ? 3 : 2,
-            ),
-          ),
-          child: TextField(
-            controller: _digitControllers[index],
-            focusNode: _digitFocusNodes[index],
-            textAlign: TextAlign.center,
-            keyboardType: TextInputType.number,
-            maxLength: 1,
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.bold,
-              color: theme.colorScheme.onSurface,
-            ),
-            inputFormatters: [
-              FilteringTextInputFormatter.digitsOnly,
-            ],
-            decoration: const InputDecoration(
-              border: InputBorder.none,
-              counterText: '',
-              contentPadding: EdgeInsets.zero,
-            ),
-            onChanged: (value) => _onDigitChanged(index, value),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSingleField(ThemeData theme) {
-    return Semantics(
-      label: 'Campo de código de acceso. Ingrese o pegue los 6 dígitos.',
+      label: 'Campo de código de acceso. Ingrese los 6 dígitos.',
       textField: true,
       child: Container(
         decoration: BoxDecoration(
@@ -611,8 +395,8 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
           ],
         ),
         child: TextField(
-          controller: _singleCodeController,
-          focusNode: _singleCodeFocusNode,
+          controller: _codeController,
+          focusNode: _codeFocusNode,
           keyboardType: TextInputType.number,
           textAlign: TextAlign.center,
           maxLength: 6,
@@ -623,10 +407,10 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
           ),
           inputFormatters: [FilteringTextInputFormatter.digitsOnly],
           decoration: InputDecoration(
-            hintText: '000000',
+            hintText: '• • • • • •',
             hintStyle: TextStyle(
-              fontSize: 32,
-              letterSpacing: 16,
+              fontSize: 24,
+              letterSpacing: 12,
               color: theme.colorScheme.onSurface.withOpacity(0.2),
             ),
             counterText: '',
@@ -644,6 +428,8 @@ class _LoginScreenIntegratedState extends State<LoginScreenIntegrated>
       ),
     );
   }
+
+  // ── Botón de ingreso ─────────────────────────────────────────────────────
 
   Widget _buildLoginButton(ThemeData theme) {
     final code = _getCode();

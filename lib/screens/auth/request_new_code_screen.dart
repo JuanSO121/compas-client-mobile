@@ -3,10 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import '../../services/auth_service.dart';
-import '../../utils/password_validator.dart';
 
-/// Pantalla para cuando el usuario olvidó o perdió su código de acceso.
-/// Verifica identidad con email + contraseña y genera un nuevo código permanente.
 class RequestNewCodeScreen extends StatefulWidget {
   const RequestNewCodeScreen({super.key});
 
@@ -35,24 +32,19 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
   void initState() {
     super.initState();
     _fadeController = AnimationController(
-      duration: const Duration(milliseconds: 300),
-      vsync: this,
-    );
+        duration: const Duration(milliseconds: 300), vsync: this);
     _fadeAnimation =
         CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut);
     _fadeController.forward();
 
-    _emailController.addListener(() {
-      if (_errorMessage != null) setState(() => _errorMessage = null);
-    });
-    _passwordController.addListener(() {
-      if (_errorMessage != null) setState(() => _errorMessage = null);
-    });
+    _emailController.addListener(
+        () { if (_errorMessage != null) setState(() => _errorMessage = null); });
+    _passwordController.addListener(
+        () { if (_errorMessage != null) setState(() => _errorMessage = null); });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       SemanticsService.announce(
-        'Solicitar nuevo código de acceso. '
-        'Ingrese su email y contraseña para verificar su identidad.',
+        'Solicitar nuevo código. Ingrese su email y contraseña para verificar su identidad.',
         TextDirection.ltr,
       );
     });
@@ -73,14 +65,9 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
     final password = _passwordController.text;
 
     if (email.isEmpty || password.isEmpty) {
-      setState(
-          () => _errorMessage = 'Por favor complete el email y la contraseña');
+      setState(() => _errorMessage = 'Complete el email y la contraseña');
       SemanticsService.announce(_errorMessage!, TextDirection.ltr);
-      if (email.isEmpty) {
-        _emailFocusNode.requestFocus();
-      } else {
-        _passwordFocusNode.requestFocus();
-      }
+      (email.isEmpty ? _emailFocusNode : _passwordFocusNode).requestFocus();
       return;
     }
 
@@ -103,10 +90,8 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
           _success = true;
           _isLoading = false;
         });
-
         SemanticsService.announce(
-          'Nuevo código enviado a su email. '
-          'Revise su bandeja de entrada. El código anterior ya no funciona.',
+          'Código enviado. Revise su email e ingrese con el nuevo código.',
           TextDirection.ltr,
         );
       } else {
@@ -114,10 +99,9 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
           _errorMessage = response.message;
           _isLoading = false;
         });
-
-        final announcement =
-            response.accessibilityInfo?.announcement ?? response.message;
-        SemanticsService.announce(announcement, TextDirection.ltr);
+        SemanticsService.announce(
+            response.accessibilityInfo?.announcement ?? response.message,
+            TextDirection.ltr);
         _passwordFocusNode.requestFocus();
       }
     } catch (e) {
@@ -139,7 +123,7 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
         backgroundColor: Colors.transparent,
         elevation: 0,
         leading: Semantics(
-          label: 'Volver a inicio de sesión',
+          label: 'Volver',
           button: true,
           child: IconButton(
             icon: const Icon(Icons.arrow_back_rounded, size: 28),
@@ -171,52 +155,37 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
       children: [
         const SizedBox(height: 60),
         Semantics(
-          label: 'Éxito',
           excludeSemantics: true,
           child: Container(
             width: 100,
             height: 100,
             decoration: BoxDecoration(
-              color: Colors.green.withOpacity(0.12),
-              shape: BoxShape.circle,
-            ),
-            child:
-                const Icon(Icons.mark_email_read_rounded, size: 52, color: Colors.green),
+                color: Colors.green.withOpacity(0.12),
+                shape: BoxShape.circle),
+            child: const Icon(Icons.mark_email_read_rounded,
+                size: 52, color: Colors.green),
           ),
         ),
         const SizedBox(height: 32),
         Semantics(
           header: true,
-          label: '¡Código enviado exitosamente!',
-          child: Text(
-            '¡Código enviado!',
-            style: theme.textTheme.titleLarge?.copyWith(
-              fontSize: 28,
-              fontWeight: FontWeight.bold,
-            ),
-            textAlign: TextAlign.center,
-          ),
+          child: Text('¡Código enviado!',
+              style: theme.textTheme.titleLarge
+                  ?.copyWith(fontSize: 28, fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center),
         ),
-        const SizedBox(height: 20),
-        Semantics(
-          label:
-              'Revise su bandeja de entrada. El nuevo código fue enviado a su email. '
-              'El código anterior ya no funciona. Use el nuevo código para ingresar.',
-          child: Text(
-            'Revise su bandeja de entrada.\n\n'
-            'Su nuevo código de 6 dígitos fue enviado al email registrado.\n\n'
-            'El código anterior ya no funciona. Use el nuevo código para ingresar a la aplicación.',
-            style: theme.textTheme.bodyLarge?.copyWith(
+        const SizedBox(height: 16),
+        Text(
+          'Revise su email. El nuevo código reemplaza al anterior.',
+          style: theme.textTheme.bodyLarge?.copyWith(
               fontSize: 16,
-              height: 1.6,
-              color: theme.colorScheme.onSurface.withOpacity(0.75),
-            ),
-            textAlign: TextAlign.center,
-          ),
+              height: 1.5,
+              color: theme.colorScheme.onSurface.withOpacity(0.7)),
+          textAlign: TextAlign.center,
         ),
         const SizedBox(height: 48),
         Semantics(
-          label: 'Botón: Ir a ingresar mi código',
+          label: 'Ir a ingresar mi código',
           button: true,
           child: Material(
             color: theme.colorScheme.primary,
@@ -224,23 +193,20 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
             child: InkWell(
               onTap: () => Navigator.pop(context),
               borderRadius: BorderRadius.circular(20),
-              child: SizedBox(
+              child: const SizedBox(
                 width: double.infinity,
                 height: 72,
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
-                  children: const [
+                  children: [
                     Icon(Icons.vpn_key_rounded, size: 28, color: Colors.white),
                     SizedBox(width: 16),
-                    Text(
-                      'Ingresar mi código',
-                      style: TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                        letterSpacing: 0.5,
-                      ),
-                    ),
+                    Text('Ingresar mi código',
+                        style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                            letterSpacing: 0.5)),
                   ],
                 ),
               ),
@@ -252,23 +218,21 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
     );
   }
 
-  // ── Vista del formulario ─────────────────────────────────────────────────
+  // ── Formulario ───────────────────────────────────────────────────────────
 
   Widget _buildFormView(ThemeData theme) {
     return Column(
       children: [
         const SizedBox(height: 32),
 
-        // ── ÍCONO ──────────────────────────────────────────────────
         Semantics(
           excludeSemantics: true,
           child: Container(
             width: 90,
             height: 90,
             decoration: BoxDecoration(
-              color: theme.colorScheme.primary.withOpacity(0.1),
-              shape: BoxShape.circle,
-            ),
+                color: theme.colorScheme.primary.withOpacity(0.1),
+                shape: BoxShape.circle),
             child: Icon(Icons.refresh_rounded,
                 size: 44, color: theme.colorScheme.primary),
           ),
@@ -276,41 +240,27 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
 
         const SizedBox(height: 28),
 
-        // ── TÍTULO ────────────────────────────────────────────────
         Semantics(
           header: true,
-          label: '¿Olvidó su código de acceso?',
-          child: Text(
-            '¿Olvidó su código?',
-            style: theme.textTheme.titleLarge?.copyWith(
-              fontSize: 26,
-              fontWeight: FontWeight.bold,
-            ),
-            textAlign: TextAlign.center,
-          ),
+          child: Text('¿Olvidó su código?',
+              style: theme.textTheme.titleLarge
+                  ?.copyWith(fontSize: 26, fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center),
         ),
 
         const SizedBox(height: 12),
 
-        Semantics(
-          label:
-              'Ingrese su email y contraseña. Le enviaremos un nuevo código de acceso. '
-              'El código anterior dejará de funcionar.',
-          child: Text(
-            'Verifique su identidad y le enviaremos\nun nuevo código de acceso.\n'
-            'El código anterior dejará de funcionar.',
-            style: theme.textTheme.bodyLarge?.copyWith(
+        Text(
+          'Verifique su identidad y le enviaremos un nuevo código.\nEl anterior dejará de funcionar.',
+          style: theme.textTheme.bodyLarge?.copyWith(
               fontSize: 15,
               color: theme.colorScheme.onSurface.withOpacity(0.6),
-              height: 1.6,
-            ),
-            textAlign: TextAlign.center,
-          ),
+              height: 1.5),
+          textAlign: TextAlign.center,
         ),
 
         const SizedBox(height: 40),
 
-        // ── EMAIL ─────────────────────────────────────────────────
         _buildTextField(
           theme: theme,
           controller: _emailController,
@@ -325,10 +275,8 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
 
         const SizedBox(height: 20),
 
-        // ── CONTRASEÑA ────────────────────────────────────────────
         _buildPasswordField(theme),
 
-        // ── ERROR ─────────────────────────────────────────────────
         if (_errorMessage != null) ...[
           const SizedBox(height: 16),
           Semantics(
@@ -341,37 +289,28 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
                 color: theme.colorScheme.error.withOpacity(0.1),
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(
-                  color: theme.colorScheme.error.withOpacity(0.3),
-                  width: 2,
-                ),
+                    color: theme.colorScheme.error.withOpacity(0.3), width: 2),
               ),
-              child: Row(
-                children: [
-                  Icon(Icons.warning_rounded,
-                      size: 20, color: theme.colorScheme.error),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      _errorMessage!,
+              child: Row(children: [
+                Icon(Icons.warning_rounded,
+                    size: 20, color: theme.colorScheme.error),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(_errorMessage!,
                       style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: theme.colorScheme.error,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: theme.colorScheme.error)),
+                ),
+              ]),
             ),
           ),
         ],
 
         const SizedBox(height: 32),
 
-        // ── BOTÓN ENVIAR ──────────────────────────────────────────
         Semantics(
-          label: 'Botón: Enviar nuevo código a mi email',
-          hint: 'Presione para verificar identidad y recibir nuevo código',
+          label: 'Enviar nuevo código',
           button: true,
           child: Material(
             color: _isLoading
@@ -391,27 +330,23 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
                           width: 32,
                           height: 32,
                           child: CircularProgressIndicator(
-                            strokeWidth: 4,
-                            valueColor:
-                                AlwaysStoppedAnimation<Color>(Colors.white),
-                          ),
+                              strokeWidth: 4,
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                  Colors.white)),
                         ),
                       )
-                    : Row(
+                    : const Row(
                         mainAxisAlignment: MainAxisAlignment.center,
-                        children: const [
+                        children: [
                           Icon(Icons.send_rounded,
                               size: 28, color: Colors.white),
                           SizedBox(width: 16),
-                          Text(
-                            'Enviar nuevo código',
-                            style: TextStyle(
-                              fontSize: 20,
-                              fontWeight: FontWeight.bold,
-                              color: Colors.white,
-                              letterSpacing: 0.5,
-                            ),
-                          ),
+                          Text('Enviar nuevo código',
+                              style: TextStyle(
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.white,
+                                  letterSpacing: 0.5)),
                         ],
                       ),
               ),
@@ -420,7 +355,6 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
         ),
 
         const SizedBox(height: 24),
-
       ],
     );
   }
@@ -437,7 +371,7 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
     void Function(String)? onSubmitted,
   }) {
     return Semantics(
-      label: 'Campo de texto para $label',
+      label: label,
       textField: true,
       child: Container(
         decoration: BoxDecoration(
@@ -453,16 +387,17 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
         child: TextField(
           controller: controller,
           focusNode: focusNode,
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+          style:
+              const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
           keyboardType: keyboardType,
           textInputAction: textInputAction,
           decoration: InputDecoration(
             hintText: hint,
             hintStyle: TextStyle(
-              fontSize: 18,
-              color: theme.colorScheme.onSurface.withOpacity(0.3),
-            ),
-            prefixIcon: Icon(icon, size: 26, color: theme.colorScheme.primary),
+                fontSize: 18,
+                color: theme.colorScheme.onSurface.withOpacity(0.3)),
+            prefixIcon:
+                Icon(icon, size: 26, color: theme.colorScheme.primary),
             border: InputBorder.none,
             contentPadding: const EdgeInsets.all(20),
           ),
@@ -474,7 +409,7 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
 
   Widget _buildPasswordField(ThemeData theme) {
     return Semantics(
-      label: 'Campo de contraseña',
+      label: 'Contraseña',
       textField: true,
       child: Container(
         decoration: BoxDecoration(
@@ -491,14 +426,14 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
           controller: _passwordController,
           focusNode: _passwordFocusNode,
           obscureText: _obscurePassword,
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+          style:
+              const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
           textInputAction: TextInputAction.done,
           decoration: InputDecoration(
             hintText: 'Tu contraseña',
             hintStyle: TextStyle(
-              fontSize: 18,
-              color: theme.colorScheme.onSurface.withOpacity(0.3),
-            ),
+                fontSize: 18,
+                color: theme.colorScheme.onSurface.withOpacity(0.3)),
             prefixIcon: Icon(Icons.lock_rounded,
                 size: 26, color: theme.colorScheme.primary),
             suffixIcon: Semantics(
