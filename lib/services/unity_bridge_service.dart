@@ -1,20 +1,5 @@
 // lib/services/unity_bridge_service.dart
-// ✅ v3.4 — cachedWaypoints + logs limpios
-//
-// ============================================================================
-//  CAMBIOS v3.3 → v3.4
-// ============================================================================
-//
-//  1. _cachedWaypoints — lista interna que se actualiza cada vez que Unity
-//     responde list_waypoints. Expuesta como cachedWaypoints (read-only).
-//     NavigationCoordinator la usa para fuzzy matching antes de navegar,
-//     evitando enviar nombres crudos del usuario directamente a Unity.
-//
-//  2. Logger reemplazado por wrapper de dos niveles:
-//       _log()      → solo en debug builds (assert — eliminado en release)
-//       _logError() → siempre (errores críticos reales)
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v3.3.
+// ✅ v3.5 — cachedWaypoints + logs limpios + TTS sync (Claude patch aplicado)
 
 import 'dart:async';
 import 'dart:convert';
@@ -160,13 +145,10 @@ class UnityBridgeService {
 
   Stream<UnityResponse> get responses => _responseStream.stream;
 
-  // ✅ v3.4 — Cache de waypoints actualizado en cada list_waypoints.
-  // NavigationCoordinator lo lee para fuzzy matching sin necesidad de
-  // solicitar la lista en cada navegación.
   final List<WaypointInfo> _cachedWaypoints = [];
   List<WaypointInfo> get cachedWaypoints => List.unmodifiable(_cachedWaypoints);
 
-  // ─── Callbacks de alto nivel ─────────────────────────────────────────────
+  // ─── Callbacks ──────────────────────────────────────────────────────────
 
   Function(UnityResponse)?                              onResponse;
   Function(List<WaypointInfo>)?                         onWaypointsReceived;
@@ -193,7 +175,6 @@ class UnityBridgeService {
 
       if (!_responseStream.isClosed) _responseStream.add(response);
 
-      // tracking_state — callback propio, return temprano
       if (response.action == 'tracking_state') {
         final isStable = response.raw['stable'] as bool?   ?? true;
         final state    = response.raw['state']  as String? ?? '';
@@ -202,24 +183,20 @@ class UnityBridgeService {
         return;
       }
 
-      // tts_request — callback propio, return temprano
       if (response.action == 'tts_request') {
         onTTSRequest?.call(response);
         return;
       }
 
-      // voice_status — callback propio, return temprano
       if (response.action == 'voice_status') {
         final info = VoiceStatusInfo.fromMap(response.raw);
         onVoiceStatusReceived?.call(info);
         return;
       }
 
-      // Callbacks generales
       onResponse?.call(response);
 
       if (response.action == 'list_waypoints' && response.ok) {
-        // ✅ v3.4: actualizar cache interno
         _cachedWaypoints
           ..clear()
           ..addAll(response.waypoints);
@@ -234,6 +211,16 @@ class UnityBridgeService {
     } catch (e) {
       _log('Mensaje no-JSON: $raw');
     }
+  }
+
+  /// Notifica a Unity que el TTS de Flutter terminó o inició.
+  /// Unity debe liberar ttsBusy cuando isSpeaking == false.
+  void sendTTSStatus({required bool isSpeaking, int priority = 0}) {
+    _send({
+      'action':     'tts_status',
+      'isSpeaking': isSpeaking,
+      'priority':   priority,
+    });
   }
 
   // ─── handleIntent ────────────────────────────────────────────────────────
@@ -252,6 +239,7 @@ class UnityBridgeService {
 
       case IntentType.stop:
         stopNavigation();
+        break;
 
       case IntentType.describe:
       case IntentType.obstacle:
