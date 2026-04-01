@@ -1,31 +1,19 @@
 // lib/services/unity_bridge_service.dart
-// ✅ v3.6 — Soporte frame_data (Unity → Flutter para segmentación sin CameraController)
+// ✅ v3.8 — Añade toggleSegMask() para botón Mask del panel de testing
 //
 // ============================================================================
-// CAMBIOS v3.5 → v3.6
+// CAMBIOS v3.7 → v3.8
 // ============================================================================
 //
-//  PROBLEMA RESUELTO:
-//    ARCore/ARKit toma control exclusivo de la cámara trasera a nivel hardware.
-//    Flutter no puede abrir un CameraController independiente mientras Unity
-//    está activo. _initSegmentation() en ArNavigationScreen fallaba o
-//    entregaba un stream vacío.
+//  ÚNICO CAMBIO: nuevo método público toggleSegMask().
 //
-//  SOLUCIÓN:
-//    Unity captura los frames (ya los tiene vía ARCameraManager),
-//    los comprime a JPEG y los envía por el bridge con action="frame_data".
-//    UnityBridgeService los intercepta ANTES de pasarlos al stream de comandos
-//    y los entrega a ObstacleDetectionService vía onFrameReceived.
+//  CONTEXTO:
+//    ArNavigationScreen v8.5 añade el botón "Mask" / "Sin máscara" en la
+//    sección SEGMENTACIÓN del panel de testing. Al pulsarlo, Flutter envía
+//    { "action": "toggle_seg_mask" } a Unity, que lo procesa en
+//    FlutterUnityBridge v4.2 → SegmentationController.SetOverlayVisible().
 //
-//  CAMBIOS CONCRETOS:
-//    1. Nuevo callback: onFrameReceived — entrega Uint8List JPEG al consumidor.
-//    2. handleUnityMessage() intercepta action="frame_data" como primera
-//       condición, decodifica Base64 y llama onFrameReceived. No contamina
-//       el canal de comandos existente.
-//    3. dispose() limpia onFrameReceived.
-//    4. Import dart:convert ya existía; se añade dart:typed_data explícito.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v3.5.
+//  TODO LO DEMÁS ES IDÉNTICO A v3.7.
 
 import 'dart:async';
 import 'dart:convert';
@@ -183,10 +171,13 @@ class UnityBridgeService {
   Function(UnityResponse)?                              onTTSRequest;
   Function(VoiceStatusInfo)?                            onVoiceStatusReceived;
 
-  // ✅ v3.6 — Callback para frames de cámara enviados desde Unity.
-  // Recibe bytes JPEG ya decodificados de Base64.
-  // ObstacleDetectionService los consume con processJpegFrame().
+  /// v3.6 — Frames de cámara AR enviados desde Unity (~10 fps).
   Function(Uint8List jpegBytes)?                        onFrameReceived;
+
+  /// v3.7 — Ratios de segmentación enviados por VoiceCommandAPI.SendSegmentationRatio().
+  /// Parámetros: obstacle, floor, wall (todos en rango [0,1]).
+  /// Background = (1 - obstacle - floor - wall).clamp(0,1) — calcular en el consumidor.
+  Function(double obstacle, double floor, double wall)? onSegmentationRatioReceived;
 
   // ─── Setup ──────────────────────────────────────────────────────────────
 
@@ -202,25 +193,16 @@ class UnityBridgeService {
     final raw = message?.toString() ?? '';
     if (raw.isEmpty) return;
 
-    // ✅ v3.6 — Intercepción rápida de frame_data ANTES del log y del
-    // jsonDecode completo. Los frames llegan a ~10 fps; logearlos satura
-    // la consola y añade latencia innecesaria.
-    //
-    // El JSON tiene la forma:
-    //   { "action": "frame_data", "data": "<base64 JPEG>", "w": 224, "h": 224 }
-    //
-    // Usamos contains() como pre-filtro barato antes de decodificar JSON
-    // para evitar el coste de jsonDecode en el hot path de frames.
+    // v3.6 — Intercepción rápida de frame_data (hot path ~10 fps)
     if (raw.contains('"frame_data"')) {
       try {
         final map = jsonDecode(raw) as Map<String, dynamic>;
         if (map['action'] == 'frame_data') {
           final b64 = map['data'] as String?;
           if (b64 != null && b64.isNotEmpty) {
-            final jpegBytes = base64Decode(b64);
-            onFrameReceived?.call(jpegBytes);
+            onFrameReceived?.call(base64Decode(b64));
           }
-          return; // No propagar al stream de comandos ni a ningún otro handler
+          return;
         }
       } catch (e) {
         _log('Error decodificando frame_data: $e');
@@ -228,7 +210,26 @@ class UnityBridgeService {
       }
     }
 
-    // A partir de aquí: flujo normal de comandos (sin cambios respecto a v3.5)
+    // v3.7 — Intercepción de segmentation_ratio antes del log general
+    // para evitar spam en consola dado que ahora llega automáticamente
+    // desde SegmentationController v9.2 en cada inferencia.
+    if (raw.contains('"segmentation_ratio"')) {
+      try {
+        final map = jsonDecode(raw) as Map<String, dynamic>;
+        if (map['action'] == 'segmentation_ratio') {
+          final obstacle = (map['obstacle'] as num?)?.toDouble() ?? 0.0;
+          final floor    = (map['floor']    as num?)?.toDouble() ?? 0.0;
+          final wall     = (map['wall']     as num?)?.toDouble() ?? 0.0;
+          onSegmentationRatioReceived?.call(obstacle, floor, wall);
+          return;
+        }
+      } catch (e) {
+        _log('Error decodificando segmentation_ratio: $e');
+        return;
+      }
+    }
+
+    // Flujo normal de comandos
     _log('← $raw');
 
     try {
@@ -275,7 +276,6 @@ class UnityBridgeService {
   }
 
   /// Notifica a Unity que el TTS de Flutter terminó o inició.
-  /// Unity debe liberar ttsBusy cuando isSpeaking == false.
   void sendTTSStatus({required bool isSpeaking, int priority = 0}) {
     _send({
       'action':     'tts_status',
@@ -294,13 +294,10 @@ class UnityBridgeService {
           _handleUnityPrefix(target);
           return;
         }
-        if (target.isNotEmpty) {
-          navigateTo(target);
-        }
+        if (target.isNotEmpty) navigateTo(target);
 
       case IntentType.stop:
         stopNavigation();
-        break;
 
       case IntentType.describe:
       case IntentType.obstacle:
@@ -320,6 +317,7 @@ class UnityBridgeService {
     if (cmd == 'repeat_instruction') { repeatInstruction();  return; }
     if (cmd == 'stop_voice')         { stopVoice();          return; }
     if (cmd == 'voice_status')       { requestVoiceStatus(); return; }
+    if (cmd == 'toggle_seg_mask')    { toggleSegMask();      return; } // ✅ v3.8
 
     if (cmd.startsWith('create_waypoint:')) {
       final name = cmd.substring('create_waypoint:'.length);
@@ -429,6 +427,17 @@ class UnityBridgeService {
     _log('→ tts_speak (p=$priority): "$text"');
   }
 
+  // ─── Comando de máscara de segmentación (v3.8) ──────────────────────────
+
+  /// ✅ v3.8 — Alterna la visibilidad de la máscara de segmentación en Unity.
+  /// Llamado desde el botón "Mask" / "Sin máscara" del panel de testing.
+  /// Unity procesa la acción en FlutterUnityBridge v4.2 →
+  /// SegmentationController.SetOverlayVisible(!current).
+  void toggleSegMask() {
+    _send({'action': 'toggle_seg_mask'});
+    _log('→ toggle_seg_mask');
+  }
+
   // ─── Privado ─────────────────────────────────────────────────────────────
 
   void _send(Map<String, dynamic> command) {
@@ -447,9 +456,10 @@ class UnityBridgeService {
     _responseStream.close();
     _cachedWaypoints.clear();
     isReadyNotifier.dispose();
-    _controller           = null;
-    onTTSRequest          = null;
-    onVoiceStatusReceived = null;
-    onFrameReceived       = null; // ✅ v3.6
+    _controller                  = null;
+    onTTSRequest                 = null;
+    onVoiceStatusReceived        = null;
+    onFrameReceived              = null;
+    onSegmentationRatioReceived  = null;
   }
 }

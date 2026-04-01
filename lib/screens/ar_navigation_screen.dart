@@ -1,5 +1,31 @@
 // lib/screens/ar_navigation_screen.dart
-// ✅ v8.3 — Fix sobreescritura de onVoiceStatusReceived del coordinator
+// ✅ v8.5 — Botón Mask · Fix status message · Barras de segmentación via push automático
+//
+// ============================================================================
+// CAMBIOS v8.4 → v8.5
+// ============================================================================
+//
+//  FIX #1 — Barras de segmentación (ya funcional con UnityBridgeService v3.7
+//    + SegmentationController v9.2 que hace PUSH automático en cada inferencia).
+//    No hay cambio de código aquí: el callback onSegmentationRatioReceived
+//    ya estaba conectado en _setupUnityBridgeCallbacks(). El bug era en Unity.
+//
+//  FIX #2 — Botón "Mask" en sección SEGMENTACIÓN del panel de testing.
+//    • Estado local _segMaskVisible (bool, default true).
+//    • Botón alterna entre "Máscara ON" y "Máscara OFF" con icono y color
+//      distintos según el estado.
+//    • Al pulsar llama _unityBridge.toggleSegMask() y alterna _segMaskVisible.
+//
+//  FIX #3 — Status message al final de _onSessionLoadResponse.
+//    ANTES: el mensaje final era inútil porque aparecía cuando ya no importaba
+//    y no comunicaba qué debe hacer el usuario.
+//    AHORA:
+//      • Sin wake word → 'Presiona el micrófono para hablar'  (accionable)
+//      • Con wake word → 'Di "Oye COMPAS" para navegar'       (accionable)
+//    El mensaje intermedio "Cargando sesión..." en _onUserReady se mantiene
+//    porque es el estado del overlay de carga, que es transitorio y correcto.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v8.4.
 
 import 'dart:async';
 import 'package:flutter/material.dart' hide NavigationMode;
@@ -71,12 +97,25 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
   // ─── Panel de testing ─────────────────────────────────────
   bool _showTestPanel = false;
-  final TextEditingController _waypointNameController   = TextEditingController(text: 'Baliza 1');
-  final TextEditingController _navigateTargetController = TextEditingController(text: 'Entrada');
-  final TextEditingController _ttsTestController        = TextEditingController(
-    text: 'Claro, ¿en qué puedo ayudarte?',
-  );
+  final TextEditingController _waypointNameController =
+      TextEditingController(text: 'Baliza 1');
+  final TextEditingController _navigateTargetController =
+      TextEditingController(text: 'Entrada');
+  final TextEditingController _ttsTestController =
+      TextEditingController(text: 'Claro, ¿en qué puedo ayudarte?');
   int _waypointCounter = 1;
+
+  // ─── Segmentación ────────────────────────────────────────
+  double _segObstacle   = 0;
+  double _segFloor      = 0;
+  double _segWall       = 0;
+  double _segBackground = 0;
+  static const double _obstacleAlertThreshold = 0.12;
+
+  // ✅ v8.5 FIX #2 — Estado local de la máscara de segmentación.
+  // Refleja el estado del overlay en Unity (optimista: asumimos que
+  // Unity arranca con _showOverlay=true en SegmentationController).
+  bool _segMaskVisible = true;
 
   // ─── Historial ────────────────────────────────────────────
   final List<_CommandItem> _history = [];
@@ -104,16 +143,13 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-
     if (!_wakeWordAvailable || !_isInitialized) return;
-
     switch (state) {
       case AppLifecycleState.paused:
       case AppLifecycleState.inactive:
         _coordinator.wakeWordService.pause();
         _logger.d('[Lifecycle] App pausada — wake word pausado');
         break;
-
       case AppLifecycleState.resumed:
         Future.delayed(const Duration(milliseconds: 800), () {
           if (mounted && _isActive && _wakeWordAvailable) {
@@ -122,7 +158,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           }
         });
         break;
-
       default:
         break;
     }
@@ -193,22 +228,25 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       if (!mounted) return;
       _logger.i('[Bridge] 📍 ${waypoints.length} waypoint(s) recibidos de Unity');
       _waypointContext.updateFromUnity(waypoints);
-      if (waypoints.isEmpty) {
-        _coordinator.speak('No hay balizas guardadas todavía.');
-        _showSnackBar('📍 No hay balizas aún');
-      } else {
-        final names = waypoints.map((w) => w.name).join(', ');
-        _coordinator.speak('Destinos disponibles: $names');
-        _showSnackBar('📍 ${waypoints.length} balizas: $names');
-      }
     };
 
     _unityBridge.onTrackingStateChanged = _onTrackingStateChanged;
 
-    // ✅ v8.3: onVoiceStatusReceived ya NO se asigna aquí.
-    // Se asigna en _onUnityCreated() DESPUÉS de attachUnityBridge(),
-    // como wrapper que llama al coordinator primero y luego hace debug.
-    // Ver _onUnityCreated() para el callback compuesto.
+    // ✅ Segmentación en tiempo real — ahora funciona porque SegmentationController
+    // v9.2 hace PUSH automático después de cada inferencia completada.
+    // Este callback recibe los datos y actualiza el estado del panel.
+    _unityBridge.onSegmentationRatioReceived = (obs, floor, wall) {
+      if (!mounted) return;
+      setState(() {
+        _segObstacle   = obs;
+        _segFloor      = floor;
+        _segWall       = wall;
+        _segBackground = (1.0 - obs - floor - wall).clamp(0.0, 1.0);
+      });
+    };
+
+    // v8.3: onVoiceStatusReceived se asigna en _onUnityCreated()
+    // DESPUÉS de attachUnityBridge() para no sobreescribir el coordinator.
   }
 
   // ─── Máquina de estados de inicialización ────────────────────────────────
@@ -237,6 +275,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
     _unityBridge.loadSession();
 
+    // Timeout de seguridad: si Unity no responde en 8s, avanzamos a ready
+    // para no bloquear al usuario. Es la razón de ser de este timeout.
     _sessionLoadTimeout = Timer(const Duration(seconds: 8), () {
       _logger.w('[AppState] Timeout esperando session_loaded — avanzando a ready');
       _onSessionLoadResponse(
@@ -254,7 +294,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     setState(() => _appState = _AppReadyState.ready);
 
     if (_unityBridge.isReady) {
-      _logger.i('[AppState] Solicitando waypoints...');
       _unityBridge.listWaypoints();
     }
 
@@ -263,11 +302,14 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         : 'No hay sesión guardada. Puedes crear balizas.';
 
     _voiceNav.isReady ? _voiceNav.speak(msg) : _coordinator.speak(msg);
-    _showSnackBar(success ? '✅ Sesión cargada' : 'ℹ️ $message');
 
+    // ✅ v8.5 FIX #3 — Status message accionable según si hay micrófono disponible.
+    // ANTES: el mensaje era inútil ("Di Oye COMPAS..." cuando el micrófono
+    //        no estaba activo aún, o "Presiona para hablar" que no indicaba qué).
+    // AHORA: mensaje claro y accionable que refleja el estado real del sistema.
     setState(() => _statusMessage = _wakeWordAvailable
-        ? 'Di "Oye COMPAS" para comenzar'
-        : 'Presiona para hablar');
+        ? 'Di "Oye COMPAS" para navegar'
+        : 'Presiona el micrófono para hablar');
   }
 
   // ─── Tracking state ───────────────────────────────────────────────────────
@@ -304,8 +346,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 18),
             const SizedBox(width: 8),
             Expanded(
-              child: Text(_trackingReasonToMessage(reason),
-                  style: const TextStyle(color: Colors.white, fontSize: 13)),
+              child: Text(
+                _trackingReasonToMessage(reason),
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+              ),
             ),
           ],
         ),
@@ -320,14 +364,14 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
   String _trackingReasonToMessage(String reason) {
     switch (reason) {
-      case 'ExcessiveMotion':       return 'Movimiento muy rápido — mueve el dispositivo más despacio.';
-      case 'InsufficientFeatures':  return 'Superficie sin textura — apunta la cámara a una zona con detalles.';
-      case 'InsufficientLight':     return 'Poca luz — busca una zona más iluminada.';
-      case 'Relocalizing':          return 'Relocalizando — mantén el dispositivo quieto un momento.';
+      case 'ExcessiveMotion':      return 'Movimiento muy rápido — mueve el dispositivo más despacio.';
+      case 'InsufficientFeatures': return 'Superficie sin textura — apunta la cámara a una zona con detalles.';
+      case 'InsufficientLight':    return 'Poca luz — busca una zona más iluminada.';
+      case 'Relocalizing':         return 'Relocalizando — mantén el dispositivo quieto un momento.';
       case 'Initializing':
-      case 'SessionInitializing':   return 'Iniciando tracking AR — mueve lentamente el dispositivo.';
-      case 'Unsupported':           return 'Tracking AR no disponible en este dispositivo.';
-      default:                      return 'Tracking AR inestable — mueve el dispositivo lentamente.';
+      case 'SessionInitializing':  return 'Iniciando tracking AR — mueve lentamente el dispositivo.';
+      case 'Unsupported':          return 'Tracking AR no disponible en este dispositivo.';
+      default:                     return 'Tracking AR inestable — mueve el dispositivo lentamente.';
     }
   }
 
@@ -400,7 +444,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       _logger.i('[Screen] ✅ VoiceNavigationService inicializado.');
 
       setState(() => _isInitialized = true);
-
       _flutterServicesReady = true;
       _tryAdvanceToWaitingUser();
 
@@ -421,30 +464,13 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _unityBridge.setController(controller);
     _voiceNav.setUnityController(controller);
 
-    // ✅ v8.3 FIX: attachUnityBridge() PRIMERO, luego envolver el callback.
-    //
-    // attachUnityBridge() asigna:
-    //   bridge.onVoiceStatusReceived = coordinator._onVoiceStatusReceived
-    //
-    // Inmediatamente después guardamos ese callback del coordinator y lo
-    // envolvemos con el callback de debug de la screen, de modo que:
-    //   1. El coordinator procesa el voice_status (completa _voiceStatusCompleter)
-    //   2. La screen muestra el snackbar de debug
-    //
-    // Así NUNCA se sobreescribe el callback del coordinator. El orden es
-    // siempre determinístico independientemente de cuándo Unity llame
-    // a _onUnityCreated.
+    // v8.3 FIX: attachUnityBridge() PRIMERO, luego envolver el callback.
     _coordinator.attachUnityBridge(_unityBridge);
 
-    // Capturar el callback del coordinator recién asignado
     final coordinatorCallback = _unityBridge.onVoiceStatusReceived;
 
-    // Envolver: coordinator primero, luego debug screen
     _unityBridge.onVoiceStatusReceived = (info) {
-      // 1. Coordinator procesa → _voiceStatusCompleter se completa
       coordinatorCallback?.call(info);
-
-      // 2. Debug snackbar para testing (no bloquea al coordinator)
       if (!mounted) return;
       final msg = info.isGuiding
           ? '📊 Guiando → ${info.destination} (${info.remainingSteps} pasos)'
@@ -455,7 +481,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     };
 
     setState(() => _unityLoaded = true);
-    _logger.i('✅ Unity AR lista — bridge conectado al coordinator (v8.3)');
+    _logger.i('✅ Unity AR lista — bridge conectado (v8.5)');
 
     _unityReady = true;
     _tryAdvanceToWaitingUser();
@@ -539,7 +565,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   void _fireTestIntent(NavigationIntent intent) {
     _unityBridge.handleIntent(intent);
     _addToHistory(intent);
-    _showSnackBar('🧪 TEST: ${intent.suggestedResponse}');
+    _showSnackBar('🧪 ${intent.suggestedResponse}');
     HapticFeedback.lightImpact();
     setState(() => _currentIntent = intent);
     Future.delayed(const Duration(seconds: 2), () {
@@ -547,13 +573,26 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     });
   }
 
+  // Auto-guardado de sesión después de crear baliza
   void _testCreateWaypoint() {
     final name = _waypointNameController.text.trim();
-    if (name.isEmpty) { _showSnackBar('⚠️ Escribe un nombre', isError: true); return; }
+    if (name.isEmpty) {
+      _showSnackBar('⚠️ Escribe un nombre', isError: true);
+      return;
+    }
     _fireTestIntent(NavigationIntent(
-      type: IntentType.navigate, target: '__unity:create_waypoint:$name',
-      priority: 6, suggestedResponse: 'Creando baliza "$name"',
+      type: IntentType.navigate,
+      target: '__unity:create_waypoint:$name',
+      priority: 6,
+      suggestedResponse: 'Creando baliza "$name"',
     ));
+    // Auto-guardado: espera a que Unity procese create_waypoint
+    Future.delayed(const Duration(milliseconds: 400), () {
+      if (mounted) {
+        _unityBridge.saveSession();
+        _logger.i('[Test] Auto-guardado tras crear baliza "$name"');
+      }
+    });
     setState(() {
       _waypointCounter++;
       _waypointNameController.text = 'Baliza $_waypointCounter';
@@ -562,11 +601,16 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
   void _testNavigateTo() {
     final target = _navigateTargetController.text.trim();
-    if (target.isEmpty) { _showSnackBar('⚠️ Escribe un destino', isError: true); return; }
+    if (target.isEmpty) {
+      _showSnackBar('⚠️ Escribe un destino', isError: true);
+      return;
+    }
     _voiceNav.resetDeduplication();
     _fireTestIntent(NavigationIntent(
-      type: IntentType.navigate, target: target,
-      priority: 8, suggestedResponse: 'Navegando a $target',
+      type: IntentType.navigate,
+      target: target,
+      priority: 8,
+      suggestedResponse: 'Navegando a $target',
     ));
   }
 
@@ -574,67 +618,67 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     _voiceNav.stop();
     _coordinator.resetNavigation();
     _fireTestIntent(NavigationIntent(
-      type: IntentType.stop, target: '',
-      priority: 10, suggestedResponse: 'Navegación detenida',
+      type: IntentType.stop,
+      target: '',
+      priority: 10,
+      suggestedResponse: 'Navegación detenida',
     ));
   }
 
-  void _testListWaypoints() => _fireTestIntent(NavigationIntent(
-    type: IntentType.navigate, target: '__unity:list_waypoints',
-    priority: 5, suggestedResponse: 'Consultando balizas',
-  ));
-
-  void _testSaveSession() => _fireTestIntent(NavigationIntent(
-    type: IntentType.navigate, target: '__unity:save_session',
-    priority: 5, suggestedResponse: 'Guardando sesión',
-  ));
-
-  void _testLoadSession() => _fireTestIntent(NavigationIntent(
-    type: IntentType.navigate, target: '__unity:load_session',
-    priority: 5, suggestedResponse: 'Cargando sesión',
-  ));
-
-  void _testNavStatus() {
-    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
-    _unityBridge.requestNavStatus();
-    _showSnackBar('🧪 TEST: Consultando estado de navegación');
-    HapticFeedback.lightImpact();
-  }
-
-  void _testVoiceInstruction() {
-    if (!_voiceNav.isReady) { _showSnackBar('⚠️ TTS no inicializado', isError: true); return; }
-    _voiceNav.speak('En diez pasos, gira a tu derecha.');
-    _showSnackBar('🔊 TEST TTS: instrucción de prueba');
-    HapticFeedback.lightImpact();
-  }
-
   void _testRepeatInstruction() {
-    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
+    if (!_unityBridge.isReady) {
+      _showSnackBar('⚠️ Unity no lista', isError: true);
+      return;
+    }
     _unityBridge.repeatInstruction();
-    _showSnackBar('🔁 TEST: repeat_instruction enviado');
+    _showSnackBar('🔁 Repetir instrucción enviado');
     HapticFeedback.lightImpact();
   }
 
   void _testStopVoice() {
-    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
+    if (!_unityBridge.isReady) {
+      _showSnackBar('⚠️ Unity no lista', isError: true);
+      return;
+    }
     _unityBridge.stopVoice();
-    _showSnackBar('🔇 TEST: stop_voice enviado');
+    _showSnackBar('🔇 Silenciar guía enviado');
     HapticFeedback.lightImpact();
   }
 
   void _testVoiceStatus() {
-    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
+    if (!_unityBridge.isReady) {
+      _showSnackBar('⚠️ Unity no lista', isError: true);
+      return;
+    }
     _unityBridge.requestVoiceStatus();
-    _showSnackBar('📊 TEST: voice_status solicitado — espera snackbar de respuesta');
+    _showSnackBar('📊 voice_status solicitado');
     HapticFeedback.lightImpact();
   }
 
   void _testTTSSpeak() {
-    if (!_unityBridge.isReady) { _showSnackBar('⚠️ Unity no lista', isError: true); return; }
+    if (!_unityBridge.isReady) {
+      _showSnackBar('⚠️ Unity no lista', isError: true);
+      return;
+    }
     final text = _ttsTestController.text.trim();
-    if (text.isEmpty) { _showSnackBar('⚠️ Escribe un texto', isError: true); return; }
+    if (text.isEmpty) {
+      _showSnackBar('⚠️ Escribe un texto', isError: true);
+      return;
+    }
     _unityBridge.speakArbitraryText(text, priority: 1, interrupt: false);
-    _showSnackBar('💬 TEST: tts_speak enviado (p=1)');
+    _showSnackBar('💬 tts_speak enviado');
+    HapticFeedback.lightImpact();
+  }
+
+  // ✅ v8.5 FIX #2 — Toggle máscara de segmentación
+  void _testToggleSegMask() {
+    if (!_unityBridge.isReady) {
+      _showSnackBar('⚠️ Unity no lista', isError: true);
+      return;
+    }
+    _unityBridge.toggleSegMask();
+    setState(() => _segMaskVisible = !_segMaskVisible);
+    _showSnackBar(_segMaskVisible ? '🎭 Máscara activada' : '🎭 Máscara desactivada');
     HapticFeedback.lightImpact();
   }
 
@@ -699,18 +743,24 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           if (_unityLoaded && _appState == _AppReadyState.ready && _showVoiceOverlay)
             _buildVoiceOverlay(),
 
+          // Tracking inestable
           if (_unityLoaded && _appState == _AppReadyState.ready && !_arTrackingStable)
             Positioned(
               top: MediaQuery.of(context).padding.top + 50,
-              left: 0, right: 0,
+              left: 0,
+              right: 0,
               child: Center(
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                   decoration: BoxDecoration(
                     color: const Color(0xFFE65100).withOpacity(0.92),
                     borderRadius: BorderRadius.circular(20),
-                    boxShadow: [BoxShadow(
-                        color: Colors.black.withOpacity(0.3), blurRadius: 8)],
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.3),
+                        blurRadius: 8,
+                      )
+                    ],
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
@@ -722,8 +772,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                             ? 'Tracking: $_arTrackingReason'
                             : 'Tracking inestable',
                         style: const TextStyle(
-                            color: Colors.white, fontSize: 12,
-                            fontWeight: FontWeight.w600),
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                     ],
                   ),
@@ -731,6 +783,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               ),
             ),
 
+          // Botones superiores + panel de testing
           if (_unityLoaded && _appState == _AppReadyState.ready) ...[
             Positioned(
               top: MediaQuery.of(context).padding.top + 8,
@@ -749,7 +802,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 left: 16,
                 child: Transform.translate(
                   offset: Offset(-300 * (1 - _testPanelAnimation.value), 0),
-                  child: Opacity(opacity: _testPanelAnimation.value, child: child),
+                  child: Opacity(
+                    opacity: _testPanelAnimation.value,
+                    child: child,
+                  ),
                 ),
               ),
               child: _buildTestPanel(),
@@ -760,7 +816,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
-  // ─── Overlays ────────────────────────────────────────────────────────────
+  // ─── Overlays ─────────────────────────────────────────────────────────────
 
   Widget _buildWaitingUserOverlay() {
     return Container(
@@ -773,12 +829,15 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               mainAxisSize: MainAxisSize.min,
               children: [
                 Container(
-                  width: 80, height: 80,
+                  width: 80,
+                  height: 80,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
                     color: const Color(0xFFFF6B00).withOpacity(0.15),
                     border: Border.all(
-                        color: const Color(0xFFFF6B00).withOpacity(0.6), width: 2),
+                      color: const Color(0xFFFF6B00).withOpacity(0.6),
+                      width: 2,
+                    ),
                   ),
                   child: const Icon(Icons.navigation_rounded,
                       color: Color(0xFFFF6B00), size: 40),
@@ -787,8 +846,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 const Text(
                   'COMPAS listo',
                   style: TextStyle(
-                    color: Colors.white, fontSize: 24,
-                    fontWeight: FontWeight.w700, letterSpacing: 0.5,
+                    color: Colors.white,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.5,
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -797,21 +858,26 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     color: Colors.white.withOpacity(0.7),
-                    fontSize: 15, height: 1.5,
+                    fontSize: 15,
+                    height: 1.5,
                   ),
                 ),
                 const SizedBox(height: 36),
                 GestureDetector(
                   onTap: _onUserReady,
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 32, vertical: 16),
                     decoration: BoxDecoration(
                       color: const Color(0xFFFF6B00),
                       borderRadius: BorderRadius.circular(16),
-                      boxShadow: [BoxShadow(
-                        color: const Color(0xFFFF6B00).withOpacity(0.4),
-                        blurRadius: 20, spreadRadius: 2,
-                      )],
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFFFF6B00).withOpacity(0.4),
+                          blurRadius: 20,
+                          spreadRadius: 2,
+                        )
+                      ],
                     ),
                     child: const Row(
                       mainAxisSize: MainAxisSize.min,
@@ -822,7 +888,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                         Text(
                           'Estoy listo',
                           style: TextStyle(
-                            color: Colors.white, fontSize: 17,
+                            color: Colors.white,
+                            fontSize: 17,
                             fontWeight: FontWeight.w700,
                           ),
                         ),
@@ -835,7 +902,9 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   Text(
                     'o di "Oye COMPAS: Estoy listo"',
                     style: TextStyle(
-                        color: Colors.white.withOpacity(0.45), fontSize: 13),
+                      color: Colors.white.withOpacity(0.45),
+                      fontSize: 13,
+                    ),
                   ),
               ],
             ),
@@ -857,7 +926,10 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             Text(
               'Cargando sesión...',
               style: TextStyle(
-                  color: Colors.white, fontSize: 17, fontWeight: FontWeight.w500),
+                color: Colors.white,
+                fontSize: 17,
+                fontWeight: FontWeight.w500,
+              ),
             ),
           ],
         ),
@@ -882,7 +954,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           const SizedBox(height: 16),
           _buildMainVoiceButton(),
           const SizedBox(height: 24),
-          _buildSecondaryControls(),
           const SizedBox(height: 20),
         ],
       ),
@@ -902,11 +973,16 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(_showVoiceOverlay ? Icons.visibility_off : Icons.mic,
-                color: Colors.white, size: 16),
+            Icon(
+              _showVoiceOverlay ? Icons.visibility_off : Icons.mic,
+              color: Colors.white,
+              size: 16,
+            ),
             const SizedBox(width: 6),
-            Text(_showVoiceOverlay ? 'Ocultar' : 'Voz',
-                style: const TextStyle(color: Colors.white, fontSize: 13)),
+            Text(
+              _showVoiceOverlay ? 'Ocultar' : 'Voz',
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+            ),
           ],
         ),
       ),
@@ -925,28 +1001,43 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
               : Colors.black.withOpacity(0.72),
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-            color: _showTestPanel ? const Color(0xFFCE93D8) : Colors.white30,
+            color: _showTestPanel
+                ? const Color(0xFFCE93D8)
+                : Colors.white30,
             width: 1.5,
           ),
           boxShadow: _showTestPanel
-              ? [BoxShadow(color: const Color(0xFF7B1FA2).withOpacity(0.4),
-              blurRadius: 12, spreadRadius: 2)]
+              ? [
+                  BoxShadow(
+                    color: const Color(0xFF7B1FA2).withOpacity(0.4),
+                    blurRadius: 12,
+                    spreadRadius: 2,
+                  )
+                ]
               : [],
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              _showTestPanel ? Icons.close_rounded : Icons.bug_report_rounded,
-              color: _showTestPanel ? const Color(0xFFCE93D8) : Colors.white70,
+              _showTestPanel
+                  ? Icons.close_rounded
+                  : Icons.bug_report_rounded,
+              color: _showTestPanel
+                  ? const Color(0xFFCE93D8)
+                  : Colors.white70,
               size: 18,
             ),
             const SizedBox(width: 6),
             Text(
-              _showTestPanel ? 'Cerrar' : 'TEST',
+              _showTestPanel ? 'Cerrar' : 'Test',
               style: TextStyle(
-                color: _showTestPanel ? const Color(0xFFCE93D8) : Colors.white70,
-                fontSize: 13, fontWeight: FontWeight.w700, letterSpacing: 0.5,
+                color: _showTestPanel
+                    ? const Color(0xFFCE93D8)
+                    : Colors.white70,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.5,
               ),
             ),
           ],
@@ -955,6 +1046,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
+  // ─── Panel de testing ─────────────────────────────────────────────────────
+
   Widget _buildTestPanel() {
     return ValueListenableBuilder<bool>(
       valueListenable: _unityBridge.isReadyNotifier,
@@ -962,16 +1055,22 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         return Container(
           width: 290,
           constraints: BoxConstraints(
-              maxHeight: MediaQuery.of(context).size.height * 0.65),
+            maxHeight: MediaQuery.of(context).size.height * 0.70,
+          ),
           decoration: BoxDecoration(
             color: const Color(0xFF0D0D1A).withOpacity(0.96),
             borderRadius: BorderRadius.circular(20),
             border: Border.all(
-                color: const Color(0xFF7B1FA2).withOpacity(0.6), width: 1.5),
-            boxShadow: [BoxShadow(
-              color: const Color(0xFF7B1FA2).withOpacity(0.25),
-              blurRadius: 20, spreadRadius: 2,
-            )],
+              color: const Color(0xFF7B1FA2).withOpacity(0.6),
+              width: 1.5,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF7B1FA2).withOpacity(0.25),
+                blurRadius: 20,
+                spreadRadius: 2,
+              )
+            ],
           ),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(20),
@@ -981,6 +1080,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
+
+                  // ── Header ───────────────────────────────────────────────
                   Row(
                     children: [
                       Container(
@@ -993,30 +1094,28 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                             color: Color(0xFFCE93D8), size: 16),
                       ),
                       const SizedBox(width: 8),
-                      const Text('Panel de Testing',
-                          style: TextStyle(color: Color(0xFFCE93D8), fontSize: 14,
-                              fontWeight: FontWeight.w700, letterSpacing: 0.3)),
+                      const Text(
+                        'Panel de testing',
+                        style: TextStyle(
+                          color: Color(0xFFCE93D8),
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.3,
+                        ),
+                      ),
                       const Spacer(),
                       Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           _buildStatusBadge(
-                              label: isReady ? 'AR ✓' : 'AR ⏳', active: isReady),
+                              label: isReady ? 'AR ✓' : 'AR ⏳',
+                              active: isReady),
                           const SizedBox(width: 4),
                           ValueListenableBuilder<bool>(
                             valueListenable: _voiceNav.isReadyNotifier,
                             builder: (_, ttsReady, __) => _buildStatusBadge(
                                 label: ttsReady ? 'TTS ✓' : 'TTS ⏳',
                                 active: ttsReady),
-                          ),
-                          const SizedBox(width: 4),
-                          StreamBuilder<List<WaypointEntry>>(
-                            stream: _waypointContext.onWaypointsChanged,
-                            builder: (_, __) => _buildStatusBadge(
-                              label: _waypointContext.hasWaypoints
-                                  ? 'WP ${_waypointContext.count}' : 'WP ⏳',
-                              active: _waypointContext.hasWaypoints,
-                            ),
                           ),
                           const SizedBox(width: 4),
                           _buildStatusBadge(
@@ -1028,78 +1127,14 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     ],
                   ),
 
-                  if (!_wakeWordAvailable) ...[
-                    const SizedBox(height: 10),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: Colors.orange.withOpacity(0.15),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.orange.withOpacity(0.5)),
-                      ),
-                      child: const Row(
-                        children: [
-                          Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 14),
-                          SizedBox(width: 6),
-                          Expanded(child: Text(
-                            'Wake word inactivo (speech_to_text v3)',
-                            style: TextStyle(color: Colors.orange, fontSize: 11),
-                          )),
-                        ],
-                      ),
-                    ),
-                  ],
-
-                  const SizedBox(height: 10),
-                  StreamBuilder<List<WaypointEntry>>(
-                    stream: _waypointContext.onWaypointsChanged,
-                    builder: (_, __) {
-                      if (!_waypointContext.hasWaypoints) {
-                        return Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                          decoration: BoxDecoration(
-                            color: Colors.blue.withOpacity(0.08),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.blue.withOpacity(0.3)),
-                          ),
-                          child: const Row(children: [
-                            Icon(Icons.info_outline, color: Colors.lightBlueAccent, size: 13),
-                            SizedBox(width: 6),
-                            Expanded(child: Text(
-                              'Groq aún no conoce las balizas.\nPulsa "Listar balizas" para cargar.',
-                              style: TextStyle(color: Colors.lightBlueAccent, fontSize: 10),
-                            )),
-                          ]),
-                        );
-                      }
-                      final names = _waypointContext.navigableWaypoints
-                          .map((w) => w.name).join(', ');
-                      return Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                        decoration: BoxDecoration(
-                          color: Colors.green.withOpacity(0.08),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.green.withOpacity(0.3)),
-                        ),
-                        child: Row(children: [
-                          const Icon(Icons.location_on, color: Colors.greenAccent, size: 13),
-                          const SizedBox(width: 6),
-                          Expanded(child: Text('Groq conoce: $names',
-                            style: const TextStyle(color: Colors.greenAccent, fontSize: 10),
-                            maxLines: 2, overflow: TextOverflow.ellipsis,
-                          )),
-                        ]),
-                      );
-                    },
-                  ),
-
+                  // ── NAVEGACIÓN ───────────────────────────────────────────
                   const SizedBox(height: 14),
                   _testSectionDivider('NAVEGACIÓN'),
                   const SizedBox(height: 10),
                   _buildTestInputRow(
                     controller: _navigateTargetController,
                     hint: 'Nombre del destino',
-                    buttonLabel: 'Navegar',
+                    buttonLabel: 'Ir',
                     buttonIcon: Icons.navigation_rounded,
                     color: const Color(0xFF1565C0),
                     accentColor: const Color(0xFF64B5F6),
@@ -1114,9 +1149,71 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     onPressed: isReady ? _testStop : null,
                   ),
 
+                  // ── BALIZAS ──────────────────────────────────────────────
                   const SizedBox(height: 14),
                   _testSectionDivider('BALIZAS'),
                   const SizedBox(height: 10),
+
+                  StreamBuilder<List<WaypointEntry>>(
+                    stream: _waypointContext.onWaypointsChanged,
+                    builder: (_, __) {
+                      if (!_waypointContext.hasWaypoints) {
+                        return Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 7),
+                          margin: const EdgeInsets.only(bottom: 8),
+                          decoration: BoxDecoration(
+                            color: Colors.blue.withOpacity(0.06),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                                color: Colors.blue.withOpacity(0.2)),
+                          ),
+                          child: const Row(children: [
+                            Icon(Icons.info_outline,
+                                color: Colors.lightBlueAccent, size: 13),
+                            SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                'Sin balizas aún. Crea una para comenzar.',
+                                style: TextStyle(
+                                    color: Colors.lightBlueAccent,
+                                    fontSize: 11),
+                              ),
+                            ),
+                          ]),
+                        );
+                      }
+                      final names = _waypointContext.navigableWaypoints
+                          .map((w) => w.name)
+                          .join(', ');
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 7),
+                        margin: const EdgeInsets.only(bottom: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.green.withOpacity(0.06),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                              color: Colors.green.withOpacity(0.2)),
+                        ),
+                        child: Row(children: [
+                          const Icon(Icons.location_on,
+                              color: Colors.greenAccent, size: 13),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              names,
+                              style: const TextStyle(
+                                  color: Colors.greenAccent, fontSize: 11),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ]),
+                      );
+                    },
+                  ),
+
                   _buildTestInputRow(
                     controller: _waypointNameController,
                     hint: 'Nombre de la baliza',
@@ -1126,96 +1223,12 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     accentColor: const Color(0xFFA5D6A7),
                     onPressed: isReady ? _testCreateWaypoint : null,
                   ),
-                  const SizedBox(height: 8),
-                  _buildTestActionButton(
-                    label: 'Listar balizas',
-                    icon: Icons.list_alt_rounded,
-                    color: const Color(0xFF0E4749),
-                    accentColor: const Color(0xFF80CBC4),
-                    onPressed: isReady ? _testListWaypoints : null,
-                  ),
 
+                  // ── GUÍA DE VOZ ──────────────────────────────────────────
                   const SizedBox(height: 14),
-                  _testSectionDivider('SESIÓN'),
+                  _testSectionDivider('GUÍA DE VOZ'),
                   const SizedBox(height: 10),
-                  Row(children: [
-                    Expanded(child: _buildTestActionButton(
-                      label: 'Guardar', icon: Icons.save_rounded,
-                      color: const Color(0xFF1A237E),
-                      accentColor: const Color(0xFF90CAF9),
-                      onPressed: isReady ? _testSaveSession : null,
-                    )),
-                    const SizedBox(width: 8),
-                    Expanded(child: _buildTestActionButton(
-                      label: 'Cargar', icon: Icons.folder_open_rounded,
-                      color: const Color(0xFF1A237E),
-                      accentColor: const Color(0xFF90CAF9),
-                      onPressed: isReady ? _testLoadSession : null,
-                    )),
-                  ]),
-                  const SizedBox(height: 8),
-                  _buildTestActionButton(
-                    label: 'Estado de navegación',
-                    icon: Icons.radar_rounded,
-                    color: const Color(0xFF33691E),
-                    accentColor: const Color(0xFFDCE775),
-                    onPressed: isReady ? _testNavStatus : null,
-                  ),
 
-                  const SizedBox(height: 14),
-                  _testSectionDivider('VOZ GPS'),
-                  const SizedBox(height: 10),
-                  ValueListenableBuilder<bool>(
-                    valueListenable: _voiceNav.isReadyNotifier,
-                    builder: (_, ttsReady, __) => Column(children: [
-                      _buildTestActionButton(
-                        label: 'Test instrucción de giro',
-                        icon: Icons.turn_right_rounded,
-                        color: const Color(0xFF4A148C),
-                        accentColor: const Color(0xFFCE93D8),
-                        onPressed: ttsReady ? _testVoiceInstruction : null,
-                      ),
-                      const SizedBox(height: 8),
-                      _buildTestActionButton(
-                        label: 'Silenciar TTS',
-                        icon: Icons.volume_off_rounded,
-                        color: const Color(0xFF37474F),
-                        accentColor: const Color(0xFFB0BEC5),
-                        onPressed: ttsReady ? () {
-                          _voiceNav.stop();
-                          _showSnackBar('🔇 TTS silenciado');
-                        } : null,
-                      ),
-                    ]),
-                  ),
-
-                  const SizedBox(height: 14),
-                  _testSectionDivider('GUÍA DE VOZ (Unity v4)'),
-                  const SizedBox(height: 10),
-                  _buildTestActionButton(
-                    label: 'Repetir instrucción',
-                    icon: Icons.replay_rounded,
-                    color: const Color(0xFF004D40),
-                    accentColor: const Color(0xFF80CBC4),
-                    onPressed: isReady ? _testRepeatInstruction : null,
-                  ),
-                  const SizedBox(height: 8),
-                  _buildTestActionButton(
-                    label: 'Silenciar guía de voz',
-                    icon: Icons.voice_over_off_rounded,
-                    color: const Color(0xFF37474F),
-                    accentColor: const Color(0xFFB0BEC5),
-                    onPressed: isReady ? _testStopVoice : null,
-                  ),
-                  const SizedBox(height: 8),
-                  _buildTestActionButton(
-                    label: 'Estado de guía (voice_status)',
-                    icon: Icons.info_outline_rounded,
-                    color: const Color(0xFF1A237E),
-                    accentColor: const Color(0xFF90CAF9),
-                    onPressed: isReady ? _testVoiceStatus : null,
-                  ),
-                  const SizedBox(height: 8),
                   _buildTestInputRow(
                     controller: _ttsTestController,
                     hint: 'Texto para COMPAS TTS',
@@ -1225,31 +1238,58 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                     accentColor: const Color(0xFFCE93D8),
                     onPressed: isReady ? _testTTSSpeak : null,
                   ),
-
-                  const SizedBox(height: 14),
-                  _testSectionDivider('SISTEMA'),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 8),
+                  Row(children: [
+                    Expanded(
+                      child: _buildTestActionButton(
+                        label: 'Repetir',
+                        icon: Icons.replay_rounded,
+                        color: const Color(0xFF004D40),
+                        accentColor: const Color(0xFF80CBC4),
+                        onPressed: isReady ? _testRepeatInstruction : null,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _buildTestActionButton(
+                        label: 'Silenciar',
+                        icon: Icons.voice_over_off_rounded,
+                        color: const Color(0xFF37474F),
+                        accentColor: const Color(0xFFB0BEC5),
+                        onPressed: isReady ? _testStopVoice : null,
+                      ),
+                    ),
+                  ]),
+                  const SizedBox(height: 8),
                   _buildTestActionButton(
-                    label: 'Reset completo',
-                    icon: Icons.refresh_rounded,
-                    color: const Color(0xFF4A148C),
-                    accentColor: const Color(0xFFCE93D8),
-                    onPressed: () {
-                      _coordinator.reset();
-                      _voiceNav.stop();
-                      _voiceNav.resetDeduplication();
-                      setState(() {
-                        _currentIntent = null;
-                        _history.clear();
-                        _waypointCounter = 1;
-                        _waypointNameController.text   = 'Baliza 1';
-                        _navigateTargetController.text = 'Entrada';
-                        _ttsTestController.text        = 'Claro, ¿en qué puedo ayudarte?';
-                      });
-                      _showSnackBar('🔄 Reset completo del sistema');
-                      HapticFeedback.mediumImpact();
-                    },
+                    label: 'Estado de guía',
+                    icon: Icons.info_outline_rounded,
+                    color: const Color(0xFF1A237E),
+                    accentColor: const Color(0xFF90CAF9),
+                    onPressed: isReady ? _testVoiceStatus : null,
                   ),
+
+                  // ── SEGMENTACIÓN ─────────────────────────────────────────
+                  const SizedBox(height: 14),
+                  _testSectionDivider('SEGMENTACIÓN'),
+                  const SizedBox(height: 10),
+
+                  // ✅ v8.5 FIX #2 — Botón toggle máscara de segmentación
+                  _buildTestActionButton(
+                    label: _segMaskVisible ? 'Ocultar máscara AR' : 'Mostrar máscara AR',
+                    icon: _segMaskVisible ? Icons.layers_clear : Icons.layers,
+                    color: _segMaskVisible
+                        ? const Color(0xFF4A148C)
+                        : const Color(0xFF1B5E20),
+                    accentColor: _segMaskVisible
+                        ? const Color(0xFFCE93D8)
+                        : const Color(0xFFA5D6A7),
+                    onPressed: isReady ? _testToggleSegMask : null,
+                  ),
+                  const SizedBox(height: 10),
+
+                  _buildSegmentationBars(),
+
                   const SizedBox(height: 4),
                 ],
               ),
@@ -1260,27 +1300,168 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
+  // ─── Barras de segmentación ───────────────────────────────────────────────
+
+  Widget _buildSegmentationBars() {
+    final isAlert = _segObstacle >= _obstacleAlertThreshold;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.04),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: isAlert
+              ? Colors.red.withOpacity(0.4)
+              : Colors.white.withOpacity(0.08),
+        ),
+      ),
+      child: Column(
+        children: [
+          _buildSegBar(
+            label: 'Background',
+            value: _segBackground,
+            color: const Color(0xFF888780),
+          ),
+          const SizedBox(height: 6),
+          _buildSegBar(
+            label: 'Obstacle',
+            value: _segObstacle,
+            color: const Color(0xFFE24B4A),
+            alert: isAlert,
+          ),
+          const SizedBox(height: 6),
+          _buildSegBar(
+            label: 'Floor',
+            value: _segFloor,
+            color: const Color(0xFF1D9E75),
+          ),
+          const SizedBox(height: 6),
+          _buildSegBar(
+            label: 'Wall',
+            value: _segWall,
+            color: const Color(0xFF378ADD),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSegBar({
+    required String label,
+    required double value,
+    required Color color,
+    bool alert = false,
+  }) {
+    final pct = (value * 100).toStringAsFixed(1);
+    return Row(
+      children: [
+        SizedBox(
+          width: 68,
+          child: Row(
+            children: [
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(width: 5),
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: alert ? Colors.red[200] : Colors.grey[500],
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: LinearProgressIndicator(
+              value: value.clamp(0.0, 1.0),
+              minHeight: 6,
+              backgroundColor: Colors.white.withOpacity(0.08),
+              valueColor: AlwaysStoppedAnimation<Color>(
+                alert ? const Color(0xFFE24B4A) : color,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 40,
+          child: Text(
+            '$pct%',
+            style: TextStyle(
+              fontSize: 11,
+              color: alert ? Colors.red[300] : Colors.grey[500],
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+            textAlign: TextAlign.right,
+          ),
+        ),
+        if (alert) ...[
+          const SizedBox(width: 4),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+            decoration: BoxDecoration(
+              color: const Color(0xFFB71C1C).withOpacity(0.6),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: const Text(
+              '⚠',
+              style: TextStyle(fontSize: 9, color: Color(0xFFEF9A9A)),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  // ─── Widgets helpers del panel ────────────────────────────────────────────
+
   Widget _buildStatusBadge({required String label, required bool active}) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
       decoration: BoxDecoration(
-        color: active ? Colors.green.withOpacity(0.2) : Colors.orange.withOpacity(0.2),
+        color: active
+            ? Colors.green.withOpacity(0.2)
+            : Colors.orange.withOpacity(0.2),
         borderRadius: BorderRadius.circular(7),
         border: Border.all(
-            color: active ? Colors.greenAccent : Colors.orange, width: 0.8),
+          color: active ? Colors.greenAccent : Colors.orange,
+          width: 0.8,
+        ),
       ),
-      child: Text(label,
-          style: TextStyle(
-              color: active ? Colors.greenAccent : Colors.orange,
-              fontSize: 10, fontWeight: FontWeight.w600)),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: active ? Colors.greenAccent : Colors.orange,
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
     );
   }
 
   Widget _testSectionDivider(String label) {
     return Row(children: [
-      Text(label, style: const TextStyle(
-          color: Color(0xFF9E9E9E), fontSize: 10,
-          fontWeight: FontWeight.w700, letterSpacing: 1.2)),
+      Text(
+        label,
+        style: const TextStyle(
+          color: Color(0xFF9E9E9E),
+          fontSize: 10,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 1.2,
+        ),
+      ),
       const SizedBox(width: 8),
       Expanded(child: Container(height: 0.5, color: Colors.white12)),
     ]);
@@ -1306,13 +1487,18 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             border: Border.all(color: Colors.white.withOpacity(0.12)),
           ),
           child: TextField(
-            controller: controller, enabled: enabled,
+            controller: controller,
+            enabled: enabled,
             style: const TextStyle(color: Colors.white, fontSize: 13),
             decoration: InputDecoration(
               hintText: hint,
-              hintStyle: TextStyle(color: Colors.white.withOpacity(0.35), fontSize: 12),
+              hintStyle: TextStyle(
+                color: Colors.white.withOpacity(0.35),
+                fontSize: 12,
+              ),
               border: InputBorder.none,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
               isDense: true,
             ),
           ),
@@ -1330,13 +1516,20 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
             decoration: BoxDecoration(
               color: color.withOpacity(0.85),
               borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: accentColor.withOpacity(0.5)),
+              border:
+                  Border.all(color: accentColor.withOpacity(0.5)),
             ),
             child: Row(mainAxisSize: MainAxisSize.min, children: [
               Icon(buttonIcon, color: accentColor, size: 15),
               const SizedBox(width: 5),
-              Text(buttonLabel, style: TextStyle(
-                  color: accentColor, fontSize: 12, fontWeight: FontWeight.w600)),
+              Text(
+                buttonLabel,
+                style: TextStyle(
+                  color: accentColor,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
             ]),
           ),
         ),
@@ -1368,15 +1561,24 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           child: Row(mainAxisSize: MainAxisSize.min, children: [
             Icon(icon, color: accentColor, size: 16),
             const SizedBox(width: 8),
-            Flexible(child: Text(label,
-                style: TextStyle(color: accentColor, fontSize: 12,
-                    fontWeight: FontWeight.w600),
-                overflow: TextOverflow.ellipsis)),
+            Flexible(
+              child: Text(
+                label,
+                style: TextStyle(
+                  color: accentColor,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
           ]),
         ),
       ),
     );
   }
+
+  // ─── Status bar ───────────────────────────────────────────────────────────
 
   Widget _buildStatusBar() {
     return Padding(
@@ -1390,17 +1592,24 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           ),
           child: Row(mainAxisSize: MainAxisSize.min, children: [
             Container(
-              width: 8, height: 8,
+              width: 8,
+              height: 8,
               decoration: BoxDecoration(
                 color: _isActive ? Colors.greenAccent : Colors.grey,
                 shape: BoxShape.circle,
               ),
             ),
             const SizedBox(width: 8),
-            Text(_statusMessage,
-                style: const TextStyle(color: Colors.white, fontSize: 12,
-                    fontWeight: FontWeight.w600),
-                maxLines: 1, overflow: TextOverflow.ellipsis),
+            Text(
+              _statusMessage,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
           ]),
         ),
         const Spacer(),
@@ -1414,12 +1623,16 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 borderRadius: BorderRadius.circular(20),
               ),
               child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(Icons.view_in_ar,
-                    color: isConnected ? Colors.greenAccent : Colors.orange,
-                    size: 14),
+                Icon(
+                  Icons.view_in_ar,
+                  color: isConnected ? Colors.greenAccent : Colors.orange,
+                  size: 14,
+                ),
                 const SizedBox(width: 6),
-                Text(isConnected ? 'AR Activo' : 'AR Cargando',
-                    style: const TextStyle(color: Colors.white, fontSize: 12)),
+                Text(
+                  isConnected ? 'AR Activo' : 'AR Cargando',
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
               ]),
             ),
           ),
@@ -1446,6 +1659,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
+  // ─── Comando actual ───────────────────────────────────────────────────────
+
   Widget _buildCurrentCommand() {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -1456,15 +1671,25 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           borderRadius: BorderRadius.circular(16),
         ),
         child: Row(children: [
-          Icon(_getIntentIcon(_currentIntent!.type), color: Colors.white, size: 22),
+          Icon(_getIntentIcon(_currentIntent!.type),
+              color: Colors.white, size: 22),
           const SizedBox(width: 12),
-          Expanded(child: Text(_currentIntent!.suggestedResponse,
-              style: const TextStyle(color: Colors.white, fontSize: 16,
-                  fontWeight: FontWeight.bold))),
+          Expanded(
+            child: Text(
+              _currentIntent!.suggestedResponse,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
         ]),
       ),
     );
   }
+
+  // ─── Historial compacto ───────────────────────────────────────────────────
 
   Widget _buildCompactHistory() {
     return Padding(
@@ -1488,11 +1713,19 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 Icon(_getIntentIcon(item.intent.type),
                     color: Colors.white70, size: 14),
                 const SizedBox(width: 8),
-                Expanded(child: Text(item.intent.suggestedResponse,
-                    style: const TextStyle(color: Colors.white70, fontSize: 13),
-                    overflow: TextOverflow.ellipsis)),
-                Text(timeStr,
-                    style: const TextStyle(color: Colors.white38, fontSize: 11)),
+                Expanded(
+                  child: Text(
+                    item.intent.suggestedResponse,
+                    style: const TextStyle(
+                        color: Colors.white70, fontSize: 13),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Text(
+                  timeStr,
+                  style: const TextStyle(
+                      color: Colors.white38, fontSize: 11),
+                ),
               ]),
             );
           }).toList(),
@@ -1500,6 +1733,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       ),
     );
   }
+
+  // ─── Botón de voz principal ───────────────────────────────────────────────
 
   Widget _buildMainVoiceButton() {
     return GestureDetector(
@@ -1509,20 +1744,25 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         builder: (context, child) => Transform.scale(
           scale: _isActive ? _pulseAnimation.value : 1.0,
           child: Container(
-            width: 100, height: 100,
+            width: 100,
+            height: 100,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               color: !_isInitialized
                   ? Colors.grey.withOpacity(0.7)
                   : (_isActive
-                  ? const Color(0xFFE53935).withOpacity(0.9)
-                  : const Color(0xFFFF6B00).withOpacity(0.9)),
-              boxShadow: [BoxShadow(
-                color: (_isActive
-                    ? const Color(0xFFE53935)
-                    : const Color(0xFFFF6B00)).withOpacity(0.4),
-                blurRadius: 24, spreadRadius: 4,
-              )],
+                      ? const Color(0xFFE53935).withOpacity(0.9)
+                      : const Color(0xFFFF6B00).withOpacity(0.9)),
+              boxShadow: [
+                BoxShadow(
+                  color: (_isActive
+                          ? const Color(0xFFE53935)
+                          : const Color(0xFFFF6B00))
+                      .withOpacity(0.4),
+                  blurRadius: 24,
+                  spreadRadius: 4,
+                )
+              ],
             ),
             child: Stack(
               alignment: Alignment.center,
@@ -1531,7 +1771,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   AnimatedBuilder(
                     animation: _waveAnimation,
                     builder: (context, _) => Container(
-                      width:  100 + (30 * _waveAnimation.value),
+                      width: 100 + (30 * _waveAnimation.value),
                       height: 100 + (30 * _waveAnimation.value),
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
@@ -1545,7 +1785,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                   ),
                 Icon(
                   _isActive ? Icons.stop_rounded : Icons.mic_rounded,
-                  color: Colors.white, size: 46,
+                  color: Colors.white,
+                  size: 46,
                 ),
               ],
             ),
@@ -1555,83 +1796,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     );
   }
 
-  Widget _buildSecondaryControls() {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 32),
-      child: ValueListenableBuilder<bool>(
-        valueListenable: _unityBridge.isReadyNotifier,
-        builder: (context, isReady, _) => Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-          children: [
-            _buildControlChip(
-              icon: Icons.save_outlined, label: 'Guardar',
-              onTap: isReady ? () {
-                _unityBridge.saveSession();
-                _showSnackBar('💾 Guardando sesión...');
-                HapticFeedback.lightImpact();
-              } : null,
-            ),
-            _buildControlChip(
-              icon: Icons.folder_open_outlined, label: 'Cargar',
-              onTap: isReady ? () {
-                _unityBridge.loadSession();
-                _showSnackBar('📂 Cargando sesión...');
-                HapticFeedback.lightImpact();
-              } : null,
-            ),
-            _buildControlChip(
-              icon: Icons.list_alt_rounded, label: 'Balizas',
-              onTap: isReady ? () {
-                _unityBridge.listWaypoints();
-                _showSnackBar('📍 Consultando balizas...');
-                HapticFeedback.lightImpact();
-              } : null,
-            ),
-            _buildControlChip(
-              icon: Icons.refresh_rounded, label: 'Reset',
-              onTap: () {
-                _coordinator.reset();
-                _voiceNav.stop();
-                setState(() { _currentIntent = null; _history.clear(); });
-                _showSnackBar('🔄 Sistema reiniciado');
-                HapticFeedback.mediumImpact();
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildControlChip({
-    required IconData icon,
-    required String label,
-    VoidCallback? onTap,
-  }) {
-    final enabled = onTap != null;
-    return GestureDetector(
-      onTap: onTap,
-      child: AnimatedOpacity(
-        opacity: enabled ? 1.0 : 0.4,
-        duration: const Duration(milliseconds: 300),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          decoration: BoxDecoration(
-            color: Colors.black.withOpacity(0.65),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-                color: enabled ? Colors.white38 : Colors.white24),
-          ),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Icon(icon, color: Colors.white, size: 22),
-            const SizedBox(height: 4),
-            Text(label, style: const TextStyle(
-                color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600)),
-          ]),
-        ),
-      ),
-    );
-  }
+  // ─── Utilidades ───────────────────────────────────────────────────────────
 
   IconData _getIntentIcon(IntentType type) {
     return switch (type) {
@@ -1643,6 +1808,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
     };
   }
 }
+
+// ─── Modelo interno ───────────────────────────────────────────────────────
 
 class _CommandItem {
   final NavigationIntent intent;
