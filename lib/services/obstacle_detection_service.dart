@@ -1,33 +1,31 @@
 // lib/services/obstacle_detection_service.dart
-// ✅ v2.0 — Lógica de proximidad avanzada (5 técnicas)
+// ✅ v2.1 — Soporte de frames JPEG desde Unity (sin CameraController)
 //
-// NUEVAS TÉCNICAS vs v1.5:
+// ============================================================================
+// CAMBIOS v2.0 → v2.1
+// ============================================================================
 //
-//  1. ZONA VERTICAL (alta/media/baja)
-//     La máscara 312×312 se divide en 3 franjas horizontales:
-//       top    (y < 104) → obstáculo lejos (horizonte)
-//       middle (104-208) → obstáculo acercándose
-//       bottom (y > 208) → obstáculo inmediato (a los pies)
-//     Se usa la zona con mayor concentración para calcular el nivel.
+//  PROBLEMA RESUELTO:
+//    processCameraImage() esperaba un CameraImage de Flutter, pero ARCore
+//    toma control exclusivo de la cámara. La solución es recibir frames JPEG
+//    enviados por Unity vía el bridge (action="frame_data").
 //
-//  2. DIRECCIÓN LATERAL (izquierda / centro / derecha)
-//     Centroide X de los píxeles de obstáculo/pared.
-//     El mensaje TTS incluye la dirección: "Obstáculo a la izquierda",
-//     "¡Pared al centro!" — más accionable para el usuario.
+//  NUEVAS ADICIONES (no modifican nada existente):
 //
-//  3. CRECIMIENTO TEMPORAL
-//     Compara la proporción actual vs la media de los últimos 4 frames.
-//     Si crece > 4% por frame → el usuario se acerca activamente.
-//     En ese caso se reduce el umbral de alerta en un nivel.
+//  1. _JpegPayload — clase payload para compute() con JPEG bytes.
 //
-//  4. FLOOR RATIO INVERSO
-//     Si floorRatio < 8% Y hay obstáculo/pared en rango → el espacio
-//     libre frente al usuario se está agotando. Sube urgencia.
+//  2. _decodeAndInfer() — función top-level para compute().
+//     Decodifica el JPEG con img.decodeJpg(), construye un _InferencePayload
+//     en modo BGRA y reutiliza _runInference() sin duplicar lógica.
 //
-//  5. CONFIANZA DE LOGIT (filtrado de ruido)
-//     Solo se cuentan los píxeles donde el logit ganador supera 0.55.
-//     Los píxeles de baja confianza (bordes, sombras) se ignoran.
-//     Reduce falsos positivos sin perder detecciones reales.
+//  3. processJpegFrame(Uint8List jpegBytes) — método público equivalente
+//     a processCameraImage() pero para JPEG. Es la nueva entrada cuando
+//     la fuente de frames es Unity en lugar de CameraController.
+//
+//  processCameraImage() SE CONSERVA para compatibilidad futura o testing
+//  en entornos sin ARCore (simulador, web).
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v2.0 (5 técnicas de proximidad intactas).
 
 import 'dart:async';
 import 'dart:typed_data';
@@ -60,7 +58,7 @@ class SegObstacleAlert {
   final DateTime        timestamp;
   final SegZone         zone;
   final SegDirection    direction;
-  final bool            isApproaching; // crecimiento temporal detectado
+  final bool            isApproaching;
 
   const SegObstacleAlert({
     required this.level,
@@ -89,7 +87,6 @@ class SegmentationResult {
   final int    inferenceMs;
   final Uint8List? maskData;
 
-  // Ratios por zona vertical (top / middle / bottom, franja de 104px cada una)
   final double obsTopRatio;
   final double obsMidRatio;
   final double obsBotRatio;
@@ -97,11 +94,9 @@ class SegmentationResult {
   final double wallMidRatio;
   final double wallBotRatio;
 
-  // Centroides (0.0–1.0, normalizados)
-  final double obsCentroidX;   // posición X del centroide de obstáculo
-  final double wallCentroidX;  // posición X del centroide de pared
+  final double obsCentroidX;
+  final double wallCentroidX;
 
-  // Píxeles de alta confianza (logit > 0.55)
   final double obsHighConfRatio;
   final double wallHighConfRatio;
 
@@ -133,7 +128,7 @@ class SegmentationResult {
       '${inferenceMs}ms)';
 }
 
-// ─── Payload para el isolate ──────────────────────────────────────────────────
+// ─── Payload para el isolate (CameraImage — se conserva para compatibilidad) ──
 
 class _InferencePayload {
   final Uint8List modelBytes;
@@ -163,15 +158,24 @@ class _InferencePayload {
   });
 }
 
-// ─── Función top-level para compute() ────────────────────────────────────────
+// ─── ✅ v2.1 — Payload para frames JPEG desde Unity ──────────────────────────
+
+class _JpegPayload {
+  final Uint8List modelBytes;
+  final Uint8List jpegBytes;
+
+  const _JpegPayload({
+    required this.modelBytes,
+    required this.jpegBytes,
+  });
+}
+
+// ─── Función top-level para compute() — CameraImage (sin cambios) ────────────
 
 SegmentationResult _runInference(_InferencePayload p) {
   const modelSize  = 312;
   const numClasses = 4;
-  // Umbral de logit para considerar un píxel "de alta confianza"
-  // Técnica 5: filtrado de ruido
   const double logitConfThreshold = 0.55;
-  // Divisores de zona vertical: top < 104, middle 104-208, bottom >= 208
   const int zoneH = modelSize ~/ 3; // 104
 
   final sw = Stopwatch()..start();
@@ -201,12 +205,7 @@ SegmentationResult _runInference(_InferencePayload p) {
     }
   }
 
-  // 2. Resize directo a 312×312 (sin crop cuadrado).
-  //
-  //  La cámara entrega 720×480 landscape. La vista en pantalla muestra
-  //  480×720 portrait via FittedBox.cover sin crop adicional.
-  //  El resize directo alinea la máscara con lo que ve el usuario.
-  //  La leve distorsión 4:3→1:1 es aceptable para segmentación semántica.
+  // 2. Resize a 312×312
   final resized = img.copyResize(source,
     width: modelSize, height: modelSize,
     interpolation: img.Interpolation.linear,
@@ -226,7 +225,7 @@ SegmentationResult _runInference(_InferencePayload p) {
       List.generate(modelSize, (_) =>
         List.filled(numClasses, 0.0))));
 
-  // 5. Inferencia desde bytes
+  // 5. Inferencia
   final interpreter = Interpreter.fromBuffer(p.modelBytes,
     options: InterpreterOptions()..threads = 2,
   );
@@ -235,37 +234,30 @@ SegmentationResult _runInference(_InferencePayload p) {
 
   sw.stop();
 
-  // 6. Análisis del mapa de segmentación con las 5 técnicas
+  // 6. Análisis del mapa de segmentación (5 técnicas — sin cambios)
   int bg = 0, fl = 0, ob = 0, wa = 0;
   final total = modelSize * modelSize;
-  final zoneTotal = modelSize * zoneH; // píxeles por zona
+  final zoneTotal = modelSize * zoneH;
 
-  // Contadores por zona vertical (técnica 1)
   int obTop = 0, obMid = 0, obBot = 0;
   int waTop = 0, waMid = 0, waBot = 0;
 
-  // Acumuladores para centroide X (técnica 2)
   double obSumX = 0, obCount = 0;
   double waSumX = 0, waCount = 0;
 
-  // Contadores de alta confianza (técnica 5)
   int obHighConf = 0, waHighConf = 0;
 
-  // Máscara para overlay visual
   final maskBytes = Uint8List(total);
 
   for (int y = 0; y < modelSize; y++) {
     for (int x = 0; x < modelSize; x++) {
       final logits = outputBuf[0][y][x];
 
-      // Argmax
       int mc = 0; double mv = logits[0];
       for (int c = 1; c < numClasses; c++) {
         if (logits[c] > mv) { mv = logits[c]; mc = c; }
       }
 
-      // Softmax aproximado del logit ganador para medir confianza
-      // Usamos el valor raw normalizado con sigmoid como proxy rápido
       final conf = 1.0 / (1.0 + _exp(-mv));
       final highConf = conf >= logitConfThreshold;
 
@@ -274,7 +266,7 @@ SegmentationResult _runInference(_InferencePayload p) {
       switch (mc) {
         case 0: bg++; break;
         case 1: fl++; break;
-        case 2: // obstacle
+        case 2:
           ob++;
           if (y < zoneH)           obTop++;
           else if (y < 2 * zoneH)  obMid++;
@@ -282,7 +274,7 @@ SegmentationResult _runInference(_InferencePayload p) {
           obSumX += x; obCount++;
           if (highConf) obHighConf++;
           break;
-        case 3: // wall
+        case 3:
           wa++;
           if (y < zoneH)           waTop++;
           else if (y < 2 * zoneH)  waMid++;
@@ -301,30 +293,80 @@ SegmentationResult _runInference(_InferencePayload p) {
     obstacleRatio:   ob / total,
     inferenceMs:     sw.elapsedMilliseconds,
     maskData:        maskBytes,
-    // Zona vertical (proporción relativa a la zona, no al frame total)
     obsTopRatio:  obTop / zoneTotal,
     obsMidRatio:  obMid / zoneTotal,
     obsBotRatio:  obBot / zoneTotal,
     wallTopRatio: waTop / zoneTotal,
     wallMidRatio: waMid / zoneTotal,
     wallBotRatio: waBot / zoneTotal,
-    // Centroide X normalizado 0..1
     obsCentroidX:  obCount  > 0 ? obSumX  / (obCount  * modelSize) : 0.5,
     wallCentroidX: waCount  > 0 ? waSumX  / (waCount  * modelSize) : 0.5,
-    // Alta confianza (técnica 5)
     obsHighConfRatio:  ob > 0 ? obHighConf / total : 0,
     wallHighConfRatio: wa > 0 ? waHighConf / total : 0,
   );
 }
 
+// ─── ✅ v2.1 — Función top-level para compute() con JPEG ─────────────────────
+//
+// Decodifica el JPEG con img.decodeJpg() en el isolate (no bloquea main thread),
+// convierte a BGRA y reutiliza _runInference() sin duplicar lógica de inferencia.
+//
+// El frame llega como 224×224 JPEG (dimensión configurada en CameraFrameSender).
+// _runInference() hace su propio resize a 312×312, así que cualquier tamaño de
+// entrada es válido — 224 es solo la resolución de transmisión por el bridge.
+
+SegmentationResult _decodeAndInfer(_JpegPayload p) {
+  // Decodificar JPEG → imagen RGB
+  final decoded = img.decodeJpg(p.jpegBytes);
+  if (decoded == null) {
+    // Frame corrupto o vacío — devolver resultado neutral sin crash
+    return const SegmentationResult(
+      backgroundRatio: 1.0,
+      floorRatio:      0.0,
+      wallRatio:       0.0,
+      obstacleRatio:   0.0,
+      inferenceMs:     0,
+    );
+  }
+
+  // Convertir imagen decodificada a buffer BGRA para _runInference(isBgra=true)
+  // img.Image puede entregar RGBA directamente, pero _InferencePayload.isBgra=true
+  // usa img.Image.fromBytes con ChannelOrder.bgra, así que construimos el buffer
+  // en ese orden.
+  final bgraBytes = Uint8List(decoded.width * decoded.height * 4);
+  int i = 0;
+  for (int y = 0; y < decoded.height; y++) {
+    for (int x = 0; x < decoded.width; x++) {
+      final px = decoded.getPixel(x, y);
+      bgraBytes[i++] = px.b.toInt();
+      bgraBytes[i++] = px.g.toInt();
+      bgraBytes[i++] = px.r.toInt();
+      bgraBytes[i++] = 255; // alpha siempre opaco
+    }
+  }
+
+  return _runInference(_InferencePayload(
+    modelBytes:     p.modelBytes,
+    yBytes:         Uint8List(0),
+    uBytes:         Uint8List(0),
+    vBytes:         Uint8List(0),
+    width:          decoded.width,
+    height:         decoded.height,
+    yBytesPerRow:   0,
+    uBytesPerRow:   0,
+    uBytesPerPixel: 0,
+    isBgra:         true,
+    bgraBytes:      bgraBytes,
+  ));
+}
+
 /// Sigmoid rápido sin importar dart:math (aceptable en isolate)
 double _exp(double x) {
-  // Aproximación de e^x para rangos [-10, 10]
   if (x > 10)  return 22026.5;
   if (x < -10) return 0.0000454;
   double r = 1 + x / 256;
   r *= r; r *= r; r *= r; r *= r;
-  r *= r; r *= r; r *= r; r *= r; // r^256
+  r *= r; r *= r; r *= r; r *= r;
   return r;
 }
 
@@ -346,16 +388,12 @@ class ObstacleDetectionService {
   bool _isProcessing  = false;
 
   // ── Umbrales base ─────────────────────────────────────────────────────────
-  //
-  // Estos umbrales se aplican a la zona más relevante (bottom > mid > top),
-  // no al frame completo. Eso los hace más sensibles sin aumentar falsos +.
-  static const double _wallWarning = 0.55; // 55% de la zona inferior
+  static const double _wallWarning = 0.55;
   static const double _wallDanger  = 0.75;
   static const double _obsWarning  = 0.20;
   static const double _obsDanger   = 0.45;
 
-  // Umbral de alta confianza para decidir zona dominante (técnica 5)
-  static const double _highConfMin = 0.08; // 8% del frame en alta confianza
+  static const double _highConfMin = 0.08;
 
   // ── Estabilidad ───────────────────────────────────────────────────────────
   static const int _framesForWarning = 5;
@@ -373,7 +411,6 @@ class ObstacleDetectionService {
   SegAlertLevel _lastEmittedLevel = SegAlertLevel.none;
 
   // ── Historial para crecimiento temporal (técnica 3) ───────────────────────
-  // Guardamos las últimas 4 proporciones de obstáculo+pared
   final List<double> _recentProportions = [];
   static const int _historySize = 4;
 
@@ -434,7 +471,41 @@ class ObstacleDetectionService {
     _recentProportions.clear();
   }
 
-  // ─── Procesamiento de frames ──────────────────────────────────────────────
+  // ─── ✅ v2.1 — Procesamiento de frames JPEG desde Unity ───────────────────
+  //
+  // Equivalente a processCameraImage() pero para bytes JPEG.
+  // Llamado por ArNavigationScreen cuando UnityBridgeService.onFrameReceived
+  // entrega un frame del bridge.
+  //
+  // El throttle de frames lo gestiona CameraFrameSender en Unity (~10 fps),
+  // por lo que _isProcessing evita acumular backpressure si el isolate tarda.
+
+  void processJpegFrame(Uint8List jpegBytes) {
+    if (!_isRunning || !_isInitialized || _isProcessing) return;
+    if (_modelBytes == null) return;
+    if (jpegBytes.isEmpty) return;
+
+    _isProcessing = true;
+
+    compute(_decodeAndInfer, _JpegPayload(
+      modelBytes: _modelBytes!,
+      jpegBytes:  jpegBytes,
+    )).then((result) {
+      if (result.maskData != null) _lastMaskData = result.maskData;
+      _resultController.add(result);
+      _logger.d('[ObstacleDetection] $result');
+      _evaluateAlerts(result);
+    }).catchError((e) {
+      _logger.e('[ObstacleDetection] Error en isolate JPEG: $e');
+    }).whenComplete(() {
+      _isProcessing = false;
+    });
+  }
+
+  // ─── Procesamiento de frames CameraImage (se conserva) ───────────────────
+  //
+  // Útil para testing en simulador o entornos sin ARCore activo.
+  // En producción con Unity AR, usar processJpegFrame().
 
   void processCameraImage(CameraImage image) {
     if (!_isRunning || !_isInitialized || _isProcessing) return;
@@ -494,10 +565,9 @@ class ObstacleDetectionService {
     }
   }
 
-  // ─── Evaluación de alertas ────────────────────────────────────────────────
+  // ─── Evaluación de alertas (sin cambios respecto a v2.0) ─────────────────
 
   void _evaluateAlerts(SegmentationResult result) {
-    // ── Técnica 3: historial de proporciones para detectar aproximación ──
     final currentProp = result.obstacleRatio + result.wallRatio;
     _recentProportions.add(currentProp);
     if (_recentProportions.length > _historySize) {
@@ -505,7 +575,6 @@ class ObstacleDetectionService {
     }
     final isApproaching = _detectApproach(currentProp);
 
-    // ── Técnica 1 + 4 + 5: nivel con lógica enriquecida ──
     final currentLevel = _computeLevel(result, isApproaching);
     _framesSinceAlert++;
 
@@ -531,7 +600,6 @@ class ObstacleDetectionService {
     final framesOk  = _framesSinceAlert >= _framesCooldown;
     final sameLevel = currentLevel == _lastEmittedLevel;
 
-    // Si se está acercando activamente, reduce el cooldown a la mitad
     final effectiveTimeOk = isApproaching
         ? (_lastAlertTime == null ||
            DateTime.now().difference(_lastAlertTime!) >= (_timeCooldown ~/ 2))
@@ -543,7 +611,6 @@ class ObstacleDetectionService {
     _emitAlert(currentLevel, result, isApproaching);
   }
 
-  /// Técnica 3: retorna true si la proporción está creciendo consistentemente
   bool _detectApproach(double currentProp) {
     if (_recentProportions.length < 3) return false;
     int growingFrames = 0;
@@ -552,37 +619,25 @@ class ObstacleDetectionService {
         growingFrames++;
       }
     }
-    // Aproximación confirmada si al menos 2 de los últimos 3 frames crecieron
     return growingFrames >= 2;
   }
 
-  /// Técnica 1 + 4 + 5: determina el nivel usando zona vertical, floor
-  /// ratio inverso y confianza del logit
   SegAlertLevel _computeLevel(SegmentationResult r, bool isApproaching) {
-    // ── Obstáculo ──
-    // Usar la zona con mayor concentración de obstáculo (técnica 1)
     final obsEffective = _zoneEffective(
       r.obsBotRatio, r.obsMidRatio, r.obsTopRatio);
-
-    // Ajustar por alta confianza (técnica 5): si pocos píxeles de alta
-    // confianza, bajar la proporción efectiva un 30%
     final obsConf = r.obsHighConfRatio >= _highConfMin ? 1.0 : 0.7;
     final obsAdj  = obsEffective * obsConf;
 
-    // ── Pared ──
     final waEffective = _zoneEffective(
       r.wallBotRatio, r.wallMidRatio, r.wallTopRatio);
     final waConf = r.wallHighConfRatio >= _highConfMin ? 1.0 : 0.7;
     final waAdj  = waEffective * waConf;
 
-    // ── Técnica 4: floor ratio inverso ──
-    // Si el piso visible < 8%, el espacio libre se está agotando
     final floorPenalty = r.floorRatio < 0.08 ? 1.15 : 1.0;
 
     final obsFinal = obsAdj * floorPenalty;
     final waFinal  = waAdj  * floorPenalty;
 
-    // ── Si se aproxima activamente, bajar umbrales un nivel (técnica 3) ──
     final double obsWarnThr  = isApproaching ? _obsWarning * 0.75 : _obsWarning;
     final double obsDangerThr= isApproaching ? _obsDanger  * 0.75 : _obsDanger;
     final double waWarnThr   = isApproaching ? _wallWarning* 0.80 : _wallWarning;
@@ -597,21 +652,16 @@ class ObstacleDetectionService {
     return SegAlertLevel.none;
   }
 
-  /// Devuelve la proporción efectiva ponderando las zonas verticales.
-  /// Bottom tiene peso 3×, middle 2×, top 1×.
-  /// Esto simula profundidad: lo que está abajo en el frame está más cerca.
   double _zoneEffective(double bot, double mid, double top) {
     return (bot * 3.0 + mid * 2.0 + top * 1.0) / 6.0;
   }
 
-  /// Técnica 2: determina la zona vertical dominante
   SegZone _dominantZone(double bot, double mid, double top) {
     if (bot >= mid && bot >= top) return SegZone.bottom;
     if (mid >= top)               return SegZone.middle;
     return SegZone.top;
   }
 
-  /// Técnica 2: determina la dirección lateral del centroide
   SegDirection _centroidDirection(double cx) {
     if (cx < 0.38) return SegDirection.left;
     if (cx > 0.62) return SegDirection.right;
@@ -643,10 +693,7 @@ class ObstacleDetectionService {
     }
 
     final direction = _centroidDirection(centroidX);
-
-    // ── Construir mensaje TTS enriquecido (técnica 2) ──
-    final message = _buildMessage(
-        type, level, zone, direction, isApproaching);
+    final message = _buildMessage(type, level, zone, direction, isApproaching);
 
     _lastAlertTime     = DateTime.now();
     _framesSinceAlert  = 0;
@@ -666,12 +713,9 @@ class ObstacleDetectionService {
     _ttsService.speak(message, interrupt: level == SegAlertLevel.danger);
   }
 
-  /// Genera el mensaje TTS según tipo, nivel, zona y dirección.
-  /// Máximo ~4 palabras para ser claro y rápido de escuchar.
   String _buildMessage(SegObstacleType type, SegAlertLevel level,
       SegZone zone, SegDirection direction, bool isApproaching) {
 
-    // Si se está acercando activamente y es peligro → mensaje urgente corto
     if (isApproaching && level == SegAlertLevel.danger) {
       return type == SegObstacleType.wall ? '¡Cuidado, pared!' : '¡Para, obstáculo!';
     }
@@ -691,7 +735,6 @@ class ObstacleDetectionService {
         SegAlertLevel.none    => '',
       };
     } else {
-      // Pared
       return switch (level) {
         SegAlertLevel.danger  => zone == SegZone.bottom
             ? '¡Pared muy cerca!'

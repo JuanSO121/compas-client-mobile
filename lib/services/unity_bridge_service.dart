@@ -1,8 +1,35 @@
 // lib/services/unity_bridge_service.dart
-// ✅ v3.5 — cachedWaypoints + logs limpios + TTS sync (Claude patch aplicado)
+// ✅ v3.6 — Soporte frame_data (Unity → Flutter para segmentación sin CameraController)
+//
+// ============================================================================
+// CAMBIOS v3.5 → v3.6
+// ============================================================================
+//
+//  PROBLEMA RESUELTO:
+//    ARCore/ARKit toma control exclusivo de la cámara trasera a nivel hardware.
+//    Flutter no puede abrir un CameraController independiente mientras Unity
+//    está activo. _initSegmentation() en ArNavigationScreen fallaba o
+//    entregaba un stream vacío.
+//
+//  SOLUCIÓN:
+//    Unity captura los frames (ya los tiene vía ARCameraManager),
+//    los comprime a JPEG y los envía por el bridge con action="frame_data".
+//    UnityBridgeService los intercepta ANTES de pasarlos al stream de comandos
+//    y los entrega a ObstacleDetectionService vía onFrameReceived.
+//
+//  CAMBIOS CONCRETOS:
+//    1. Nuevo callback: onFrameReceived — entrega Uint8List JPEG al consumidor.
+//    2. handleUnityMessage() intercepta action="frame_data" como primera
+//       condición, decodifica Base64 y llama onFrameReceived. No contamina
+//       el canal de comandos existente.
+//    3. dispose() limpia onFrameReceived.
+//    4. Import dart:convert ya existía; se añade dart:typed_data explícito.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v3.5.
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_unity_widget/flutter_unity_widget.dart';
 
@@ -156,6 +183,11 @@ class UnityBridgeService {
   Function(UnityResponse)?                              onTTSRequest;
   Function(VoiceStatusInfo)?                            onVoiceStatusReceived;
 
+  // ✅ v3.6 — Callback para frames de cámara enviados desde Unity.
+  // Recibe bytes JPEG ya decodificados de Base64.
+  // ObstacleDetectionService los consume con processJpegFrame().
+  Function(Uint8List jpegBytes)?                        onFrameReceived;
+
   // ─── Setup ──────────────────────────────────────────────────────────────
 
   void setController(UnityWidgetController controller) {
@@ -164,10 +196,39 @@ class UnityBridgeService {
     _log('Controller registrado — isReady=true');
   }
 
+  // ─── Procesamiento de mensajes entrantes ─────────────────────────────────
+
   void handleUnityMessage(dynamic message) {
     final raw = message?.toString() ?? '';
     if (raw.isEmpty) return;
 
+    // ✅ v3.6 — Intercepción rápida de frame_data ANTES del log y del
+    // jsonDecode completo. Los frames llegan a ~10 fps; logearlos satura
+    // la consola y añade latencia innecesaria.
+    //
+    // El JSON tiene la forma:
+    //   { "action": "frame_data", "data": "<base64 JPEG>", "w": 224, "h": 224 }
+    //
+    // Usamos contains() como pre-filtro barato antes de decodificar JSON
+    // para evitar el coste de jsonDecode en el hot path de frames.
+    if (raw.contains('"frame_data"')) {
+      try {
+        final map = jsonDecode(raw) as Map<String, dynamic>;
+        if (map['action'] == 'frame_data') {
+          final b64 = map['data'] as String?;
+          if (b64 != null && b64.isNotEmpty) {
+            final jpegBytes = base64Decode(b64);
+            onFrameReceived?.call(jpegBytes);
+          }
+          return; // No propagar al stream de comandos ni a ningún otro handler
+        }
+      } catch (e) {
+        _log('Error decodificando frame_data: $e');
+        return;
+      }
+    }
+
+    // A partir de aquí: flujo normal de comandos (sin cambios respecto a v3.5)
     _log('← $raw');
 
     try {
@@ -389,5 +450,6 @@ class UnityBridgeService {
     _controller           = null;
     onTTSRequest          = null;
     onVoiceStatusReceived = null;
+    onFrameReceived       = null; // ✅ v3.6
   }
 }
