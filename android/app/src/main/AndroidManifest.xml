@@ -3,25 +3,20 @@
     package="com.example.flutter_voice_robot">
 
     <!-- ═══════════════════════════════════════════════════════ -->
-    <!-- ✅ PERMISOS ESENCIALES (MODERNOS) -->
+    <!-- PERMISOS -->
     <!-- ═══════════════════════════════════════════════════════ -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
-
-    <!-- ✅ MEJORA: Permiso para audio Bluetooth en Android 12+ -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-
-    <!-- ================================================================ -->
-    <!-- ✅ SOLUCIÓN: CÁMARA OPCIONAL (FORMA CORRECTA)                      -->
-    <!-- ================================================================ -->
-    <!-- 1. Declara que vas a usar el permiso de la cámara. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
-    <!-- 2. Declara que la característica (la cámara física) NO es requerida. -->
-    <!-- Esto permite que tu app se instale en dispositivos sin cámara. -->
+    <!-- ═══════════════════════════════════════════════════════ -->
+    <!-- FEATURES -->
+    <!-- ═══════════════════════════════════════════════════════ -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
 
@@ -31,7 +26,7 @@
         android:icon="@mipmap/ic_launcher"
         android:networkSecurityConfig="@xml/network_security_config">
 
-        <!-- ✅ METADATA PARA GOOGLE AI EDGE (NPU) -->
+        <!-- Google AI Edge -->
         <meta-data
             android:name="com.google.android.gms.ai.edge.enabled"
             android:value="true" />
@@ -39,19 +34,31 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop"
+            android:launchMode="singleTask"
             android:theme="@style/LaunchTheme"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
-            android:windowSoftInputMode="adjustResize">
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="
+                orientation|
+                keyboardHidden|
+                keyboard|
+                screenSize|
+                smallestScreenSize|
+                locale|
+                layoutDirection|
+                fontScale|
+                screenLayout|
+                density|
+                uiMode">
 
             <meta-data
                 android:name="io.flutter.embedding.android.NormalTheme"
                 android:resource="@style/NormalTheme" />
 
             <intent-filter>
-                <action android:name="android.intent.action.MAIN"/>
-                <category android:name="android.intent.category.LAUNCHER"/>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
@@ -59,8 +66,22 @@
             android:name="com.unity3d.player.UnityPlayerGameActivity"
             android:exported="false"
             android:screenOrientation="fullSensor"
-            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|fontScale|layoutDirection|density" />
-
+            android:configChanges="
+                mcc|
+                mnc|
+                locale|
+                touchscreen|
+                keyboard|
+                keyboardHidden|
+                navigation|
+                orientation|
+                screenLayout|
+                uiMode|
+                screenSize|
+                smallestScreenSize|
+                fontScale|
+                layoutDirection|
+                density" />
 
         <meta-data
             android:name="flutterEmbedding"
@@ -75,13 +96,14 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
     </application>
 
-    <!-- ✅ QUERIES (YA ESTABA BIEN) -->
     <queries>
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
         <package android:name="com.google.android.gms" />
     </queries>
+
 </manifest>

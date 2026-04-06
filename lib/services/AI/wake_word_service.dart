@@ -1,45 +1,44 @@
 // lib/services/AI/wake_word_service.dart
-// ✅ v4.0 — Sesión larga sin loop de ciclos
+// ✅ v4.1 — Fix error_client permanent · Restart delay 300ms → 800ms
 //
 // ============================================================================
-//  CAMBIOS v3.1 → v4.0
+//  CAMBIOS v4.0 → v4.1
 // ============================================================================
 //
-//  PROBLEMA EN v3.1:
-//    El loop de ciclos (5s escucha + 600ms pausa + repetir) causaba:
-//      - Sonido de mic encendiéndose/apagándose cada 5 segundos
-//      - Actividad constante de Android AudioFocus aunque estuviera pausado
-//      - Complejidad innecesaria con Completer para suspender el loop
+//  PROBLEMA EN v4.0:
+//    _onSttError() trataba error_client con permanent:true como un error
+//    fatal, llamando onError() y deteniendo toda la detección definitivamente.
 //
-//  NUEVO APPROACH — Sesión única larga:
-//    En lugar de ciclos cortos, abre UNA sola sesión STT larga (listenFor: 1h).
-//    Android mantiene el micrófono abierto en silencio sin callbacks de ruido.
-//    Cuando el STT termina solo (timeout interno, error, fin de audio), se
-//    reinicia automáticamente con un delay mínimo (300ms anti-rebote).
-//    Resultado: cero sonido de mic, cero loop, comportamiento como "siempre on".
+//    Causa raíz: cuando _onSttStatus recibe 'notListening' y llama
+//    _scheduleRestart() con solo 300ms de delay, Android aún no liberó
+//    el SpeechRecognizer interno. La siguiente llamada a listen() recibe
+//    error_client porque el recognizer anterior sigue vivo.
+//    Android marca este error como permanent:true, pero NO lo es en la práctica.
 //
-//  PAUSE/RESUME:
-//    pause() → cierra la sesión STT activa (silencia el mic)
-//    resume() → abre una nueva sesión larga
-//    No hay loop que suspender — simplemente hay sesión o no hay sesión.
+//    Flujo problemático:
+//      _openSession() → listen() OK
+//      → status: notListening  (cierre sucio, recognizer aún vivo en Android)
+//      → _scheduleRestart(300ms) → _openSession() demasiado rápido
+//      → error_client permanent:true → onError() → detención total
 //
-//  DETECCIÓN:
-//    Igual que antes: palabras clave en español en el texto parcial/final.
-//    Al detectar: cierra la sesión, dispara onWakeWordDetected, NO reinicia
-//    hasta que resume() sea llamado explícitamente (el coordinator lo maneja).
+//  SOLUCIÓN v4.1:
+//    1. error_client interceptado ANTES del bloque permanent general.
+//       Se reintenta con 1500ms de delay — suficiente para que Android
+//       libere el recognizer. No se llama onError() porque no es un
+//       error real del sistema, sino una condición de carrera.
 //
-//  REINICIO AUTOMÁTICO:
-//    Si el STT termina solo sin detección (timeout, error recoverable):
-//      - Si no está pausado → reinicia tras 300ms
-//      - Si está pausado → no reinicia (espera resume())
+//    2. _restartDelay: 300ms → 800ms.
+//       Reduce la frecuencia de la condición de carrera en el caso base.
+//       En hardware lento subir a 1200ms si persiste.
 //
-//  SIN DEPENDENCIAS NUEVAS — usa speech_to_text ^7.0.0 ya en pubspec.yaml.
+//  TODO LO DEMÁS ES IDÉNTICO A v4.0.
 
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
+
 // ─── WakeWordConfig ───────────────────────────────────────────────────────────
 
 class WakeWordConfig {
@@ -110,11 +109,16 @@ class WakeWordService {
   ];
 
   // Sesión larga: Android mantiene el mic abierto sin callbacks de ruido.
-  // No se usa listenFor corto + loop — una sola sesión hasta que termine sola.
   static const Duration _sessionDuration = Duration(hours: 1);
 
-  // Delay mínimo entre reinicios automáticos (anti-rebote).
-  static const Duration _restartDelay = Duration(milliseconds: 300);
+  // ✅ v4.1: aumentado de 300ms a 800ms para dar tiempo a Android a liberar
+  // el SpeechRecognizer entre sesiones y evitar la condición de carrera
+  // que genera error_client.
+  static const Duration _restartDelay = Duration(milliseconds: 800);
+
+  // Delay específico para recuperación de error_client. Más largo que
+  // _restartDelay porque necesita esperar la liberación del recognizer.
+  static const Duration _errorClientDelay = Duration(milliseconds: 1500);
 
   // ─── initialize ──────────────────────────────────────────────────────────
 
@@ -126,7 +130,7 @@ class WakeWordService {
     if (_isInitialized) return;
 
     try {
-      _log('Inicializando v4.0 (sesión larga)...');
+      _log('Inicializando v4.1 (sesión larga, fix error_client)...');
 
       _currentKeyword     = config.keyword;
       _currentSensitivity = sensitivity;
@@ -140,7 +144,7 @@ class WakeWordService {
       if (!available) throw Exception('STT no disponible en este dispositivo');
 
       _isInitialized = true;
-      _log('v4.0 listo — keywords: ${_keywords.join(", ")}');
+      _log('v4.1 listo — keywords: ${_keywords.join(", ")}');
     } catch (e) {
       _logError('Error inicializando: $e');
       onError?.call(e.toString());
@@ -203,20 +207,19 @@ class WakeWordService {
       _isListening = true;
 
       await _stt.listen(
-        onResult: _onResult,
-        listenFor:      _sessionDuration,   // sesión larga — no hace loop
-        pauseFor:       const Duration(seconds: 8), // silencio max antes de fin
+        onResult:       _onResult,
+        listenFor:      _sessionDuration,
+        pauseFor:       const Duration(seconds: 8),
         partialResults: true,
         localeId:       'es_CO',
         cancelOnError:  false,
-        listenMode:     ListenMode.dictation, // modo continuo
+        listenMode:     ListenMode.dictation,
       );
 
       _log('Sesión abierta (listenFor=1h, pauseFor=8s)');
     } catch (e) {
       _isListening = false;
       _logError('Error abriendo sesión: $e');
-      // Reintentar tras delay si sigue activo
       _scheduleRestart();
     }
   }
@@ -289,6 +292,25 @@ class WakeWordService {
       return;
     }
 
+    // ✅ v4.1 FIX: error_client NO es un error fatal aunque Android lo marque
+    // como permanent:true. Ocurre cuando _scheduleRestart() abre una nueva
+    // sesión antes de que Android libere el SpeechRecognizer anterior.
+    // Solución: esperar _errorClientDelay (1500ms) antes de reintentar.
+    // No se llama onError() porque es una condición de carrera recuperable.
+    if (error.errorMsg == 'error_client') {
+      _log('error_client — esperando liberación del recognizer '
+          '(${_errorClientDelay.inMilliseconds}ms)...');
+      _isListening = false;
+      if (_isStarted && !_isPaused && !_detected) {
+        Future.delayed(_errorClientDelay, () {
+          if (_isStarted && !_isPaused && !_detected && !_isListening) {
+            _openSession();
+          }
+        });
+      }
+      return;
+    }
+
     // Otros errores
     _logError('STT error: ${error.errorMsg} (permanent: ${error.permanent})');
     _isListening = false;
@@ -334,7 +356,9 @@ class WakeWordService {
     'sensitivity':     _currentSensitivity,
     'detection_count': _detectionCount,
     'last_detection':  _lastDetection?.toIso8601String(),
-    'engine':          'speech_to_text_v4.0_long_session',
+    'engine':          'speech_to_text_v4.1_long_session',
+    'restart_delay_ms':       _restartDelay.inMilliseconds,
+    'error_client_delay_ms':  _errorClientDelay.inMilliseconds,
   };
 
   void resetStatistics() {
