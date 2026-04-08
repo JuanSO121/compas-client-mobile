@@ -1,34 +1,46 @@
 // lib/services/AI/conversation_service.dart
-// ✅ v5 — Nuevas acciones COMPAS: repeat, status, stop_voice
+// ✅ v6 — Fix navegación: falso match LIST, sugerencias pendientes, prompt reforzado
 //
 // ============================================================================
-//  CAMBIOS v4 → v5
+//  CAMBIOS v5 → v6
 // ============================================================================
 //
-//  NUEVAS ACCIONES en _UnityAction:
-//    repeat    → __unity:repeat_instruction   (label COMPAS: REPEAT)
-//    status    → __unity:voice_status         (label COMPAS: STATUS)
-//    stopVoice → __unity:stop_voice           (label COMPAS: STOP silenciar)
+//  BUG CORREGIDO — Falso match _UnityAction.list sobre respuestas informativas:
 //
-//  _extractAction() amplía sus patrones:
-//    - Frases de "repetir" detectan _UnityAction.repeat
-//    - Frases de "estado / cuánto falta" detectan _UnityAction.status
-//    - Frases de "silencio / para de hablar" detectan _UnityAction.stopVoice
-//      (distinto de stop_navigation que cancela la ruta entera)
+//    PROBLEMA (v5):
+//      _extractAction() tenía 'destinos disponibles' en listBot.
+//      Cuando GROQ respondía "Los destinos disponibles son: ..."
+//      (sin confirmar navegación), se disparaba _UnityAction.list
+//      en lugar de _UnityAction.none → Unity recibía list_waypoints
+//      en vez de ejecutar la navegación solicitada.
 //
-//  _buildIntent() añade los tres casos nuevos.
+//    FIX 1 — listBot depurado:
+//      Se eliminó 'destinos disponibles' de listBot. Ahora solo coincide
+//      con la frase de acción exacta del system prompt:
+//      "consultando los destinos disponibles."
 //
-//  _chatOffline() añade fallbacks para repeat y status.
+//  NUEVO — Manejo de sugerencias pendientes (_pendingSuggestion):
 //
-//  _offlineFallback() actualiza el mensaje de capacidades.
+//    PROBLEMA (v5):
+//      Cuando GROQ no encontraba el destino exacto y respondía con una
+//      sugerencia ("¿Quieres ir a Habitación 2° Piso?"), el sistema
+//      descartaba la sugerencia. Si el usuario decía "sí", no había
+//      contexto para saber a dónde navegar.
 //
-//  STOP ya distingue entre "detener navegación" (stop_navigation) y
-//  "silenciar la voz" (stop_voice). La heurística:
-//    - Frases con "silencia", "cállate", "para de hablar", "mudo"
-//      → stopVoice (no cancela la ruta)
-//    - Resto → stop (cancela la ruta, comportamiento v4)
+//    FIX 2 — _extractSuggestion() + _pendingSuggestion:
+//      Si GROQ sugiere un destino sin confirmarlo, se guarda en
+//      _pendingSuggestion. Si el usuario responde afirmativamente
+//      ("sí", "dale", "ok", etc.) en el turno siguiente, se dispara
+//      _UnityAction.navigate con ese destino automáticamente.
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v4.
+//  NUEVO — System prompt reforzado con regla "un solo candidato":
+//
+//    FIX 3 — GROQ debe confirmar directamente si hay un único candidato:
+//      Si el usuario pide un lugar y hay exactamente un destino similar,
+//      GROQ ya no debe preguntar — debe responder "Navegando a [Nombre]."
+//      directamente para que _extractAction() detecte la acción.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v5.
 
 import 'dart:async';
 import 'package:logger/logger.dart';
@@ -65,9 +77,9 @@ class ChatbotResponse {
 enum _UnityAction {
   navigate,
   stop,
-  stopVoice, // ✅ v5: silenciar guía de voz sin cancelar ruta
-  repeat,    // ✅ v5: repetir última instrucción
-  status,    // ✅ v5: consultar estado de navegación
+  stopVoice,
+  repeat,
+  status,
   list,
   create,
   remove,
@@ -91,6 +103,9 @@ class ConversationService {
   final List<ChatMessage> _conversationHistory = [];
   static const int _maxHistory = 20;
   bool _isInitialized = false;
+
+  // ✅ v6 FIX 2 — Destino sugerido pendiente de confirmación del usuario
+  String? _pendingSuggestion;
 
   // ─── Inicialización ──────────────────────────────────────────────────────
 
@@ -158,6 +173,15 @@ class ConversationService {
             intent:     intent,
             confidence: 0.95,
           );
+        }
+      }
+
+      // ✅ v6 FIX 2 — Si GROQ no confirmó acción, buscar sugerencia implícita
+      if (action == _UnityAction.none) {
+        final suggestion = _extractSuggestion(response.content);
+        if (suggestion != null && suggestion.isNotEmpty) {
+          _pendingSuggestion = _resolveTarget(suggestion);
+          _logger.d('[Suggest] Destino sugerido guardado: "$_pendingSuggestion"');
         }
       }
 
@@ -244,6 +268,21 @@ Tu confirmación debe usar el nombre EXACTO de la lista, sin parafrasear.
   "Voy hacia el destino que mencionaste." ← sin nombre concreto
 
 ══════════════════════════════════════════════════════════════════
+REGLA CRÍTICA — UN SOLO CANDIDATO:
+
+Si el usuario pide un lugar y existe EXACTAMENTE UN destino similar
+o que corresponda aproximadamente a lo pedido, NO preguntes —
+confirma DIRECTAMENTE con la frase de navegación.
+
+❌ MAL (genera ambigüedad y rompe la detección de acciones):
+  "¿Quieres ir a la Habitación 2° Piso?"
+
+✅ BIEN (acción directa, detectable por el sistema):
+  "Navegando a Habitación 2° Piso."
+
+Solo pregunta si hay DOS O MÁS candidatos igualmente válidos.
+
+══════════════════════════════════════════════════════════════════
 
 FRASES DE CONFIRMACIÓN (usa estas exactas):
 
@@ -275,7 +314,8 @@ EJEMPLOS:
 RECUERDA:
 - Usa siempre los nombres exactos de la lista para confirmar
 - Si no hay lugares registrados, díselo al usuario
-- Respuestas cortas y directas siempre''';
+- Respuestas cortas y directas siempre
+- Si solo hay un lugar que coincide con lo pedido, ve directamente sin preguntar''';
   }
 
   // ─── Extracción de acción ────────────────────────────────────────────────
@@ -284,8 +324,29 @@ RECUERDA:
     final bot  = botResponse.toLowerCase();
     final user = userMessage.toLowerCase();
 
-    // ✅ v5 — STOP_VOICE (antes que STOP para evitar captura prematura) ────
-    // Detecta frases de silenciar la guía de voz SIN cancelar la ruta.
+    // ✅ v6 FIX 2 — Verificar confirmación de sugerencia pendiente PRIMERO
+    // Si el usuario confirma ("sí", "dale", etc.) y hay una sugerencia guardada,
+    // navegamos directamente sin necesidad de que GROQ repita el destino.
+    final confirmPhrases = [
+      'sí', 'si', 'claro', 'ok', 'dale', 'bueno', 'perfecto',
+      'adelante', 'vamos', 'de acuerdo', 'está bien', 'esta bien',
+      'correcto', 'exacto', 'eso', 'ese', 'esa',
+    ];
+    if (_pendingSuggestion != null && _pendingSuggestion!.isNotEmpty) {
+      if (_matchesAny(user, confirmPhrases)) {
+        final dest = _pendingSuggestion!;
+        _pendingSuggestion = null;
+        _logger.i('[Suggest] ✅ Confirmación recibida → navegando a "$dest"');
+        return (_UnityAction.navigate, dest);
+      }
+      // Si el usuario no confirmó, limpiar sugerencia (cambió de tema)
+      if (!_matchesAny(user, confirmPhrases)) {
+        _logger.d('[Suggest] Sugerencia descartada — usuario cambió de tema');
+        _pendingSuggestion = null;
+      }
+    }
+
+    // ── STOP_VOICE (antes que STOP para evitar captura prematura) ────────
     final stopVoiceBot = [
       'silenciando la guía de voz',
       'silencio la guía',
@@ -309,7 +370,7 @@ RECUERDA:
       return (_UnityAction.stop, '');
     }
 
-    // ✅ v5 — REPEAT ───────────────────────────────────────────────────────
+    // ── REPEAT ────────────────────────────────────────────────────────────
     final repeatBot  = ['repitiendo la última instrucción', 'repito la instrucción'];
     final repeatUser = [
       'repite', 'repítelo', 'repetir', 'otra vez', 'de nuevo',
@@ -320,7 +381,7 @@ RECUERDA:
       return (_UnityAction.repeat, '');
     }
 
-    // ✅ v5 — STATUS ───────────────────────────────────────────────────────
+    // ── STATUS ────────────────────────────────────────────────────────────
     final statusBot  = [
       'consultando el estado de la navegación',
       'consulto el estado',
@@ -336,8 +397,15 @@ RECUERDA:
     }
 
     // ── LIST ──────────────────────────────────────────────────────────────
-    final listBot  = ['consultando los destinos', 'consulto los destinos',
-      'destinos disponibles', 'listar'];
+    // ✅ v6 FIX 1 — Se eliminó 'destinos disponibles' de listBot.
+    // Esa cadena aparece en respuestas INFORMATIVAS de GROQ ("Los destinos
+    // disponibles son: ...") y causaba un falso positivo que disparaba
+    // list_waypoints en Unity en lugar de procesar la navegación.
+    // Solo se mantienen frases de ACCIÓN explícita del system prompt.
+    final listBot  = [
+      'consultando los destinos disponibles',   // frase exacta de confirmación
+      'consulto los destinos disponibles',
+    ];
     final listUser = ['qué lugares', 'cuáles lugares', 'qué destinos',
       'cuáles destinos', 'qué hay', 'qué puntos',
       'muéstrame los destinos', 'qué balizas', 'cuáles balizas'];
@@ -455,14 +523,68 @@ RECUERDA:
     return null;
   }
 
+  // ─── Extracción de sugerencia implícita ──────────────────────────────────
+
+  /// ✅ v6 FIX 2 — Detecta cuando GROQ sugiere un destino sin confirmarlo.
+  /// Busca patrones de pregunta con un destino concreto en la respuesta.
+  /// Retorna el nombre del destino sugerido o null si no hay sugerencia.
+  String? _extractSuggestion(String botResponse) {
+    final bot = botResponse.toLowerCase();
+    final suggestionPhrases = [
+      '¿quieres ir a ',
+      '¿te llevo a ',
+      '¿vamos a ',
+      '¿deseas ir a ',
+      '¿vamos hacia ',
+      '¿quieres que te lleve a ',
+      '¿te guío a ',
+      '¿te guío hacia ',
+      'quieres ir a ',
+      'te llevo a ',
+    ];
+
+    for (final phrase in suggestionPhrases) {
+      final idx = bot.indexOf(phrase);
+      if (idx >= 0) {
+        final afterOriginal = botResponse.substring(idx + phrase.length).trim();
+        final cleaned = _cleanDestination(afterOriginal);
+        if (cleaned.isNotEmpty && cleaned.length <= 60) {
+          _logger.d('[Suggest] Sugerencia detectada: "$cleaned"');
+          return cleaned;
+        }
+      }
+    }
+    return null;
+  }
+
   // ─── Modo offline ─────────────────────────────────────────────────────────
 
   Future<ChatbotResponse> _chatOffline(String userMessage) async {
     final user = userMessage.toLowerCase().trim();
 
-    // ✅ v5 — silenciar voz (antes de stop para no capturarlo)
+    // ✅ v6 FIX 2 — Verificar confirmación de sugerencia pendiente también offline
+    final confirmPhrases = [
+      'sí', 'si', 'claro', 'ok', 'dale', 'bueno', 'perfecto',
+      'adelante', 'vamos', 'de acuerdo', 'está bien', 'esta bien',
+      'correcto', 'exacto', 'eso', 'ese', 'esa',
+    ];
+    if (_pendingSuggestion != null && _pendingSuggestion!.isNotEmpty) {
+      if (_matchesAny(user, confirmPhrases)) {
+        final dest = _pendingSuggestion!;
+        _pendingSuggestion = null;
+        return ChatbotResponse(
+          type: ResponseType.offlineCommand,
+          message: 'Navegando a $dest.',
+          intent: _buildIntent(_UnityAction.navigate, dest),
+          confidence: 0.9,
+        );
+      }
+      _pendingSuggestion = null;
+    }
+
+    // silenciar voz (antes de stop)
     if (_matchesAny(user, ['silencia', 'cállate', 'callate', 'para de hablar',
-        'deja de hablar', 'sin voz', 'modo mudo'])) {
+      'deja de hablar', 'sin voz', 'modo mudo'])) {
       return ChatbotResponse(
         type: ResponseType.offlineCommand,
         message: 'Silenciando la guía de voz.',
@@ -472,7 +594,7 @@ RECUERDA:
     }
 
     if (_matchesAny(user, ['para', 'detente', 'alto', 'stop', 'cancela',
-        'detener navegación', 'cancelar ruta'])) {
+      'detener navegación', 'cancelar ruta'])) {
       return ChatbotResponse(
         type: ResponseType.offlineCommand,
         message: 'Deteniendo la navegación.',
@@ -481,9 +603,8 @@ RECUERDA:
       );
     }
 
-    // ✅ v5 — repetir
     if (_matchesAny(user, ['repite', 'repítelo', 'repetir', 'otra vez',
-        'de nuevo', 'qué dijiste', 'no escuché', 'no oí'])) {
+      'de nuevo', 'qué dijiste', 'no escuché', 'no oí'])) {
       return ChatbotResponse(
         type: ResponseType.offlineCommand,
         message: 'Repitiendo la última instrucción.',
@@ -492,10 +613,9 @@ RECUERDA:
       );
     }
 
-    // ✅ v5 — estado
     if (_matchesAny(user, ['cuánto falta', 'cuanto falta', 'qué tan lejos',
-        'a dónde voy', 'cuántos pasos', 'cómo voy', 'como voy',
-        'estado de la navegación', 'próxima instrucción'])) {
+      'a dónde voy', 'cuántos pasos', 'cómo voy', 'como voy',
+      'estado de la navegación', 'próxima instrucción'])) {
       return ChatbotResponse(
         type: ResponseType.offlineCommand,
         message: 'Consultando el estado de la navegación.',
@@ -599,7 +719,6 @@ RECUERDA:
           suggestedResponse: 'Navegación detenida',
         );
 
-      // ✅ v5 NUEVO — Silenciar guía de voz sin cancelar la ruta
       case _UnityAction.stopVoice:
         return NavigationIntent(
           type: IntentType.navigate,
@@ -608,7 +727,6 @@ RECUERDA:
           suggestedResponse: 'Guía de voz silenciada',
         );
 
-      // ✅ v5 NUEVO — Repetir la última instrucción hablada
       case _UnityAction.repeat:
         return NavigationIntent(
           type: IntentType.navigate,
@@ -617,7 +735,6 @@ RECUERDA:
           suggestedResponse: 'Repitiendo instrucción',
         );
 
-      // ✅ v5 NUEVO — Consultar estado de la navegación
       case _UnityAction.status:
         return NavigationIntent(
           type: IntentType.navigate,
@@ -728,6 +845,7 @@ RECUERDA:
 
   void clearHistory() {
     _conversationHistory.clear();
+    _pendingSuggestion = null;  // ✅ v6: limpiar sugerencia al resetear historial
     _logger.d('Historial limpiado');
   }
 
@@ -742,6 +860,7 @@ RECUERDA:
     'ai_mode':                   _aiModeController.currentMode.name,
     'destinations_in_context':   _waypointContext.count,
     'destinations_last_update':  _waypointContext.lastUpdate?.toIso8601String(),
+    'pending_suggestion':        _pendingSuggestion,  // ✅ v6: nuevo campo de diagnóstico
   };
 
   bool get isInitialized => _isInitialized;
@@ -749,6 +868,7 @@ RECUERDA:
 
   void dispose() {
     _conversationHistory.clear();
+    _pendingSuggestion = null;
     _groqService.dispose();
   }
 }

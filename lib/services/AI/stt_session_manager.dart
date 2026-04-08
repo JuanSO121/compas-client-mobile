@@ -1,146 +1,184 @@
 // lib/services/AI/stt_session_manager.dart
-// ✅ GESTOR DE SESIONES STT - EVITA CONFLICTOS
+// ✅ v2.0 — Reescritura: FSM limpia, sin Timers internos, sin cooldown propio.
+//
+// ============================================================================
+// POR QUÉ SE REESCRIBIÓ (bugs v1.x)
+// ============================================================================
+//
+//  BUG 1 — _minTimeBetweenSessions (500ms) bloqueaba reinicios legítimos.
+//    Medía desde markIdle(), no desde el listen() previo. Cuando
+//    WakeWordService.resume() intentaba reabrir el STT tras un comando,
+//    canStart() devolvía false porque 500ms no habían pasado desde el
+//    cierre, aunque el listen() nuevo era completamente independiente.
+//
+//  BUG 2 — El Timer de transición (2s) nunca se cancelaba en el happy-path.
+//    Si el STT pasaba starting → active → done correctamente, el timer
+//    expiraba igualmente y forzaba un markIdle() espurio, haciendo que
+//    el coordinator viera un idle cuando el STT aún estaba activo.
+//
+//  BUG 3 — _isTransitioning era un bool sin scope de reset garantizado.
+//    Una excepción entre markStarting() y markActive() lo dejaba en true
+//    para siempre, bloqueando silenciosamente todos los canStart() futuros.
+//
+//  BUG 4 — waitUntilIdle() usaba polling cada 100ms: ineficiente y propenso
+//    a dejar el loop corriendo si el caller no esperaba correctamente.
+//
+// ============================================================================
+// DISEÑO v2.0
+// ============================================================================
+//
+//  FSM de 3 estados: idle → starting → active → idle.
+//  No hay estado 'stopping': markIdle() es el único retorno a idle.
+//
+//  canStart() solo verifica el estado actual — sin cooldowns de tiempo.
+//  El control de cooldown entre sesiones es responsabilidad del caller.
+//
+//  waitUntilIdle() usa ValueNotifier listener — cero polling.
 
 import 'dart:async';
-import 'package:logger/logger.dart';
+import 'package:flutter/foundation.dart';
 
-/// Gestor de sesiones STT para evitar conflictos y race conditions
-///
-/// PROBLEMA RESUELTO:
-/// - Múltiples intentos de start() simultáneos
-/// - error_busy por sesiones superpuestas
-/// - Loops infinitos de reinicio
-class STTSessionManager {
-  final Logger _logger = Logger();
+// ─── Estados ─────────────────────────────────────────────────────────────────
 
-  // Estado de sesión
-  SessionState _state = SessionState.idle;
-  DateTime? _lastStateChange;
-  Timer? _transitionTimer;
+enum SessionState {
+  /// Sin sesión STT activa. Lista para iniciar.
+  idle,
 
-  // Lock para operaciones
-  bool _isTransitioning = false;
+  /// Entre markStarting() y markActive(). Aún no confirmado por la plataforma.
+  starting,
 
-  // Configuración
-  static const Duration _transitionTimeout = Duration(seconds: 2);
-  static const Duration _minTimeBetweenSessions = Duration(milliseconds: 500);
-
-  /// Verificar si puede iniciar sesión
-  bool canStart() {
-    if (_isTransitioning) {
-      _logger.w('⚠️ En transición, no puede iniciar');
-      return false;
-    }
-
-    if (_state == SessionState.active) {
-      _logger.w('⚠️ Sesión ya activa');
-      return false;
-    }
-
-    // Verificar tiempo mínimo entre sesiones
-    if (_lastStateChange != null) {
-      final elapsed = DateTime.now().difference(_lastStateChange!);
-      if (elapsed < _minTimeBetweenSessions) {
-        _logger.w('⚠️ Muy pronto para nueva sesión (${elapsed.inMilliseconds}ms)');
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  /// Marcar inicio de sesión
-  Future<bool> markStarting() async {
-    if (!canStart()) return false;
-
-    _isTransitioning = true;
-    _changeState(SessionState.starting);
-
-    // Timeout de transición
-    _transitionTimer = Timer(_transitionTimeout, () {
-      if (_state == SessionState.starting) {
-        _logger.e('⏱️ Timeout en transición a active');
-        _changeState(SessionState.idle);
-        _isTransitioning = false;
-      }
-    });
-
-    return true;
-  }
-
-  /// Confirmar sesión activa
-  void markActive() {
-    _transitionTimer?.cancel();
-    _isTransitioning = false;
-    _changeState(SessionState.active);
-    _logger.d('✅ Sesión STT activa');
-  }
-
-  /// Marcar fin de sesión
-  void markStopping() {
-    _transitionTimer?.cancel();
-    _isTransitioning = false;
-    _changeState(SessionState.stopping);
-  }
-
-  /// Confirmar sesión cerrada
-  void markIdle() {
-    _transitionTimer?.cancel();
-    _isTransitioning = false;
-    _changeState(SessionState.idle);
-    _logger.d('⏹️ Sesión STT cerrada');
-  }
-
-  /// Forzar reset (en caso de error)
-  void forceReset() {
-    _logger.w('🔄 Force reset de session manager');
-    _transitionTimer?.cancel();
-    _isTransitioning = false;
-    _changeState(SessionState.idle);
-  }
-
-  /// Cambiar estado con logging
-  void _changeState(SessionState newState) {
-    if (_state != newState) {
-      _logger.d('State: ${_state.name} → ${newState.name}');
-      _state = newState;
-      _lastStateChange = DateTime.now();
-    }
-  }
-
-  /// Esperar hasta que esté idle
-  Future<void> waitUntilIdle({Duration timeout = const Duration(seconds: 3)}) async {
-    final startTime = DateTime.now();
-
-    while (_state != SessionState.idle) {
-      if (DateTime.now().difference(startTime) > timeout) {
-        _logger.e('⏱️ Timeout esperando idle state');
-        forceReset();
-        break;
-      }
-
-      await Future.delayed(const Duration(milliseconds: 100));
-    }
-  }
-
-  // Getters
-  SessionState get state => _state;
-  bool get isIdle => _state == SessionState.idle;
-  bool get isActive => _state == SessionState.active;
-  bool get isTransitioning => _isTransitioning;
-  Duration? get timeSinceLastChange => _lastStateChange != null
-      ? DateTime.now().difference(_lastStateChange!)
-      : null;
-
-  void dispose() {
-    _transitionTimer?.cancel();
-  }
+  /// Sesión STT activa, recibiendo audio.
+  active,
 }
 
-/// Estados posibles de la sesión STT
-enum SessionState {
-  idle,      // Sin sesión
-  starting,  // Iniciando sesión
-  active,    // Sesión activa
-  stopping,  // Cerrando sesión
+// ─── Manager ──────────────────────────────────────────────────────────────────
+
+/// Rastreador de estado de sesión STT.
+///
+/// Fuente de verdad única del estado del STT para evitar race conditions
+/// entre WakeWordService, NavigationCoordinator e IntegratedVoiceCommandService.
+///
+/// Responsabilidades:
+///   ✅ Rastrear estado (idle / starting / active).
+///   ✅ Exponer estado de forma reactiva (ValueListenable).
+///   ✅ Proveer espera reactiva sin polling (waitUntilIdle).
+///
+/// NO es responsable de:
+///   ❌ Controlar el STT directamente.
+///   ❌ Gestionar timers de retry.
+///   ❌ Imponer cooldowns entre sesiones (eso va en el caller).
+class STTSessionManager {
+  // ─── Estado ────────────────────────────────────────────────────────────────
+
+  final ValueNotifier<SessionState> _state = ValueNotifier(SessionState.idle);
+
+  ValueListenable<SessionState> get stateListenable => _state;
+
+  SessionState get state => _state.value;
+
+  bool get isIdle => _state.value == SessionState.idle;
+  bool get isActive => _state.value == SessionState.active;
+  bool get isStarting => _state.value == SessionState.starting;
+
+  // ─── canStart ──────────────────────────────────────────────────────────────
+
+  /// Devuelve true si se puede abrir una nueva sesión STT.
+  ///
+  /// Solo verifica el estado FSM. No impone cooldowns temporales.
+  bool canStart() {
+    if (_state.value != SessionState.idle) {
+      _log('canStart=false — estado: ${_state.value.name}');
+      return false;
+    }
+    return true;
+  }
+
+  // ─── Transiciones ──────────────────────────────────────────────────────────
+
+  /// Registra el intento de abrir una sesión.
+  /// Retorna false si el estado actual no lo permite (ya activa / starting).
+  bool markStarting() {
+    if (!canStart()) return false;
+    _to(SessionState.starting);
+    return true;
+  }
+
+  /// Confirma que el STT está escuchando activamente.
+  /// Solo válido si el estado es 'starting'. Ignorado en cualquier otro estado.
+  void markActive() {
+    if (_state.value == SessionState.starting) {
+      _to(SessionState.active);
+    } else {
+      _log('markActive() ignorado — estado: ${_state.value.name}');
+    }
+  }
+
+  /// Cierra la sesión STT, volviendo al estado idle.
+  ///
+  /// Llamar aquí tanto para cierre normal como para cleanup de error.
+  /// Es el único punto de retorno a idle — no hay markStopping() separado.
+  void markIdle() {
+    if (_state.value != SessionState.idle) {
+      _to(SessionState.idle);
+    }
+  }
+
+  /// Reset de emergencia para recuperación de errores críticos.
+  /// No loguea la transición para no contaminar el log en recuperaciones.
+  void forceReset() {
+    _log('⚠️ forceReset() desde ${_state.value.name}');
+    _state.value = SessionState.idle;
+  }
+
+  // ─── Espera reactiva ───────────────────────────────────────────────────────
+
+  /// Espera sin polling hasta que el estado sea idle.
+  ///
+  /// Usa ValueNotifier listener para eficiencia O(1).
+  /// El [timeout] previene bloqueos si el STT nunca notifica su cierre.
+  Future<void> waitUntilIdle({
+    Duration timeout = const Duration(seconds: 4),
+  }) async {
+    if (isIdle) return;
+
+    final completer = Completer<void>();
+
+    void onStateChange() {
+      if (_state.value == SessionState.idle && !completer.isCompleted) {
+        completer.complete();
+      }
+    }
+
+    _state.addListener(onStateChange);
+
+    try {
+      await completer.future.timeout(
+        timeout,
+        onTimeout: () {
+          _log('⏱️ waitUntilIdle timeout (${timeout.inSeconds}s) — forceReset');
+          forceReset();
+        },
+      );
+    } finally {
+      _state.removeListener(onStateChange);
+    }
+  }
+
+  // ─── Internos ──────────────────────────────────────────────────────────────
+
+  void _to(SessionState next) {
+    _log('${_state.value.name} → ${next.name}');
+    _state.value = next;
+  }
+
+  static void _log(String msg) {
+    assert(() {
+      debugPrint('[STTSession] $msg');
+      return true;
+    }());
+  }
+
+  void dispose() {
+    _state.dispose();
+  }
 }

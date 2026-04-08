@@ -1,6 +1,3 @@
-// android/app/src/main/kotlin/com/example/flutter_voice_robot/MainActivity.kt
-// ✅ v2.1 — Lifecycle fix para evitar pause de Unity + AEC + google_ai_edge
-
 package com.example.flutter_voice_robot
 
 import io.flutter.embedding.android.FlutterActivity
@@ -24,8 +21,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // ✅ Registrar plugin AEC (wake word)
-        flutterEngine.plugins.add(AecPlugin())
+        // ❌ AEC eliminado (menos carga CPU / audio / GC)
 
         // ─── google_ai_edge ───────────────────────────────────────────────
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
@@ -84,11 +80,10 @@ class MainActivity : FlutterActivity() {
             }
     }
 
-    // ─── Lifecycle FIX (evita pause completo de Unity / AR) ───────────────
+    // ─── Lifecycle FIX ───────────────────────────────────────────────────
 
     override fun onPause() {
         super.onPause()
-        // ⚠️ NO detener nada aquí
     }
 
     override fun onResume() {

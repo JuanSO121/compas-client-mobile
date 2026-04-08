@@ -1,38 +1,4 @@
 // lib/services/AI/groq_service.dart
-// ✅ v2 — Integrado con ConversationService v5 + NavigationContext para TTS
-//
-// ============================================================================
-//  CAMBIOS v1 → v2
-// ============================================================================
-//
-//  CAMBIO 1 — NavigationContext: nuevo parámetro opcional en chat()
-//    ConversationService puede pasar el estado de navegación para que
-//    el LLM responda "¿cuánto falta?" con datos reales de Unity.
-//
-//  CAMBIO 2 — maxTokens: 500 → 120 por defecto
-//    Respuestas TTS: máximo 2 oraciones. 120 tokens es suficiente y reduce
-//    latencia (~300ms menos por llamada).
-//
-//  CAMBIO 3 — temperature: 0.7 → 0.6
-//    Más consistente para asistente de navegación, sin perder naturalidad.
-//
-//  CAMBIO 4 — Historial: 10 → 6 mensajes
-//    Para navegación indoor el contexto relevante es reciente.
-//    Reduce tokens y latencia sin perder coherencia.
-//
-//  CAMBIO 5 — Prompt conversacional reescrito para biblioteca universitaria
-//    Personalidad cálida, empática, con reglas explícitas de formato TTS.
-//    Sin markdown, sin listas, máximo 2 oraciones.
-//
-//  CAMBIO 6 — Labels del clasificador alineados con ConversationService v5
-//    START_NAVIGATION, STOP, REPEAT, STATUS, HELP
-//    (se mantienen legacy MOVE/TURN en thresholds por retrocompatibilidad)
-//
-//  COMPATIBILIDAD TOTAL con ConversationService v5:
-//    - chat() acepta systemPrompt (ConversationService v5 lo pasa siempre)
-//    - Cuando systemPrompt viene de ConversationService, navigationContext
-//      es ignorado (ConversationService ya incluye el contexto en su prompt)
-//    - NavigationContext solo aplica cuando GroqService genera su propio prompt
 
 import 'dart:async';
 import 'dart:convert';
@@ -98,7 +64,7 @@ class GroqService {
     _httpClient        = http.Client();
     _isInitialized     = true;
     _consecutiveErrors = 0;
-    _logger.i('✅ Groq Service v2 inicializado');
+    _logger.i('✅ Groq Service v3 inicializado');
   }
 
   // ─── Clasificador ─────────────────────────────────────────────────────────
@@ -144,7 +110,7 @@ class GroqService {
 
   // ─── Conversación ─────────────────────────────────────────────────────────
 
-  /// [systemPrompt] — ConversationService v5 siempre lo pasa con su propio
+  /// [systemPrompt] — ConversationService v6 siempre lo pasa con su propio
   /// prompt que incluye waypoints disponibles. Se respeta sin modificaciones.
   ///
   /// [navigationContext] — solo aplica cuando NO se pasa systemPrompt.
@@ -152,12 +118,12 @@ class GroqService {
   ///
   /// [maxTokens] — 120 por defecto (respuestas TTS cortas).
   Future<GroqConversationResponse> chat(
-    String message, {
-    List<ChatMessage>?  history,
-    int                 maxTokens         = 120,
-    String?             systemPrompt,
-    NavigationContext?  navigationContext,
-  }) async {
+      String message, {
+        List<ChatMessage>?  history,
+        int                 maxTokens         = 120,
+        String?             systemPrompt,
+        NavigationContext?  navigationContext,
+      }) async {
     if (!_isInitialized) throw StateError('Groq Service no inicializado');
 
     _conversationCalls++;
@@ -250,9 +216,9 @@ class GroqService {
   }
 
   List<Map<String, String>> _buildMessages(
-    String message, List<ChatMessage>? history, {
-    String? systemPrompt, NavigationContext? navigationContext,
-  }) {
+      String message, List<ChatMessage>? history, {
+        String? systemPrompt, NavigationContext? navigationContext,
+      }) {
     final msgs = <Map<String, String>>[];
 
     msgs.add({
@@ -260,7 +226,7 @@ class GroqService {
       'content': systemPrompt ?? _conversationPrompt(ctx: navigationContext),
     });
 
-    // ✅ v2: máximo 6 mensajes de historial (era 10)
+    // máximo 6 mensajes de historial
     if (history != null && history.isNotEmpty) {
       final recent = history.length > 6
           ? history.sublist(history.length - 6)
@@ -300,6 +266,8 @@ FORMATO: {"label":"LABEL","confidence":0.XX}''';
 
   /// Prompt por defecto de COMPAS — solo se usa cuando ConversationService
   /// NO pasa su propio systemPrompt (caso poco frecuente en producción).
+  ///
+  /// ✅ v3: Incluye regla "un solo candidato" alineada con ConversationService v6.
   String _conversationPrompt({NavigationContext? ctx}) {
     final navInfo = ctx?.toPromptString() ?? 'Sin navegación activa.';
 
@@ -322,11 +290,34 @@ REGLAS DE FORMATO (obligatorias):
 - Español natural y conversacional
 - Máximo 2 oraciones
 
+REGLA CRÍTICA — UN SOLO CANDIDATO:
+Si el usuario pide un lugar y existe EXACTAMENTE UN destino que coincida
+o sea similar a lo pedido, NO preguntes — confirma DIRECTAMENTE con
+la frase "Navegando a [NombreExacto]."
+
+❌ MAL (rompe la detección de acciones):
+  "¿Quieres ir a la Habitación 2° Piso?"
+
+✅ BIEN (acción directa, detectable por el sistema):
+  "Navegando a Habitación 2° Piso."
+
+Solo pregunta si hay DOS O MÁS candidatos igualmente válidos.
+
+FRASES DE CONFIRMACIÓN EXACTAS (el sistema las detecta por texto):
+- Navegar:  "Navegando a [NombreExacto]."
+- Detener:  "Deteniendo la navegación."
+- Silencio: "Silenciando la guía de voz."
+- Repetir:  "Repitiendo la última instrucción."
+- Estado:   "Consultando el estado de la navegación."
+- Lugares:  "Consultando los destinos disponibles."
+
 EJEMPLOS:
-"hola" → "Hola, soy COMPAS. ¿A dónde quieres ir?"
-"¿qué puedes hacer?" → "Puedo guiarte a cualquier lugar de la biblioteca. Solo dime a dónde quieres ir."
-"no escuché" → "No hay problema, di 'repite' y te vuelvo a dar la indicación."
-"me perdí" → "Tranquilo, estoy aquí. Dime a dónde querías ir y te guío desde donde estás."''';
+"hola"         → "Hola, soy COMPAS. ¿A dónde quieres ir?"
+"ir al baño"   → "Navegando a Baño."
+"repite"       → "Repitiendo la última instrucción."
+"¿cuánto falta?" → "Consultando el estado de la navegación."
+"¿qué lugares hay?" → "Consultando los destinos disponibles."
+"me perdí"     → "Tranquilo, estoy aquí. Dime a dónde querías ir y te guío desde donde estás."''';
   }
 
   // ─── Parsing ──────────────────────────────────────────────────────────────

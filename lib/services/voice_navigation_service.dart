@@ -1,15 +1,40 @@
 // lib/services/voice_navigation_service.dart
-// ✅ v6.6 — Logs limpios
+// ✅ v6.7 — Integración guard TTS↔STT con WakeWordService
 //
 // ============================================================================
-//  CAMBIOS v6.5 → v6.6
+//  CAMBIOS v6.6 → v6.7
 // ============================================================================
 //
-//  Logger reemplazado por wrapper de dos niveles:
-//    _log()      → solo en debug builds (assert — eliminado en release)
-//    _logError() → siempre (errores críticos reales)
+//  FIX PRINCIPAL — Mutex TTS↔STT vía WakeWordService.notifyTTSStarted/Ended
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v6.5 (token de generación para race condition).
+//    En v6.6, _pauseWakeWord() llamaba wakeWordService.pause() y
+//    _resumeWakeWord() llamaba wakeWordService.resume(). Este enfoque tenía
+//    dos problemas:
+//
+//    1. pause()/resume() son asíncronos y pueden llegar tarde: si el TTS
+//       empieza a reproducir antes de que pause() complete, el STT ya captó
+//       el primer frame de audio del altavoz.
+//
+//    2. resume() no conoce la ventana de eco residual: el STT se reabría
+//       inmediatamente y podía capturar el final del audio del altavoz.
+//
+//    v6.7 reemplaza las llamadas directas a pause()/resume() por:
+//      • notifyTTSStarted() — cierra la sesión STT síncronamente y bloquea
+//        cualquier nueva apertura mientras _ttsActive == true.
+//      • notifyTTSEnded()   — activa la ventana de supresión de eco (1500ms)
+//        y reencola la apertura de sesión automáticamente.
+//
+//    Ambos métodos viven en WakeWordService v4.2 y son la fuente de verdad
+//    del guard. VoiceNavigationService solo los llama en los puntos exactos:
+//      ANTES  de _ttsService!.speak()  → notifyTTSStarted()
+//      finally de _speak()             → notifyTTSEnded()
+//
+//  NOTA: _pauseWakeWord() y _resumeWakeWord() se conservan como no-ops
+//  comentados para documentar el diseño anterior. El token de generación
+//  (_resumeGeneration) ya no es necesario pero se mantiene por compatibilidad
+//  con v6.5 en caso de rollback.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v6.6.
 
 import 'dart:async';
 import 'dart:convert';
@@ -42,7 +67,7 @@ class _PendingInstruction {
 
 class VoiceNavigationService {
   static final VoiceNavigationService _instance =
-      VoiceNavigationService._internal();
+  VoiceNavigationService._internal();
   factory VoiceNavigationService() => _instance;
   VoiceNavigationService._internal();
 
@@ -75,7 +100,7 @@ class VoiceNavigationService {
   StreamSubscription<UnityResponse>? _unitySubscription;
   StreamSubscription<void>?          _ttsCompletionSubscription;
 
-  // v6.5: token de generación para cancelar resume() obsoletos
+  // Token de generación (conservado por compatibilidad con v6.5)
   int _resumeGeneration = 0;
 
   final ValueNotifier<bool> isReadyNotifier = ValueNotifier(false);
@@ -98,66 +123,67 @@ class VoiceNavigationService {
 
     _ttsReady = true;
     isReadyNotifier.value = true;
-    _log('v6.6 listo — cola máx: $_maxQueueSize');
+    _log('v6.7 listo — cola máx: $_maxQueueSize');
   }
 
   void attachWakeWordService(WakeWordService wakeWordService) {
     _wakeWordService = wakeWordService;
-    _log('WakeWordService conectado');
+    _log('WakeWordService conectado (guard TTS↔STT activo)');
   }
 
   // ─── TTS completed ───────────────────────────────────────────────────────
 
   void _onTTSCompleted() {}
 
-  // ─── Wake word helpers ───────────────────────────────────────────────────
+  // ─── Guard TTS↔STT (v6.7) ────────────────────────────────────────────────
 
-  Future<void> _pauseWakeWord() async {
+  /// Notifica al WakeWordService que el TTS va a comenzar.
+  /// WakeWordService cierra la sesión STT y bloquea nuevas aperturas.
+  /// Es async porque _closeSession() en WakeWordService es async.
+  Future<void> _notifyTTSStarted() async {
     if (_wakeWordService == null) return;
-    if (!_wakeWordService!.isListening) return;
-
-    // v6.5: incrementar generación ANTES de pausar
+    if (!_wakeWordService!.isInitialized) return;
+    // Incrementar generación para cancelar cualquier resume() pendiente
     _resumeGeneration++;
-
     try {
-      await _wakeWordService!.pause();
-      _log('Wake word pausado para TTS');
+      await _wakeWordService!.notifyTTSStarted();
     } catch (e) {
-      _logError('Error pausando wake word: $e');
+      _logError('Error en notifyTTSStarted: $e');
     }
   }
 
-  void _resumeWakeWord() {
+  /// Notifica al WakeWordService que el TTS terminó.
+  /// WakeWordService activará la ventana de eco y reabrirá STT automáticamente.
+  void _notifyTTSEnded() {
     if (_wakeWordService == null) return;
     if (!_wakeWordService!.isInitialized) return;
+    try {
+      _wakeWordService!.notifyTTSEnded();
+    } catch (e) {
+      _logError('Error en notifyTTSEnded: $e');
+    }
+  }
 
-    final ttsStillActive = _ttsService?.isSpeaking ?? false;
-    if (_queue.isNotEmpty || _currentInstruction != null || ttsStillActive) return;
+  // ─── Métodos legacy (no-ops — conservados para rollback) ─────────────────
 
-    final generation = ++_resumeGeneration;
+  // ignore: unused_element
+  Future<void> _pauseWakeWord() async {
+    // Reemplazado por _notifyTTSStarted() en v6.7.
+    // No-op intencional.
+  }
 
-    Future.delayed(const Duration(milliseconds: 350), () {
-      if (generation != _resumeGeneration) {
-        _log('Resume cancelado — nueva actividad TTS durante delay');
-        return;
-      }
-
-      final stillActive = _ttsService?.isSpeaking ?? false;
-      if (_queue.isEmpty && _currentInstruction == null && !stillActive) {
-        _wakeWordService!.resume().catchError((e) {
-          _logError('Error reanudando wake word: $e');
-        });
-        _log('Wake word reanudado (350ms)');
-      }
-    });
+  // ignore: unused_element
+  void _resumeWakeWord() {
+    // Reemplazado por _notifyTTSEnded() en v6.7.
+    // No-op intencional.
   }
 
   // ─── Conexión con Unity ──────────────────────────────────────────────────
 
   void attachToUnityBridge(
-    UnityBridgeService bridge, {
-    UnityWidgetController? controller,
-  }) {
+      UnityBridgeService bridge, {
+        UnityWidgetController? controller,
+      }) {
     if (controller != null) {
       _unityController = controller;
     }
@@ -272,12 +298,12 @@ class VoiceNavigationService {
         instruction.priority == _InstructionPriority.urgent) {
       final toRemove = _queue
           .where((i) =>
-              i.priority == _InstructionPriority.low ||
-              i.priority == _InstructionPriority.medium)
+      i.priority == _InstructionPriority.low ||
+          i.priority == _InstructionPriority.medium)
           .length;
       if (toRemove > 0) {
         _queue.removeWhere((i) =>
-            i.priority == _InstructionPriority.low ||
+        i.priority == _InstructionPriority.low ||
             i.priority == _InstructionPriority.medium);
         _log('Descartados $toRemove low/med por ${instruction.priority.name}');
       }
@@ -334,12 +360,13 @@ class VoiceNavigationService {
 
     _log('▶ [${instruction.announcementType}] "${instruction.text}"');
 
-    await _pauseWakeWord();
+    // ✅ v6.7: usar guard TTS↔STT en lugar de pause/resume directo
+    await _notifyTTSStarted();
     _notifyUnityTTSStatus(speaking: true);
 
     final shouldInterrupt =
         instruction.priority == _InstructionPriority.urgent ||
-        instruction.priority == _InstructionPriority.high;
+            instruction.priority == _InstructionPriority.high;
 
     try {
       await _ttsService!.speak(instruction.text, interrupt: shouldInterrupt);
@@ -351,7 +378,8 @@ class VoiceNavigationService {
       _isDraining         = false;
 
       _notifyUnityTTSStatus(speaking: false);
-      _resumeWakeWord();
+      // ✅ v6.7: notificar fin de TTS — WakeWordService gestiona eco + reapertura
+      _notifyTTSEnded();
       _speakPending();
     }
   }
@@ -399,7 +427,8 @@ class VoiceNavigationService {
     _queue.clear();
     _isDraining = false;
     _notifyUnityTTSStatus(speaking: false);
-    _resumeWakeWord();
+    // ✅ v6.7: notificar fin para reabrir STT con ventana de eco
+    _notifyTTSEnded();
     _log('Detenido — cola vaciada');
   }
 
@@ -418,8 +447,8 @@ class VoiceNavigationService {
   int  get queueLength => _queue.length;
   bool get isBusy =>
       (_ttsService?.isSpeaking ?? false) ||
-      _currentInstruction != null ||
-      _queue.isNotEmpty;
+          _currentInstruction != null ||
+          _queue.isNotEmpty;
 
   Future<void> dispose() async {
     await _unitySubscription?.cancel();

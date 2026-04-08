@@ -122,13 +122,21 @@ class NavigationCoordinator {
     _unityBridge = bridge;
     bridge.onVoiceStatusReceived = _onVoiceStatusReceived;
 
-    // ✅ CLAVE: sincronizar estado del TTS con Unity
+    // sync TTS → Unity
     _ttsService.onTTSStatusChanged = (isSpeaking, priority) {
       bridge.sendTTSStatus(
         isSpeaking: isSpeaking,
         priority: priority,
       );
     };
+
+    // ✅ NUEVO — permitir que voiceService espere al TTS
+    _voiceService.isTtsSpeaking = () => _ttsService.isSpeaking;
+
+    // ✅ NUEVO — conectar wake word al voice service
+    if (_wakeWordAvailable) {
+      _voiceService.attachWakeWordService(_wakeWordService);
+    }
 
     _log('UnityBridgeService conectado + TTS sync');
   }
@@ -314,6 +322,14 @@ class NavigationCoordinator {
   // ─── Procesamiento principal ──────────────────────────────────────────────
 
   Future<void> _processUserInput(String userInput) async {
+
+    if (userInput.toLowerCase().contains('oye compa') ||
+        userInput.toLowerCase().contains('te escucho')) {
+      _log('🧹 Ignorando eco del sistema');
+      await _returnToIdle();
+      return;
+    }
+
     if (_state != CoordinatorState.listeningCommand &&
         _state != CoordinatorState.processing) {
       return;
@@ -483,6 +499,10 @@ class NavigationCoordinator {
 
     _log('"Oye COMPAS" detectado');
     HapticFeedback.heavyImpact();
+
+    // ✅ NUEVO — activar modo wake word
+    _voiceService.setWakeWordModeActive(true);
+
     await _transitionToListeningCommand();
   }
 
@@ -508,7 +528,13 @@ class NavigationCoordinator {
       await _ttsService.speak(greeting, interrupt: true);
       await _ttsService.waitForCompletion();
 
-      await Future.delayed(const Duration(milliseconds: 300));
+      // 🔥 CRÍTICO: esperar a que el audio REAL deje de sonar
+            while (_ttsService.isSpeaking) {
+              await Future.delayed(const Duration(milliseconds: 50));
+            }
+
+      // buffer extra realista (hardware/audio)
+            await Future.delayed(const Duration(milliseconds: 500));
 
       _state = CoordinatorState.listeningCommand;
       _partialText = '';
@@ -520,6 +546,10 @@ class NavigationCoordinator {
       }
 
       _voiceService.setWakeWordActive(false);
+      if (_ttsService.isSpeaking) {
+        _log('⛔ Bloqueado: TTS aún activo antes de STT');
+        return;
+      }
       await _voiceService.startListening();
       onStatusUpdate?.call('Escuchando...');
       _resetCommandTimeout();
@@ -532,7 +562,11 @@ class NavigationCoordinator {
   // ─── Utilidades ───────────────────────────────────────────────────────────
 
   String _getRandomGreeting() {
-    const greetings = ['Dime', '¿Sí?', 'Te escucho', '¿En qué puedo ayudarte?', 'Aquí estoy'];
+    const greetings = [
+  'Dime, te escucho',
+  'Estoy listo, dime',
+  '¿En qué puedo ayudarte exactamente?',
+];
     return greetings[DateTime.now().millisecond % greetings.length];
   }
 
@@ -562,6 +596,7 @@ class NavigationCoordinator {
         await _voiceService.sessionManager.waitUntilIdle(
           timeout: const Duration(seconds: 2),
         );
+        await Future.delayed(const Duration(milliseconds: 800));
         await _wakeWordService.resume();
         onStatusUpdate?.call('Esperando "Oye COMPAS"...');
       }
@@ -584,18 +619,18 @@ class NavigationCoordinator {
     _state = CoordinatorState.idle;
 
     if (_wakeWordAvailable && _isActive) {
-      if (!suppressSTT) {
-        try {
-          _voiceService.setWakeWordActive(true);
-          await _wakeWordService.resume();
-          onStatusUpdate?.call('Esperando "Oye COMPAS"...');
-        } catch (e) {
-          _logError('Error reanudando wake word: $e');
-        }
-      } else {
-        onStatusUpdate?.call('Navegando...');
+      // ✅ Siempre reanudar wake word, independiente de suppressSTT
+      try {
+        _voiceService.setWakeWordActive(true);
+        await _wakeWordService.resume();
+        onStatusUpdate?.call(
+          suppressSTT ? 'Navegando... (di "Oye COMPAS")' : 'Esperando "Oye COMPAS"...',
+        );
+      } catch (e) {
+        _logError('Error reanudando wake word: $e');
       }
     } else if (!suppressSTT && _isActive) {
+      // Sin wake word disponible: reactivar STT directo
       try {
         await Future.delayed(const Duration(milliseconds: 600));
         if (_voiceService.sessionManager.canStart()) {
@@ -663,6 +698,9 @@ class NavigationCoordinator {
     try {
       _isActive         = false;
       _navigationActive = false;
+
+      _voiceService.setWakeWordModeActive(false);
+
       _commandTimeoutTimer?.cancel();
       _partialText = '';
 
