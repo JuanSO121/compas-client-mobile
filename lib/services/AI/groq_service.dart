@@ -1,5 +1,4 @@
 // lib/services/AI/groq_service.dart
-// ✅ SERVICIO GROQ MEJORADO - CONEXIÓN ESTABLE Y ROBUSTA
 
 import 'dart:async';
 import 'dart:convert';
@@ -10,8 +9,36 @@ import '../../config/api_config.dart';
 import '../../models/shared_models.dart';
 
 enum GroqMode {
-  command,      // Clasificación rápida de comandos
-  conversation, // Conversación completa
+  command,
+  conversation,
+}
+
+/// Estado de navegación para enriquecer el prompt conversacional.
+/// ConversationService lo construye con datos de VoiceStatusInfo de Unity.
+class NavigationContext {
+  final bool   isNavigating;
+  final String destination;
+  final double remainingMeters;
+  final int    remainingSteps;
+  final String nextInstruction;
+
+  const NavigationContext({
+    this.isNavigating    = false,
+    this.destination     = '',
+    this.remainingMeters = 0,
+    this.remainingSteps  = 0,
+    this.nextInstruction = '',
+  });
+
+  String toPromptString() {
+    if (!isNavigating) return 'Sin navegación activa.';
+    final sb = StringBuffer();
+    if (destination.isNotEmpty)     sb.write('Destino: "$destination". ');
+    if (remainingSteps > 0)         sb.write('Pasos restantes: $remainingSteps. ');
+    if (nextInstruction.isNotEmpty) sb.write('Próxima indicación: $nextInstruction.');
+    final result = sb.toString().trim();
+    return result.isEmpty ? 'Navegación en curso.' : result;
+  }
 }
 
 class GroqService {
@@ -21,419 +48,373 @@ class GroqService {
 
   final Logger _logger = Logger();
 
-  bool _isInitialized = false;
-  int _commandCalls = 0;
-  int _conversationCalls = 0;
-  int _errorCount = 0;
-  int _consecutiveErrors = 0;
+  bool _isInitialized     = false;
+  int  _commandCalls      = 0;
+  int  _conversationCalls = 0;
+  int  _errorCount        = 0;
+  int  _consecutiveErrors = 0;
 
-  // Cache para respuestas similares
   final Map<String, GroqCommandResponse> _responseCache = {};
-
-  // ✅ Cliente HTTP reutilizable
   late http.Client _httpClient;
 
   Future<void> initialize() async {
-    if (_isInitialized) {
-      _logger.w('Groq Service ya inicializado');
-      return;
-    }
+    if (_isInitialized) { _logger.w('Groq Service ya inicializado'); return; }
+    if (ApiConfig.groqApiKey.isEmpty) throw Exception('GROQ_API_KEY no configurado');
 
-    if (ApiConfig.groqApiKey.isEmpty) {
-      throw Exception('GROQ_API_KEY no configurado en .env');
-    }
-
-    // ✅ Crear cliente HTTP persistente
-    _httpClient = http.Client();
-
-    _isInitialized = true;
+    _httpClient        = http.Client();
+    _isInitialized     = true;
     _consecutiveErrors = 0;
-    _logger.i('✅ Groq Service inicializado');
+    _logger.i('✅ Groq Service v3 inicializado');
   }
 
-  /// ✅ CLASIFICAR COMANDO (modo rápido)
+  // ─── Clasificador ─────────────────────────────────────────────────────────
+
   Future<GroqCommandResponse> classifyCommand(String text) async {
-    if (!_isInitialized) {
-      throw StateError('Groq Service no inicializado');
-    }
+    if (!_isInitialized) throw StateError('Groq Service no inicializado');
 
     _commandCalls++;
-    final stopwatch = Stopwatch()..start();
+    final sw = Stopwatch()..start();
 
     try {
-      // Verificar cache
-      final normalizedText = text.toLowerCase().trim();
-      if (_responseCache.containsKey(normalizedText)) {
+      final key = text.toLowerCase().trim();
+      if (_responseCache.containsKey(key)) {
         _logger.d('💾 Cache hit: "$text"');
-        return _responseCache[normalizedText]!;
+        return _responseCache[key]!;
       }
 
       final response = await _makeGroqRequest(
-        text: text,
-        mode: GroqMode.command,
-        maxTokens: 100,
-        temperature: 0.1,
+        text: text, mode: GroqMode.command,
+        maxTokens: 80, temperature: 0.1,
       );
 
-      stopwatch.stop();
-
-      // Guardar en cache
-      _responseCache[normalizedText] = response;
-
-      // Limpiar cache si crece mucho
-      if (_responseCache.length > 50) {
-        _responseCache.clear();
-      }
-
-      // ✅ Resetear contador de errores en éxito
+      sw.stop();
+      _responseCache[key] = response;
+      if (_responseCache.length > 50) _responseCache.clear();
       _consecutiveErrors = 0;
 
-      _logger.i('[GROQ-CMD] "$text" → ${response.label} (${(response.confidence * 100).toStringAsFixed(1)}%) [${stopwatch.elapsedMilliseconds}ms]');
+      _logger.i('[GROQ-CMD] "$text" → ${response.label} '
+          '(${(response.confidence * 100).toStringAsFixed(1)}%) [${sw.elapsedMilliseconds}ms]');
 
       return response;
 
     } on TimeoutException {
-      _errorCount++;
-      _consecutiveErrors++;
-      _logger.e('⏱️ Groq timeout (error #$_consecutiveErrors)');
+      _errorCount++; _consecutiveErrors++;
+      _logger.e('⏱️ Groq timeout (#$_consecutiveErrors)');
       throw Exception('Groq timeout');
     } catch (e) {
-      _errorCount++;
-      _consecutiveErrors++;
-      _logger.e('❌ Error clasificando comando (error #$_consecutiveErrors): $e');
+      _errorCount++; _consecutiveErrors++;
+      _logger.e('❌ Error clasificando (#$_consecutiveErrors): $e');
       rethrow;
     }
   }
 
-  /// ✅ CONVERSACIÓN COMPLETA (modo conversacional)
+  // ─── Conversación ─────────────────────────────────────────────────────────
+
+  /// [systemPrompt] — ConversationService v6 siempre lo pasa con su propio
+  /// prompt que incluye waypoints disponibles. Se respeta sin modificaciones.
+  ///
+  /// [navigationContext] — solo aplica cuando NO se pasa systemPrompt.
+  /// Permite responder "¿cuánto falta?" con datos reales de Unity.
+  ///
+  /// [maxTokens] — 120 por defecto (respuestas TTS cortas).
   Future<GroqConversationResponse> chat(
       String message, {
-        List<ChatMessage>? history,
-        int maxTokens = 500,
-        String? systemPrompt, // ✅ NUEVO: Prompt personalizable
+        List<ChatMessage>?  history,
+        int                 maxTokens         = 120,
+        String?             systemPrompt,
+        NavigationContext?  navigationContext,
       }) async {
-    if (!_isInitialized) {
-      throw StateError('Groq Service no inicializado');
-    }
+    if (!_isInitialized) throw StateError('Groq Service no inicializado');
 
     _conversationCalls++;
-    final stopwatch = Stopwatch()..start();
+    final sw = Stopwatch()..start();
 
     try {
-      final messages = _buildConversationMessages(
-        message,
-        history,
-        systemPrompt: systemPrompt, // ✅ NUEVO
+      final messages = _buildMessages(
+        message, history,
+        systemPrompt: systemPrompt,
+        navigationContext: navigationContext,
       );
 
       final response = await _httpClient.post(
         Uri.parse('${ApiConfig.groqBaseUrl}/chat/completions'),
         headers: ApiConfig.groqHeaders,
         body: jsonEncode({
-          'model': ApiConfig.groqConversationModel,
-          'messages': messages,
-          'temperature': 0.7,
-          'max_tokens': maxTokens,
-          'stream': false,
-          'top_p': 0.9,
+          'model':       ApiConfig.groqConversationModel,
+          'messages':    messages,
+          'temperature': 0.6,
+          'max_tokens':  maxTokens,
+          'stream':      false,
+          'top_p':       0.9,
         }),
-      ).timeout(
-        const Duration(seconds: 10),
-      );
+      ).timeout(const Duration(seconds: 10));
 
       if (response.statusCode != 200) {
-        _logger.e('Groq API error: ${response.statusCode}');
-        _logger.e('Response: ${response.body}');
         throw Exception('Groq API error: ${response.statusCode} - ${response.body}');
       }
 
-      final data = jsonDecode(response.body);
+      final data    = jsonDecode(response.body);
       final content = data['choices'][0]['message']['content'] as String;
-      final usage = data['usage'];
+      final usage   = data['usage'];
 
-      stopwatch.stop();
-
-      // ✅ Resetear contador de errores en éxito
+      sw.stop();
       _consecutiveErrors = 0;
 
-      _logger.i('[GROQ-CHAT] ${content.substring(0, content.length > 50 ? 50 : content.length)}... [${stopwatch.elapsedMilliseconds}ms]');
+      final preview = content.length > 60 ? '${content.substring(0, 60)}...' : content;
+      _logger.i('[GROQ-CHAT] $preview [${sw.elapsedMilliseconds}ms]');
 
       return GroqConversationResponse(
-        content: content,
-        tokensUsed: usage['total_tokens'] as int,
+        content:          content.trim(),
+        tokensUsed:       usage['total_tokens']      as int,
         completionTokens: usage['completion_tokens'] as int,
-        promptTokens: usage['prompt_tokens'] as int,
-        responseTimeMs: stopwatch.elapsedMilliseconds,
+        promptTokens:     usage['prompt_tokens']     as int,
+        responseTimeMs:   sw.elapsedMilliseconds,
       );
 
     } on TimeoutException {
-      _errorCount++;
-      _consecutiveErrors++;
-      _logger.e('⏱️ Groq chat timeout (error #$_consecutiveErrors)');
+      _errorCount++; _consecutiveErrors++;
+      _logger.e('⏱️ Groq chat timeout (#$_consecutiveErrors)');
       throw Exception('Groq timeout');
     } catch (e) {
-      _errorCount++;
-      _consecutiveErrors++;
-      _logger.e('❌ Error en conversación (error #$_consecutiveErrors): $e');
+      _errorCount++; _consecutiveErrors++;
+      _logger.e('❌ Error conversación (#$_consecutiveErrors): $e');
       rethrow;
     }
   }
 
-  /// ✅ CORE: Request a Groq API con manejo robusto
+  // ─── Internals ────────────────────────────────────────────────────────────
+
   Future<GroqCommandResponse> _makeGroqRequest({
-    required String text,
-    required GroqMode mode,
-    int maxTokens = 100,
-    double temperature = 0.1,
+    required String text, required GroqMode mode,
+    int maxTokens = 80, double temperature = 0.1,
   }) async {
+    final response = await _httpClient.post(
+      Uri.parse('${ApiConfig.groqBaseUrl}/chat/completions'),
+      headers: ApiConfig.groqHeaders,
+      body: jsonEncode({
+        'model':       ApiConfig.groqCommandModel,
+        'messages': [
+          {'role': 'system', 'content': _commandPrompt()},
+          {'role': 'user',   'content': text},
+        ],
+        'temperature': temperature,
+        'max_tokens':  maxTokens,
+        'stream':      false,
+        'top_p':       0.95,
+      }),
+    ).timeout(
+      const Duration(seconds: 5),
+      onTimeout: () => throw TimeoutException('Groq timeout 5s'),
+    );
 
-    final prompt = mode == GroqMode.command
-        ? _buildCommandPrompt(text)
-        : _buildConversationPrompt(text);
-
-    try {
-      final response = await _httpClient.post(
-        Uri.parse('${ApiConfig.groqBaseUrl}/chat/completions'),
-        headers: ApiConfig.groqHeaders,
-        body: jsonEncode({
-          'model': ApiConfig.groqCommandModel,
-          'messages': [
-            {'role': 'system', 'content': prompt},
-            {'role': 'user', 'content': text},
-          ],
-          'temperature': temperature,
-          'max_tokens': maxTokens,
-          'stream': false,
-          'top_p': 0.95,
-        }),
-      ).timeout(
-        const Duration(seconds: 5), // ✅ 5 segundos para comandos
-        onTimeout: () {
-          throw TimeoutException('Groq timeout después de 5s');
-        },
-      );
-
-      if (response.statusCode != 200) {
-        _logger.e('Groq API error: ${response.statusCode}');
-        _logger.e('Response body: ${response.body}');
-        throw Exception('Groq API error: ${response.statusCode} - ${response.body}');
-      }
-
-      final data = jsonDecode(response.body);
-      final content = data['choices'][0]['message']['content'] as String;
-
-      return _parseCommandResponse(content);
-
-    } on TimeoutException catch (e) {
-      _logger.e('Timeout en Groq: $e');
-      rethrow;
-    } catch (e) {
-      _logger.e('Error en request a Groq: $e');
-      rethrow;
+    if (response.statusCode != 200) {
+      throw Exception('Groq API error: ${response.statusCode}');
     }
+
+    final content = jsonDecode(response.body)['choices'][0]['message']['content'] as String;
+    return _parse(content);
   }
 
-  /// ✅ Prompt optimizado para comandos (JSON puro)
-  String _buildCommandPrompt(String text) {
-    return '''Eres un clasificador de comandos de navegación para un robot asistente.
+  List<Map<String, String>> _buildMessages(
+      String message, List<ChatMessage>? history, {
+        String? systemPrompt, NavigationContext? navigationContext,
+      }) {
+    final msgs = <Map<String, String>>[];
 
-CATEGORÍAS EXACTAS (solo estas 6):
-- MOVE: moverse adelante (avanza, muévete, camina, adelante, forward, anda, vamos)
-- STOP: detenerse (para, detente, alto, stop, frena, quieto, espera)
-- TURN_LEFT: girar izquierda (izquierda, gira a la izquierda, left, zurda, izq)
-- TURN_RIGHT: girar derecha (derecha, gira a la derecha, right, diestra, der)
-- HELP: ayuda (ayuda, help, auxilio, socorro)
-- REPEAT: repetir (repite, otra vez, de nuevo, again)
+    msgs.add({
+      'role':    'system',
+      'content': systemPrompt ?? _conversationPrompt(ctx: navigationContext),
+    });
 
-INSTRUCCIONES:
-1. Clasifica el comando en UNA categoría
-2. Asigna confianza 0.0-1.0 basado en claridad
-3. Responde SOLO con JSON, sin explicaciones
-4. Si no encaja en ninguna, usa confianza < 0.5
+    // máximo 6 mensajes de historial
+    if (history != null && history.isNotEmpty) {
+      final recent = history.length > 6
+          ? history.sublist(history.length - 6)
+          : history;
+      for (final m in recent) {
+        msgs.add({'role': m.role, 'content': m.content});
+      }
+    }
 
-FORMATO DE RESPUESTA (OBLIGATORIO):
-{"label":"CATEGORIA","confidence":0.XX}
-
-Ejemplos:
-- "avanza" → {"label":"MOVE","confidence":0.95}
-- "para ya" → {"label":"STOP","confidence":0.90}
-- "no sé" → {"label":"MOVE","confidence":0.20}''';
+    msgs.add({'role': 'user', 'content': message});
+    return msgs;
   }
 
-  /// ✅ Prompt para conversación natural
-  String _buildConversationPrompt(String text) {
-    return '''Eres COMPAS, un robot asistente amigable y útil.
+  // ─── Prompts ──────────────────────────────────────────────────────────────
 
-Características:
-- Hablas español de forma natural y concisa
-- Eres útil y empático
-- Respondes de forma breve pero completa
-- Si te piden ejecutar una acción (mover, girar, etc), confirmas que la ejecutarás
+  String _commandPrompt() => '''Eres el clasificador de intenciones de COMPAS, asistente de navegación en una biblioteca universitaria.
 
-Contexto: El usuario puede tanto conversar contigo como darte comandos de navegación.
+LABELS (solo estos 5):
+- START_NAVIGATION: el usuario quiere ir a un lugar o preguntar dónde está algo
+  Ej: "llévame a la sala de estudio", "¿dónde están los baños?", "quiero ir a recepción"
+- STOP: detener la navegación actual
+  Ej: "para", "detente", "cancela", "alto", "no quiero ir"
+- REPEAT: volver a escuchar la última instrucción
+  Ej: "repite", "¿qué dijiste?", "no escuché", "otra vez"
+- STATUS: preguntar por el progreso de la navegación
+  Ej: "¿cuánto falta?", "¿ya casi llegamos?", "¿dónde estoy?", "¿cuántos pasos?"
+- HELP: ayuda general, saludos, preguntas generales, o comando no reconocido
+  Ej: "hola", "ayuda", "¿qué puedes hacer?", cualquier pregunta general
 
-Responde de forma natural al mensaje del usuario.''';
+REGLAS:
+1. Si menciona un lugar o destino → START_NAVIGATION siempre
+2. Si pregunta por progreso durante navegación → STATUS
+3. Todo lo que no sea claramente STOP o REPEAT → HELP
+4. Responde SOLO con JSON
+
+FORMATO: {"label":"LABEL","confidence":0.XX}''';
+
+  /// Prompt por defecto de COMPAS — solo se usa cuando ConversationService
+  /// NO pasa su propio systemPrompt (caso poco frecuente en producción).
+  ///
+  /// ✅ v3: Incluye regla "un solo candidato" alineada con ConversationService v6.
+  String _conversationPrompt({NavigationContext? ctx}) {
+    final navInfo = ctx?.toPromptString() ?? 'Sin navegación activa.';
+
+    return '''Eres COMPAS, asistente de navegación de la biblioteca universitaria. Ayudas a estudiantes, visitantes y personas con discapacidad visual a moverse por el edificio.
+
+PERSONALIDAD:
+- Cálido, paciente y empático
+- Claro y directo — el usuario escucha tus respuestas en voz alta
+- Máximo 2 oraciones cortas por respuesta
+- Si no entiendes algo, lo dices con amabilidad y ofreces una alternativa
+
+ESTADO ACTUAL:
+$navInfo
+
+CAPACIDADES:
+Guiar a cualquier lugar, repetir la última instrucción, informar cuánto falta, detener la navegación.
+
+REGLAS DE FORMATO (obligatorias):
+- Sin listas, sin guiones, sin asteriscos, sin emojis
+- Español natural y conversacional
+- Máximo 2 oraciones
+
+REGLA CRÍTICA — UN SOLO CANDIDATO:
+Si el usuario pide un lugar y existe EXACTAMENTE UN destino que coincida
+o sea similar a lo pedido, NO preguntes — confirma DIRECTAMENTE con
+la frase "Navegando a [NombreExacto]."
+
+❌ MAL (rompe la detección de acciones):
+  "¿Quieres ir a la Habitación 2° Piso?"
+
+✅ BIEN (acción directa, detectable por el sistema):
+  "Navegando a Habitación 2° Piso."
+
+Solo pregunta si hay DOS O MÁS candidatos igualmente válidos.
+
+FRASES DE CONFIRMACIÓN EXACTAS (el sistema las detecta por texto):
+- Navegar:  "Navegando a [NombreExacto]."
+- Detener:  "Deteniendo la navegación."
+- Silencio: "Silenciando la guía de voz."
+- Repetir:  "Repitiendo la última instrucción."
+- Estado:   "Consultando el estado de la navegación."
+- Lugares:  "Consultando los destinos disponibles."
+
+EJEMPLOS:
+"hola"         → "Hola, soy COMPAS. ¿A dónde quieres ir?"
+"ir al baño"   → "Navegando a Baño."
+"repite"       → "Repitiendo la última instrucción."
+"¿cuánto falta?" → "Consultando el estado de la navegación."
+"¿qué lugares hay?" → "Consultando los destinos disponibles."
+"me perdí"     → "Tranquilo, estoy aquí. Dime a dónde querías ir y te guío desde donde estás."''';
   }
 
-  /// ✅ Parsear respuesta JSON de clasificación
-  GroqCommandResponse _parseCommandResponse(String content) {
+  // ─── Parsing ──────────────────────────────────────────────────────────────
+
+  GroqCommandResponse _parse(String content) {
     try {
-      // Limpiar respuesta (quitar markdown si existe)
-      final jsonText = content
-          .replaceAll('```json', '')
-          .replaceAll('```', '')
-          .trim();
-
-      final json = jsonDecode(jsonText);
+      final clean = content.replaceAll('```json', '').replaceAll('```', '').trim();
+      final json  = jsonDecode(clean);
       final label = json['label'] as String;
-      final confidence = (json['confidence'] as num).toDouble();
+      final conf  = (json['confidence'] as num).toDouble();
 
-      // Thresholds por categoría
       const thresholds = {
-        'MOVE': 0.65,
-        'STOP': 0.65,
-        'TURN_LEFT': 0.60,
-        'TURN_RIGHT': 0.60,
-        'REPEAT': 0.55,
-        'HELP': 0.70,
+        'START_NAVIGATION': 0.70,
+        'STOP':             0.65,
+        'REPEAT':           0.60,
+        'STATUS':           0.65,
+        'HELP':             0.50,
+        'MOVE':             0.65,
+        'TURN_LEFT':        0.60,
+        'TURN_RIGHT':       0.60,
       };
 
       final threshold = thresholds[label] ?? 0.50;
-      final passesThreshold = confidence >= threshold;
-
       return GroqCommandResponse(
-        label: label,
-        confidence: confidence,
-        passesThreshold: passesThreshold,
-        threshold: threshold,
-        rawResponse: content,
+        label: label, confidence: conf,
+        passesThreshold: conf >= threshold,
+        threshold: threshold, rawResponse: content,
       );
 
     } catch (e) {
-      _logger.e('Error parseando respuesta Groq: $e');
-      _logger.e('Respuesta raw: $content');
-
-      // Fallback: intentar detectar con keywords
-      return _fallbackParsing(content);
+      _logger.e('Error parseando Groq: $e — raw: $content');
+      return _fallback(content);
     }
   }
 
-  /// ✅ Fallback si JSON falla
-  GroqCommandResponse _fallbackParsing(String content) {
-    final lower = content.toLowerCase();
-
-    if (lower.contains('move') || lower.contains('avanz')) {
-      return GroqCommandResponse(
-        label: 'MOVE',
-        confidence: 0.70,
-        passesThreshold: true,
-        threshold: 0.65,
-        rawResponse: content,
-      );
+  GroqCommandResponse _fallback(String content) {
+    final l = content.toLowerCase();
+    if (l.contains('start_navigation') || l.contains('navigation')) {
+      return GroqCommandResponse(label: 'START_NAVIGATION', confidence: 0.70,
+          passesThreshold: true, threshold: 0.70, rawResponse: content);
     }
-
-    if (lower.contains('stop') || lower.contains('para') || lower.contains('det')) {
-      return GroqCommandResponse(
-        label: 'STOP',
-        confidence: 0.75,
-        passesThreshold: true,
-        threshold: 0.65,
-        rawResponse: content,
-      );
+    if (l.contains('stop') || l.contains('para')) {
+      return GroqCommandResponse(label: 'STOP', confidence: 0.70,
+          passesThreshold: true, threshold: 0.65, rawResponse: content);
     }
-
-    return GroqCommandResponse(
-      label: 'UNKNOWN',
-      confidence: 0.30,
-      passesThreshold: false,
-      threshold: 0.50,
-      rawResponse: content,
-    );
+    if (l.contains('repeat') || l.contains('repite')) {
+      return GroqCommandResponse(label: 'REPEAT', confidence: 0.70,
+          passesThreshold: true, threshold: 0.60, rawResponse: content);
+    }
+    if (l.contains('status') || l.contains('falta')) {
+      return GroqCommandResponse(label: 'STATUS', confidence: 0.70,
+          passesThreshold: true, threshold: 0.65, rawResponse: content);
+    }
+    return GroqCommandResponse(label: 'HELP', confidence: 0.60,
+        passesThreshold: true, threshold: 0.50, rawResponse: content);
   }
 
-  /// ✅ Construir mensajes para conversación con historial
-  List<Map<String, String>> _buildConversationMessages(
-      String message,
-      List<ChatMessage>? history, {
-        String? systemPrompt, // ✅ NUEVO
-      }) {
-    final messages = <Map<String, String>>[];
+  // ─── Utils ────────────────────────────────────────────────────────────────
 
-    // System prompt (personalizado o default)
-    messages.add({
-      'role': 'system',
-      'content': systemPrompt ?? _buildConversationPrompt(message),
-    });
-
-    // Historial (limitar a últimos 10 mensajes)
-    if (history != null && history.isNotEmpty) {
-      final recentHistory = history.length > 10
-          ? history.sublist(history.length - 10)
-          : history;
-
-      for (var msg in recentHistory) {
-        messages.add({
-          'role': msg.role,
-          'content': msg.content,
-        });
-      }
-    }
-
-    // Mensaje actual
-    messages.add({
-      'role': 'user',
-      'content': message,
-    });
-
-    return messages;
-  }
-
-  /// ✅ Verificar salud del servicio
   bool get isHealthy => _consecutiveErrors < 3;
 
-  /// ✅ Resetear errores (útil después de reconectar)
   void resetErrors() {
-    _consecutiveErrors = 0;
-    _errorCount = 0;
-    _logger.i('Contador de errores reseteado');
+    _consecutiveErrors = 0; _errorCount = 0;
+    _logger.i('Errores reseteados');
   }
 
-  Map<String, dynamic> getStatistics() {
-    return {
-      'is_initialized': _isInitialized,
-      'command_calls': _commandCalls,
-      'conversation_calls': _conversationCalls,
-      'error_count': _errorCount,
-      'consecutive_errors': _consecutiveErrors,
-      'cache_size': _responseCache.length,
-      'total_calls': _commandCalls + _conversationCalls,
-      'is_healthy': isHealthy,
-    };
-  }
+  void clearCache() { _responseCache.clear(); _logger.d('Cache limpiado'); }
 
-  void clearCache() {
-    _responseCache.clear();
-    _logger.d('Cache limpiado');
-  }
+  Map<String, dynamic> getStatistics() => {
+    'is_initialized':     _isInitialized,
+    'command_calls':      _commandCalls,
+    'conversation_calls': _conversationCalls,
+    'error_count':        _errorCount,
+    'consecutive_errors': _consecutiveErrors,
+    'cache_size':         _responseCache.length,
+    'total_calls':        _commandCalls + _conversationCalls,
+    'is_healthy':         isHealthy,
+  };
 
   void dispose() {
     _responseCache.clear();
-    _httpClient.close(); // ✅ Cerrar cliente HTTP
+    _httpClient.close();
     _isInitialized = false;
     _logger.i('GroqService disposed');
   }
 }
 
-// ========== MODELOS DE RESPUESTA ==========
+// ─── Modelos ──────────────────────────────────────────────────────────────
 
 class GroqCommandResponse {
   final String label;
   final double confidence;
-  final bool passesThreshold;
+  final bool   passesThreshold;
   final double threshold;
   final String rawResponse;
 
-  GroqCommandResponse({
+  const GroqCommandResponse({
     required this.label,
     required this.confidence,
     required this.passesThreshold,
@@ -441,26 +422,21 @@ class GroqCommandResponse {
     required this.rawResponse,
   });
 
-  VoiceCommandResult toVoiceCommandResult() {
-    return VoiceCommandResult(
-      label: label,
-      confidence: confidence,
-      passesThreshold: passesThreshold,
-      threshold: threshold,
-      inferenceTimeMs: 0,
-      logits: [],
-    );
-  }
+  VoiceCommandResult toVoiceCommandResult() => VoiceCommandResult(
+    label: label, confidence: confidence,
+    passesThreshold: passesThreshold,
+    threshold: threshold, inferenceTimeMs: 0, logits: [],
+  );
 }
 
 class GroqConversationResponse {
   final String content;
-  final int tokensUsed;
-  final int completionTokens;
-  final int promptTokens;
-  final int responseTimeMs;
+  final int    tokensUsed;
+  final int    completionTokens;
+  final int    promptTokens;
+  final int    responseTimeMs;
 
-  GroqConversationResponse({
+  const GroqConversationResponse({
     required this.content,
     required this.tokensUsed,
     required this.completionTokens,
@@ -470,8 +446,8 @@ class GroqConversationResponse {
 }
 
 class ChatMessage {
-  final String role; // 'user' o 'assistant'
-  final String content;
+  final String   role;
+  final String   content;
   final DateTime timestamp;
 
   ChatMessage({

@@ -38,7 +38,9 @@ Además, incluye un módulo de autenticación con tokens y gestión de perfil/pr
 
 ---
 
-## Características principales
+**Repositorio:** https://github.com/JuanSO121/compas-client-mobile  
+**Autores:** Juan José Sánchez Ocampo · Carlos Eduardo Rangel  
+**Institución:** Universidad de San Buenaventura Cali — Ingeniería de Sistemas e Ingeniería Multimedia, 2026
 
 ### 1) Interacción por voz inteligente
 - Detección de comandos mediante `speech_to_text`.
@@ -102,7 +104,7 @@ Además, incluye un módulo de autenticación con tokens y gestión de perfil/pr
 
 ---
 
-## Estructura del proyecto
+### Funcionalidades implementadas
 
 ```text
 lib/
@@ -307,7 +309,7 @@ El proyecto incluye decisiones explícitas de accesibilidad:
 
 ---
 
-## Licencia
+## Repositorios relacionados
 
 Actualmente este repositorio no incluye un archivo de licencia explícito.
 

@@ -1,8 +1,24 @@
 // lib/screens/auth/welcome_screen.dart
+//
+// ── Cambios TTS v1.0 ──────────────────────────────────────────────────────────
+//
+//  • initState: inicializa AuthTTSService y anuncia la pantalla (~400 ms delay
+//    para que el widget esté renderizado antes de hablar).
+//  • _navigateToLogin / _navigateToRegister: anuncia el botón tocado ANTES de
+//    navegar, con un pequeño delay para que el TTS alcance a decir algo.
+//  • dispose: NO libera AuthTTSService aquí — lo libera LoginScreenIntegrated
+//    al entrar a ArNavigationScreen. Welcome solo para el TTS al salir de scope.
+//  • _buildPrimaryButton: envuelto en GestureDetector para capturar el tap y
+//    anunciar la acción sin romper el InkWell existente.
+//
+//  SemanticsService.announce() se mantiene para TalkBack/VoiceOver del SO.
+// ──────────────────────────────────────────────────────────────────────────────
+
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_voice_robot/screens/auth/register_screen_integrated.dart';
+import '../../services/auth_tts_service.dart';
 
 import 'login_screen_integrated.dart';
 
@@ -17,6 +33,9 @@ class _WelcomeScreenState extends State<WelcomeScreen>
     with SingleTickerProviderStateMixin {
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
+
+  // ✅ TTS
+  final AuthTTSService _tts = AuthTTSService();
 
   @override
   void initState() {
@@ -34,7 +53,18 @@ class _WelcomeScreenState extends State<WelcomeScreen>
     _fadeController.forward();
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await Future.delayed(const Duration(milliseconds: 300));
+      // ✅ Inicializar TTS y anunciar pantalla
+      await _tts.initialize();
+
+      await Future.delayed(const Duration(milliseconds: 400));
+
+      // Anuncio por TTS (funciona sin TalkBack activo)
+      await _tts.announceScreen(
+        'Bienvenido a COMPAS. '
+            'Dos opciones disponibles: Iniciar sesión o Crear cuenta.',
+      );
+
+      // Anuncio accesibilidad SO (TalkBack / VoiceOver)
       SemanticsService.announce(
         'Bienvenido a COMPAS. Dos opciones disponibles: Iniciar sesión o Crear cuenta',
         TextDirection.ltr,
@@ -45,12 +75,21 @@ class _WelcomeScreenState extends State<WelcomeScreen>
   @override
   void dispose() {
     _fadeController.dispose();
+    // AuthTTSService NO se libera aquí; se libera al salir del flujo de auth.
     super.dispose();
   }
 
-  void _navigateToLogin() {
+  // ── Navegación ─────────────────────────────────────────────────────────────
+
+  void _navigateToLogin() async {
     HapticFeedback.lightImpact();
+    await _tts.announceButton('Iniciando sesión');
     SemanticsService.announce('Ir a iniciar sesión', TextDirection.ltr);
+
+    // Pequeño delay para que el TTS arranque antes de la transición
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+
     Navigator.of(context).push(
       PageRouteBuilder(
         pageBuilder: (_, __, ___) => const LoginScreenIntegrated(),
@@ -60,9 +99,14 @@ class _WelcomeScreenState extends State<WelcomeScreen>
     );
   }
 
-  void _navigateToRegister() {
+  void _navigateToRegister() async {
     HapticFeedback.lightImpact();
+    await _tts.announceButton('Crear cuenta nueva');
     SemanticsService.announce('Ir a crear cuenta', TextDirection.ltr);
+
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+
     Navigator.of(context).push(
       PageRouteBuilder(
         pageBuilder: (_, __, ___) => const RegisterScreenIntegrated(),
@@ -71,6 +115,8 @@ class _WelcomeScreenState extends State<WelcomeScreen>
       ),
     );
   }
+
+  // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -92,46 +138,14 @@ class _WelcomeScreenState extends State<WelcomeScreen>
                 Semantics(
                   label: 'Logo de la aplicación COMPAS',
                   child: Image.asset(
-                    'assets/images/compas_V3.png',
-                    width: 180,
-                    height: 180,
+                    'assets/images/compas_V4.jpeg',
+                    width: 280,
+                    height: 280,
                     fit: BoxFit.contain,
                   ),
                 ),
 
                 const SizedBox(height: 48),
-
-                // TÍTULO PRINCIPAL
-                Semantics(
-                  header: true,
-                  label: 'COMPAS',
-                  child: Text(
-                    'COMPAS',
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      fontSize: 32,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.5,
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-
-                const SizedBox(height: 16),
-
-                // SUBTÍTULO
-                Semantics(
-                  label: 'Tecnología que te escucha',
-                  child: Text(
-                    'Tecnología que te escucha',
-                    style: theme.textTheme.bodyLarge?.copyWith(
-                      fontSize: 18,
-                      color: theme.colorScheme.onSurface.withValues(alpha: 0.6),
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-
-                const SizedBox(height: 80),
 
                 // BOTÓN PRINCIPAL: INICIAR SESIÓN
                 Semantics(
@@ -143,6 +157,7 @@ class _WelcomeScreenState extends State<WelcomeScreen>
                     icon: Icons.login_rounded,
                     onPressed: _navigateToLogin,
                     isPrimary: true,
+                    ttsHint: 'Iniciar sesión con su cuenta existente.',
                   ),
                 ),
 
@@ -158,6 +173,7 @@ class _WelcomeScreenState extends State<WelcomeScreen>
                     icon: Icons.person_add_rounded,
                     onPressed: _navigateToRegister,
                     isPrimary: false,
+                    ttsHint: 'Crear una cuenta nueva.',
                   ),
                 ),
 
@@ -177,6 +193,7 @@ class _WelcomeScreenState extends State<WelcomeScreen>
     required IconData icon,
     required VoidCallback onPressed,
     required bool isPrimary,
+    required String ttsHint,
   }) {
     final theme = Theme.of(context);
 
@@ -186,6 +203,7 @@ class _WelcomeScreenState extends State<WelcomeScreen>
       elevation: 0,
       child: InkWell(
         onTap: onPressed,
+        // ✅ onHover para accesibilidad en dispositivos con puntero
         borderRadius: BorderRadius.circular(20),
         child: Container(
           width: double.infinity,

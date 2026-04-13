@@ -1,35 +1,66 @@
 // lib/services/AI/integrated_voice_command_service.dart
-// ✅ v3 — Fix condición de carrera STT/Porcupine + sessionManager corrupto
+// ✅ v4.0 — Reinicio automático post-comando + arquitectura limpia.
 //
-//  BUGS CORREGIDOS (v2 → v3):
-//  ─────────────────────────────────────────────────────────────────────────
-//  BUG 1: _onSpeechStatus('notListening'/'done') ponía _isListening=false
-//    pero NO llamaba _sessionManager.markIdle(). El coordinator veía
-//    sessionManager.isIdle==false y entraba en _returnToIdle() intentando
-//    detener un STT que ya había terminado solo → bucle de errores y el
-//    siguiente ciclo de escucha nunca arrancaba bien.
-//    FIX: markIdle() en _onSpeechStatus cuando status es done/notListening.
+// ============================================================================
+// PROBLEMA RAÍZ (v3.x)
+// ============================================================================
 //
-//  BUG 2: _processCommand() llamaba onCommandDetected + onCommandExecuted
-//    en el mismo tick síncrono. NavigationCoordinator asume que son eventos
-//    separados en el tiempo (onCommandDetected captura el texto, luego
-//    onCommandExecuted lo procesa). Al llegar juntos, capturedText=null
-//    cuando se ejecuta onCommandExecuted.
-//    FIX: onCommandExecuted se llama con microtask (un tick después).
+//  Después de ejecutar un comando (ej: "navegar a Entrada"), el sistema
+//  quedaba sordo: el STT no se reactivaba y el wake word tampoco.
 //
-//  BUG 3 (el bug del "Oye compas"): Cuando Porcupine está activo,
-//    el STT NO debería estar corriendo. Pero si por cualquier razón el STT
-//    captura el wake word, _processCommand lo enviaba al coordinator que
-//    estaba en CoordinatorState.idle → "Estado incorrecto".
-//    FIX: filtro de wake word en _processCommand. Si el texto es solo
-//    "oye compas" (o variantes), lo ignoramos silenciosamente.
-//    Además: exponer wakeWordActive setter para que el coordinator
-//    informe a este servicio si Porcupine está activo.
+//  Flujo roto en v3.x:
+//    1. WakeWordService detecta "Oye COMPAS" → cierra su sesión STT.
+//    2. Coordinator llama startListening() → STT escucha → usuario habla.
+//    3. _onSpeechResult() recibe el comando final → _processCommand().
+//    4. _onSpeechStatus('done') → markIdle() en STTSessionManager. ✅
+//    5. Coordinator ejecuta el intent y habla TTS.
+//    6. TTS termina → VoiceNavigationService._resumeWakeWord().
+//    7. ❌ _resumeWakeWord() hace un early return porque _queue.isNotEmpty
+//       (la instrucción de navegación TTS aún está en cola).
+//    8. ❌ WakeWordService nunca hace resume() → ya no escucha nada.
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v2.
+//  Adicionalmente en STTSessionManager v1.x:
+//    _minTimeBetweenSessions (500ms) bloqueaba canStart() si el coordinator
+//    intentaba abrir el STT justo al terminar el TTS.
+//
+// ============================================================================
+// SOLUCIÓN v4.0
+// ============================================================================
+//
+//  1. _autoRestartWakeWord() — llamado al final de _processCommand() y en
+//     _onSpeechStatus('done'). Espera a que el TTS termine (con timeout)
+//     antes de hacer resume() en WakeWordService. No depende de que
+//     VoiceNavigationService._resumeWakeWord() haga el trabajo.
+//
+//  2. El coordinator ya no necesita orquestar el reinicio del wake word
+//     desde fuera. Este servicio se auto-gestiona.
+//
+//  3. STTSessionManager v2.0: sin _minTimeBetweenSessions, sin timers
+//     internos. canStart() solo verifica el estado FSM.
+//
+//  4. Separación clara de responsabilidades:
+//     - IntegratedVoiceCommandService: gestiona el STT de comandos.
+//     - WakeWordService: gestiona detección del wake word.
+//     - VoiceNavigationService: gestiona el TTS de guía.
+//     - Coordinator (NavigationCoordinator): orquesta el flujo alto nivel.
+//
+// ============================================================================
+// NOTAS SOBRE speech_to_text (documentación oficial)
+// ============================================================================
+//
+//  El paquete speech_to_text está diseñado para "comandos cortos y frases
+//  breves, no para conversión continua o escucha siempre activa".
+//  (https://pub.dev/packages/speech_to_text)
+//
+//  La estrategia correcta para un asistente de voz es:
+//    - WakeWordService: sesión larga con pauseFor alto → detecta el wake word.
+//    - IntegratedVoiceCommandService: sesión corta por demanda → captura el
+//      comando → cierra → devuelve control a WakeWordService.
+//
+//  Este archivo implementa exactamente ese patrón.
 
 import 'dart:async';
-import 'package:logger/logger.dart';
+import 'package:flutter/foundation.dart';
 import 'package:speech_to_text/speech_recognition_error.dart' as stt;
 import 'package:speech_to_text/speech_recognition_result.dart' as stt;
 import 'package:speech_to_text/speech_to_text.dart' as stt;
@@ -39,133 +70,174 @@ import '../../models/shared_models.dart';
 import 'voice_command_classifier.dart';
 import 'robot_fsm.dart';
 import 'stt_session_manager.dart';
+import 'wake_word_service.dart';
 
 class IntegratedVoiceCommandService {
   static final IntegratedVoiceCommandService _instance =
-  IntegratedVoiceCommandService._internal();
+      IntegratedVoiceCommandService._internal();
   factory IntegratedVoiceCommandService() => _instance;
   IntegratedVoiceCommandService._internal();
 
-  final Logger                 _logger         = Logger();
-  final stt.SpeechToText       _speech         = stt.SpeechToText();
-  final VoiceCommandClassifier _classifier     = VoiceCommandClassifier();
-  final RobotFSM               _fsm            = RobotFSM();
-  final STTSessionManager      _sessionManager = STTSessionManager();
+  // ─── Dependencias ──────────────────────────────────────────────────────────
+
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  final VoiceCommandClassifier _classifier = VoiceCommandClassifier();
+  final RobotFSM _fsm = RobotFSM();
+  final STTSessionManager _sessionManager = STTSessionManager();
 
   STTSessionManager get sessionManager => _sessionManager;
 
-  bool   _isInitialized     = false;
-  bool   _isListening       = false;
-  bool   _isProcessing      = false;
-  String _lastPartialText   = '';
-  int    _consecutiveErrors = 0;
+  // ─── Referencias externas ──────────────────────────────────────────────────
 
-  // ✅ BUG 3 FIX: el coordinator avisa si Porcupine está activo.
-  // Cuando es true, filtramos el wake word si el STT lo captura por error.
-  bool _wakeWordActive = false;
-  void setWakeWordActive(bool active) => _wakeWordActive = active;
+  /// Inyectado por el coordinator para poder hacer resume() post-TTS.
+  WakeWordService? _wakeWordService;
 
-  // Frases de wake word que el STT podría capturar accidentalmente
+  /// Callback que el coordinator registra para saber si el TTS está hablando.
+  /// Si es null, no se espera al TTS antes de reactivar el wake word.
+  bool Function()? isTtsSpeaking;
+
+  // ─── Estado interno ────────────────────────────────────────────────────────
+
+  bool _isInitialized = false;
+  bool _isListening = false;
+  bool _isProcessing = false;
+  String _lastPartialText = '';
+  int _consecutiveErrors = 0;
+
+  /// ✅ Bandera de control: true mientras el sistema está en modo "escucha
+  /// activa" (wake word detectado, esperando comando). Permite que
+  /// _autoRestartWakeWord() sepa si debe reactivar el wake word o no.
+  bool _wakeWordModeActive = false;
+
+  // Variantes de wake word que el STT podría capturar accidentalmente
+  // al solaparse la sesión de WakeWordService con la de comandos.
   static const List<String> _wakeWordVariants = [
     'oye compas',
     'oye compass',
     'oye comas',
     'oy compas',
     'hoy compas',
+    'hey compas',
+    'hey compass',
   ];
 
-  static const Duration _pauseTimeout = Duration(milliseconds: 4500);
+  // ─── Configuración STT ─────────────────────────────────────────────────────
+
+  /// Tiempo que el STT espera silencio antes de enviar resultado final.
+  /// Android ignora valores > ~5s en muchos dispositivos.
+  static const Duration _pauseFor = Duration(milliseconds: 4500);
+
+  /// Tiempo máximo de escucha por sesión de comando.
+  static const Duration _listenFor = Duration(seconds: 15);
+
   static const int _maxConsecutiveErrors = 3;
 
-  // ─── Callbacks ────────────────────────────────────────────────────────────
+  // ─── Cooldown entre sesiones STT ───────────────────────────────────────────
+
+  /// Tiempo mínimo entre el cierre de una sesión STT y la apertura de otra.
+  /// Necesario en Android para que el SpeechRecognizer libere el hardware.
+  /// Más corto que en v1.x porque STTSessionManager ya no impone su propio
+  /// cooldown — este es el único punto de control.
+  static const Duration _sessionCooldown = Duration(milliseconds: 600);
+
+  DateTime? _lastSessionClosedAt;
+
+  // ─── Callbacks ─────────────────────────────────────────────────────────────
 
   Function(NavigationIntent)? onCommandDetected;
   Function(NavigationIntent)? onCommandExecuted;
-  Function(String)?           onCommandRejected;
-  Function(String)?           onStatusUpdate;
-  Function(String partialText)? onPartialResult;
+  Function(String)? onCommandRejected;
+  Function(String)? onStatusUpdate;
+  Function(String)? onPartialResult;
 
-  // ─── Inicialización ───────────────────────────────────────────────────────
+  // ─── Inicialización ────────────────────────────────────────────────────────
 
   Future<void> initialize() async {
-    if (_isInitialized) {
-      _logger.w('Servicio ya inicializado');
-      return;
-    }
+    if (_isInitialized) return;
+
+    await _ensurePermissions();
+
+    final available = await _speech.initialize(
+      onError: _onSpeechError,
+      onStatus: _onSpeechStatus,
+      debugLogging: false,
+    );
+
+    if (!available) throw Exception('speech_to_text no disponible');
 
     try {
-      _logger.i('Inicializando IntegratedVoiceCommandService v3...');
-
-      await _ensurePermissions();
-
-      final available = await _speech.initialize(
-        onError:      _onSpeechError,
-        onStatus:     _onSpeechStatus,
-        debugLogging: false,
-      );
-
-      if (!available) {
-        throw Exception('Speech recognition no disponible');
-      }
-
-      try {
-        _logger.i('Intentando inicializar TFLite...');
-        await _classifier.initialize();
-        _logger.i('✅ TFLite inicializado');
-      } catch (e) {
-        _logger.w('⚠️ TFLite no disponible: $e');
-        _logger.i('📌 Usando clasificación por keywords (fallback)');
-      }
-
-      _isInitialized = true;
-      _logger.i('✅ IntegratedVoiceCommandService v3 listo');
-      _logger.i('   pauseFor: ${_pauseTimeout.inMilliseconds}ms');
-
+      await _classifier.initialize();
+      _log('✅ Clasificador TFLite listo');
     } catch (e) {
-      _logger.e('❌ Error inicializando servicio: $e');
-      rethrow;
+      _log('⚠️ TFLite no disponible — usando keyword fallback: $e');
     }
+
+    _isInitialized = true;
+    _log('v4.0 lista');
   }
 
   Future<void> _ensurePermissions() async {
-    final micStatus = await Permission.microphone.status;
-
-    if (micStatus.isDenied) {
+    final status = await Permission.microphone.status;
+    if (status.isDenied) {
       final result = await Permission.microphone.request();
-      if (!result.isGranted) {
-        throw Exception('Permiso de micrófono denegado');
-      }
+      if (!result.isGranted) throw Exception('Permiso de micrófono denegado');
     }
-
-    if (micStatus.isPermanentlyDenied) {
-      throw Exception('Permiso permanentemente denegado. Ve a Ajustes.');
+    if (status.isPermanentlyDenied) {
+      throw Exception('Permiso permanentemente denegado — ir a Ajustes');
     }
-
-    _logger.i('✅ Permisos verificados');
   }
 
-  // ─── Control de escucha ───────────────────────────────────────────────────
+  // ─── Inyección de dependencias ─────────────────────────────────────────────
+
+  /// Llamado por el coordinator para conectar el WakeWordService.
+  /// Permite que este servicio reactive el wake word tras cada comando.
+  void attachWakeWordService(WakeWordService wakeWordService) {
+    _wakeWordService = wakeWordService;
+    _log('WakeWordService conectado');
+  }
+
+  void setWakeWordActive(bool active) {
+    _wakeWordModeActive = active;
+  }
+
+  /// Informa a este servicio si está activo en modo "post-wake-word".
+  /// Cuando es true, después de procesar un comando se reactivará
+  /// el wake word automáticamente.
+  void setWakeWordModeActive(bool active) {
+    _wakeWordModeActive = active;
+    _log('wakeWordMode=$active');
+  }
+
+  // ─── startListening ────────────────────────────────────────────────────────
 
   Future<void> startListening() async {
     if (!_isInitialized) throw StateError('Servicio no inicializado');
-
     if (_isListening) {
-      _logger.w('Ya está escuchando');
+      _log('⚠️ Ya escuchando');
       return;
+    }
+
+    // Respetar cooldown para que Android libere el SpeechRecognizer.
+    if (_lastSessionClosedAt != null) {
+      final elapsed = DateTime.now().difference(_lastSessionClosedAt!);
+      if (elapsed < _sessionCooldown) {
+        final remaining = _sessionCooldown - elapsed;
+        _log('Cooldown: esperando ${remaining.inMilliseconds}ms');
+        await Future.delayed(remaining);
+      }
     }
 
     try {
       await _startListeningSession();
     } catch (e) {
-      _logger.e('Error iniciando escucha: $e');
       _consecutiveErrors++;
-
+      _log(
+        '❌ Error iniciando ($e) — intento $_consecutiveErrors/$_maxConsecutiveErrors',
+      );
       if (_consecutiveErrors < _maxConsecutiveErrors) {
-        _logger.w('Reintentando... (${_consecutiveErrors}/$_maxConsecutiveErrors)');
         await Future.delayed(const Duration(milliseconds: 500));
         await startListening();
       } else {
-        _logger.e('Demasiados errores consecutivos, abortando');
         _consecutiveErrors = 0;
         rethrow;
       }
@@ -173,196 +245,210 @@ class IntegratedVoiceCommandService {
   }
 
   Future<void> _startListeningSession() async {
-    if (!await _sessionManager.markStarting()) {
-      _logger.w('⚠️ Session manager rechazó inicio — estado: ${_sessionManager.state.name}');
+    if (!_sessionManager.markStarting()) {
+      _log('Session manager rechazó el inicio');
       return;
     }
 
     if (_isProcessing) {
-      _logger.w('⚠️ Procesando comando, cancelando inicio');
+      _log('⚠️ Procesando — cancelando apertura');
       _sessionManager.markIdle();
       return;
     }
 
     _lastPartialText = '';
 
-    final options = stt.SpeechListenOptions(
-      partialResults:       true,
-      onDevice:             false,
-      autoPunctuation:      false,
-      enableHapticFeedback: false,
-      cancelOnError:        false,
-      listenMode:           stt.ListenMode.confirmation,
-    );
-
     try {
       await _speech.listen(
-        onResult:     _onSpeechResult,
-        pauseFor:     _pauseTimeout,
-        localeId:     'es_CO',
-        listenOptions: options,
+        onResult: _onSpeechResult,
+        listenFor: _listenFor,
+        pauseFor: _pauseFor,
+        localeId: 'es_CO',
+        listenOptions: stt.SpeechListenOptions(
+          partialResults: true,
+          cancelOnError: false,
+          listenMode: stt.ListenMode.confirmation,
+          onDevice: false,
+          autoPunctuation: false,
+          enableHapticFeedback: false,
+        ),
       );
 
       _isListening = true;
       _sessionManager.markActive();
-      _logger.i('✅ Sesión STT activa (pauseFor=${_pauseTimeout.inMilliseconds}ms)');
+      _consecutiveErrors = 0;
+      _log(
+        '✅ Escuchando (pauseFor=${_pauseFor.inMs}ms, listenFor=${_listenFor.inSeconds}s)',
+      );
       onStatusUpdate?.call('Escuchando...');
-
     } catch (e) {
-      _logger.e('Error iniciando sesión STT: $e');
       _isListening = false;
-      _sessionManager.markIdle(); // ✅ Siempre limpiar el estado
-
+      _sessionManager.markIdle();
       if (e.toString().contains('error_busy')) {
-        _logger.w('STT ocupado, esperando 1s...');
+        _log('STT ocupado — esperando 1s antes de reintentar');
         await Future.delayed(const Duration(seconds: 1));
       }
-
       rethrow;
     }
   }
 
-  // ─── Resultado de voz ─────────────────────────────────────────────────────
+  // ─── stopListening ─────────────────────────────────────────────────────────
 
-  void _onSpeechResult(stt.SpeechRecognitionResult result) {
-    final text = result.recognizedWords.trim();
-
-    if (text.isEmpty) return;
-
-    if (result.finalResult) {
-      _logger.i('✅ STT final: "$text"');
-      _processCommand(text);
-    } else {
-      if (text != _lastPartialText) {
-        _lastPartialText = text;
-        _logger.d('⏳ STT parcial: "$text"');
-        onPartialResult?.call(text);
-      }
-    }
-  }
-
-  // ─── Procesamiento del comando ────────────────────────────────────────────
-
-  Future<void> _processCommand(String text) async {
-    if (_isProcessing) {
-      _logger.w('Ya procesando comando');
+  Future<void> stopListening() async {
+    if (!_isListening && !_isProcessing && _sessionManager.isIdle) {
       return;
     }
 
-    // ✅ BUG 3 FIX: filtrar wake word si Porcupine está activo.
-    // El STT a veces captura el propio wake word cuando se solapa con
-    // el inicio/fin de sesión de Porcupine. Ignorarlo silenciosamente.
-    if (_wakeWordActive) {
-      final normalized = text.toLowerCase().trim();
-      if (_wakeWordVariants.any((v) => normalized == v || normalized.startsWith(v))) {
-        _logger.w('⚠️ STT capturó wake word accidentalmente — ignorado: "$text"');
-        return;
+    _log('Deteniendo STT...');
+    _isListening = false;
+    _isProcessing = false;
+    _consecutiveErrors = 0;
+
+    try {
+      if (_speech.isListening) {
+        await _speech.stop();
       }
+    } catch (e) {
+      _log('⚠️ Error en stop(): $e');
+      _sessionManager.forceReset();
+      return;
+    }
+
+    _lastSessionClosedAt = DateTime.now();
+    _sessionManager.markIdle();
+    onStatusUpdate?.call('Escucha detenida');
+  }
+
+  // ─── Resultado STT ─────────────────────────────────────────────────────────
+
+  void _onSpeechResult(stt.SpeechRecognitionResult result) {
+    final text = result.recognizedWords.trim();
+    if (text.isEmpty) return;
+
+    if (result.finalResult) {
+      _log('STT final: "$text"');
+      _processCommand(text);
+    } else if (text != _lastPartialText) {
+      _lastPartialText = text;
+      onPartialResult?.call(text);
+    }
+  }
+
+  // ─── Procesamiento del comando ─────────────────────────────────────────────
+
+  Future<void> _processCommand(String text) async {
+    if (_isProcessing) {
+      _log('⚠️ Ya procesando');
+      return;
+    }
+
+    // Filtrar si el STT capturó accidentalmente el wake word.
+    final normalized = text.toLowerCase().trim();
+    if (_wakeWordModeActive &&
+        _wakeWordVariants.any(
+          (v) => normalized == v || normalized.startsWith(v),
+        )) {
+      _log('⚠️ Wake word capturado por STT — ignorado: "$text"');
+      return;
+    }
+
+    if (text.length < 2) {
+      _log('Texto muy corto — ignorado: "$text"');
+      return;
     }
 
     _isProcessing = true;
 
     try {
-      if (text.trim().isEmpty || text.length < 2) {
-        _logger.w('Texto muy corto ignorado: "$text"');
-        return;
-      }
-
-      _logger.i('📝 Texto capturado: "$text"');
+      _log('📝 Procesando: "$text"');
 
       final intent = NavigationIntent(
-        type:              IntentType.navigate,
-        target:            'forward',
-        priority:          5,
+        type: IntentType.navigate,
+        target: 'forward',
+        priority: 5,
         suggestedResponse: text,
       );
 
       _consecutiveErrors = 0;
-
-      // Notificar captura del texto
       onCommandDetected?.call(intent);
 
-      // ✅ BUG 2 FIX: onCommandExecuted en el siguiente microtask.
-      // El coordinator necesita que onCommandDetected haya guardado
-      // el texto (capturedText) ANTES de que onCommandExecuted lo use.
-      // Sin este delay eran síncronos y capturedText era null al ejecutar.
+      // ✅ Microtask garantiza que onCommandDetected termine (y el coordinator
+      // guarde el texto capturado) antes de que onCommandExecuted lo consuma.
       await Future.microtask(() {
         onCommandExecuted?.call(intent);
       });
-
-    } catch (e, stackTrace) {
-      _logger.e('Error procesando texto: $e\n$stackTrace');
+    } catch (e) {
+      _log('❌ Error procesando: $e');
       _consecutiveErrors++;
     } finally {
       _isProcessing = false;
+      // ✅ v4.0: Reactivar el wake word después de cada comando, independiente
+      // de que el TTS haya terminado o no. La espera al TTS se hace internamente.
+      _autoRestartWakeWord();
     }
   }
 
-  // ─── Detener ──────────────────────────────────────────────────────────────
+  // ─── Auto-reinicio del wake word ───────────────────────────────────────────
 
-  Future<void> stopListening() async {
-    if (!_isListening && !_isProcessing && _sessionManager.isIdle) {
-      _logger.d('Ya detenido');
-      return;
+  /// Reactiva el WakeWordService después de que el TTS de respuesta termine.
+  ///
+  /// Este método es el núcleo del fix v4.0. En versiones anteriores, el
+  /// reinicio dependía de VoiceNavigationService._resumeWakeWord(), que
+  /// hacía early return si el TTS aún tenía items en cola.
+  ///
+  /// Aquí esperamos explícitamente a que el TTS termine (con timeout) antes
+  /// de llamar wakeWordService.resume(). Esto garantiza que el micrófono
+  /// no intente abrir dos sesiones simultáneas.
+  Future<void> _autoRestartWakeWord() async {
+    if (!_wakeWordModeActive) return;
+    final wws = _wakeWordService;
+    if (wws == null || !wws.isInitialized) return;
+
+    // Esperar a que el TTS de confirmación termine antes de abrir el mic.
+    // Max 8 segundos — si el TTS no termina en ese tiempo, reactivar igual.
+    const Duration ttsWaitTimeout = Duration(seconds: 8);
+    const Duration pollInterval = Duration(milliseconds: 200);
+    final deadline = DateTime.now().add(ttsWaitTimeout);
+
+    while (DateTime.now().isBefore(deadline)) {
+      final speaking = isTtsSpeaking?.call() ?? false;
+      if (!speaking) break;
+      await Future.delayed(pollInterval);
     }
 
-    _logger.i('Deteniendo escucha...');
-    _isListening      = false;
-    _isProcessing     = false;
-    _consecutiveErrors = 0;
+    // Cooldown adicional para que Android libere el canal de audio del TTS.
+    await Future.delayed(const Duration(milliseconds: 400));
+
+    if (!_wakeWordModeActive)
+      return; // pudo haberse desactivado durante la espera
 
     try {
-      if (_speech.isListening) {
-        _sessionManager.markStopping();
-        await _speech.stop();
-      }
-      _sessionManager.markIdle();
-      _logger.d('⏹️ Sesión STT cerrada');
+      await wws.resume();
+      _log('✅ Wake word reactivado post-comando');
     } catch (e) {
-      _logger.e('Error deteniendo STT: $e');
-      _sessionManager.forceReset();
-    }
-
-    onStatusUpdate?.call('Escucha detenida');
-  }
-
-  // ─── Callbacks de error y estado ─────────────────────────────────────────
-
-  void _onSpeechError(stt.SpeechRecognitionError error) {
-    _logger.e('STT Error: ${error.errorMsg} (permanent: ${error.permanent})');
-
-    if (error.errorMsg == 'error_busy') {
-      _logger.w('⚠️ STT busy (esperado durante transición), ignorando');
-      return;
-    }
-
-    if (error.errorMsg == 'error_speech_timeout' && _lastPartialText.isEmpty) {
-      _logger.d('Timeout por silencio (nadie habló)');
-      return;
-    }
-
-    _consecutiveErrors++;
-
-    if (error.permanent || _consecutiveErrors >= _maxConsecutiveErrors) {
-      _logger.e('Error permanente o límite alcanzado, deteniendo STT');
-      stopListening();
-      onStatusUpdate?.call('Error de reconocimiento');
+      _log('⚠️ Error reactivando wake word: $e');
     }
   }
+
+  // ─── Callbacks STT ─────────────────────────────────────────────────────────
 
   void _onSpeechStatus(String status) {
-    _logger.d('STT Status: $status');
+    _log('STT status: $status');
 
     if (status == 'done' || status == 'notListening') {
+      final wasListening = _isListening;
       _isListening = false;
+      _lastSessionClosedAt = DateTime.now();
 
-      // ✅ BUG 1 FIX: marcar el session manager como idle cuando el STT
-      // termina por su cuenta (pauseFor expirado, fin natural de sesión).
-      // Sin esto el coordinator veía sessionManager.isIdle==false y entraba
-      // en un bucle intentando detener un STT que ya había terminado.
       if (!_sessionManager.isIdle) {
-        _logger.d('🔄 STT terminó solo → markIdle()');
         _sessionManager.markIdle();
+      }
+
+      // Si la sesión terminó sola sin que procesáramos un comando (ej: timeout
+      // de silencio), y estamos en modo wake word → reactivar.
+      if (wasListening && !_isProcessing && _wakeWordModeActive) {
+        _log('STT terminó sin resultado → reactivando wake word');
+        _autoRestartWakeWord();
       }
     }
 
@@ -371,74 +457,73 @@ class IntegratedVoiceCommandService {
     }
   }
 
-  // ─── Helpers ─────────────────────────────────────────────────────────────
+  void _onSpeechError(stt.SpeechRecognitionError error) {
+    // error_busy: transición normal entre sesiones — ignorar.
+    if (error.errorMsg == 'error_busy') return;
 
-  VoiceCommandResult _fallbackClassification(String text) {
-    final normalized = text.toLowerCase().trim();
-
-    if (normalized.contains('muev') || normalized.contains('adelante') ||
-        normalized.contains('avanza') || normalized.contains('camina') ||
-        normalized.contains('anda')   || normalized.contains('sigue')  ||
-        normalized.contains('vamos')  || normalized.contains('forward')) {
-      return VoiceCommandResult(label: 'MOVE', confidence: 0.80, passesThreshold: true, threshold: 0.65, inferenceTimeMs: 0, logits: []);
-    }
-    if (normalized.contains('para')  || normalized.contains('det') ||
-        normalized.contains('stop')  || normalized.contains('alto') ||
-        normalized.contains('quieto')|| normalized.contains('frena')) {
-      return VoiceCommandResult(label: 'STOP', confidence: 0.90, passesThreshold: true, threshold: 0.65, inferenceTimeMs: 0, logits: []);
-    }
-    if (normalized.contains('izquierda') || normalized.contains('izq') || normalized.contains('left')) {
-      return VoiceCommandResult(label: 'TURN_LEFT', confidence: 0.75, passesThreshold: true, threshold: 0.60, inferenceTimeMs: 0, logits: []);
-    }
-    if (normalized.contains('derecha') || normalized.contains('der') || normalized.contains('right')) {
-      return VoiceCommandResult(label: 'TURN_RIGHT', confidence: 0.75, passesThreshold: true, threshold: 0.60, inferenceTimeMs: 0, logits: []);
-    }
-    if (normalized.contains('ayuda') || normalized.contains('help') || normalized.contains('auxilio')) {
-      return VoiceCommandResult(label: 'HELP', confidence: 0.85, passesThreshold: true, threshold: 0.70, inferenceTimeMs: 0, logits: []);
-    }
-    if (normalized.contains('repite') || normalized.contains('repeat') || normalized.contains('otra vez')) {
-      return VoiceCommandResult(label: 'REPEAT', confidence: 0.70, passesThreshold: true, threshold: 0.55, inferenceTimeMs: 0, logits: []);
+    // error_speech_timeout: silencio prolongado — reiniciar si en modo wake word.
+    if (error.errorMsg == 'error_speech_timeout') {
+      _isListening = false;
+      _lastSessionClosedAt = DateTime.now();
+      _sessionManager.markIdle();
+      if (_wakeWordModeActive && !_isProcessing) {
+        _autoRestartWakeWord();
+      }
+      return;
     }
 
-    return VoiceCommandResult(label: 'UNKNOWN', confidence: 0.30, passesThreshold: false, threshold: 0.50, inferenceTimeMs: 0, logits: []);
-  }
-
-  Action _labelToAction(String label) {
-    switch (label) {
-      case 'MOVE':       return Action.move;
-      case 'STOP':       return Action.stop;
-      case 'TURN_LEFT':  return Action.turnLeft;
-      case 'TURN_RIGHT': return Action.turnRight;
-      case 'REPEAT':     return Action.repeat;
-      case 'HELP':       return Action.help;
-      default:           return Action.unknown;
+    // error_client: race condition de Android al abrir sesión muy rápido.
+    // No es fatal — reintentar con delay mayor.
+    if (error.errorMsg == 'error_client') {
+      _log('error_client — esperando 1500ms antes de reintentar');
+      _isListening = false;
+      _lastSessionClosedAt = DateTime.now();
+      _sessionManager.markIdle();
+      if (_wakeWordModeActive && !_isProcessing) {
+        Future.delayed(const Duration(milliseconds: 1500), () {
+          if (_wakeWordModeActive && !_isProcessing) {
+            _autoRestartWakeWord();
+          }
+        });
+      }
+      return;
     }
-  }
 
-  NavigationIntent _actionToIntent(Action action, String text) {
-    switch (action) {
-      case Action.move:      return NavigationIntent(type: IntentType.navigate, target: 'forward', priority: 8, suggestedResponse: 'Avanzando');
-      case Action.stop:      return NavigationIntent(type: IntentType.stop,     target: '',        priority: 10, suggestedResponse: 'Deteniéndome');
-      case Action.turnLeft:  return NavigationIntent(type: IntentType.navigate, target: 'left',    priority: 7, suggestedResponse: 'Girando a la izquierda');
-      case Action.turnRight: return NavigationIntent(type: IntentType.navigate, target: 'right',   priority: 7, suggestedResponse: 'Girando a la derecha');
-      case Action.help:      return NavigationIntent(type: IntentType.help,     target: '',        priority: 9, suggestedResponse: 'Activando ayuda');
-      default:               return NavigationIntent.unknown();
+    _log('STT error: ${error.errorMsg} (permanent=${error.permanent})');
+    _isListening = false;
+    _lastSessionClosedAt = DateTime.now();
+    _sessionManager.markIdle();
+    _consecutiveErrors++;
+
+    if (error.permanent || _consecutiveErrors >= _maxConsecutiveErrors) {
+      _log('❌ Error permanente o límite alcanzado');
+      _consecutiveErrors = 0;
+      return;
+    }
+
+    // Error recuperable → reintentar con delay.
+    if (_wakeWordModeActive && !_isProcessing) {
+      Future.delayed(const Duration(seconds: 2), _autoRestartWakeWord);
     }
   }
 
-  Future<void> setSpeechRate(double rate) async {}
-  Future<void> setVolume(double volume) async {}
+  // ─── Getters y helpers ─────────────────────────────────────────────────────
+
+  bool get isInitialized => _isInitialized;
+  bool get isListening => _isListening;
+  bool get isProcessing => _isProcessing;
+  bool get wakeWordModeActive => _wakeWordModeActive;
 
   Map<String, dynamic> getStatistics() => {
-    'is_initialized':    _isInitialized,
-    'is_listening':      _isListening,
-    'is_processing':     _isProcessing,
+    'is_initialized': _isInitialized,
+    'is_listening': _isListening,
+    'is_processing': _isProcessing,
     'consecutive_errors': _consecutiveErrors,
-    'session_state':     _sessionManager.state.name,
-    'pause_timeout_ms':  _pauseTimeout.inMilliseconds,
-    'wake_word_active':  _wakeWordActive,
-    'fsm_stats':         _fsm.getStatistics(),
-    'classifier_stats':  {'inference_count': _classifier.inferenceCount},
+    'session_state': _sessionManager.state.name,
+    'wake_word_mode': _wakeWordModeActive,
+    'pause_for_ms': _pauseFor.inMilliseconds,
+    'session_cooldown_ms': _sessionCooldown.inMilliseconds,
+    'fsm_stats': _fsm.getStatistics(),
   };
 
   void resetFSM() {
@@ -446,14 +531,24 @@ class IntegratedVoiceCommandService {
     _consecutiveErrors = 0;
   }
 
-  bool get isInitialized => _isInitialized;
-  bool get isListening   => _isListening;
-  bool get isProcessing  => _isProcessing;
+  static void _log(String msg) {
+    assert(() {
+      debugPrint('[VoiceCmd] $msg');
+      return true;
+    }());
+  }
 
   void dispose() {
     stopListening();
     _classifier.dispose();
     _sessionManager.dispose();
-    _logger.i('IntegratedVoiceCommandService disposed');
+    _wakeWordService = null;
+    isTtsSpeaking = null;
   }
+}
+
+// ─── Extensión de conveniencia ────────────────────────────────────────────────
+
+extension _DurationMs on Duration {
+  int get inMs => inMilliseconds;
 }

@@ -23,12 +23,12 @@ dependencies:
   # ══════════════════════════════════════════════════════════
   speech_to_text: ^7.0.0        # STT
   flutter_tts: ^4.0.2           # TTS
-  porcupine_flutter: ^4.0.0 # Wake word detection
+  # porcupine_flutter: ^4.0.0 # Wake word detection
 
   # ══════════════════════════════════════════════════════════
   # ✅ AUDIO (OPCIONAL - para grabar)
   # ══════════════════════════════════════════════════════════
-  record: ^5.1.2
+  record: ^6.0.0
   audioplayers: ^6.1.0
   audio_session: ^0.1.16
 
@@ -36,6 +36,8 @@ dependencies:
   # ✅ CÁMARA (SOLO para Environment Recognition)
   # ══════════════════════════════════════════════════════════
   camera: ^0.11.0+2
+
+  image: ^4.2.0
 
   # ══════════════════════════════════════════════════════════
   # ✅ NETWORKING
@@ -80,7 +82,7 @@ dev_dependencies:
 flutter_launcher_icons: # ← Nueva sección aquí (nivel flutter:)
   android: true
   ios: true
-  image_path: "assets/images/compas_V3.png"  # Tu logo listo
+  image_path: "assets/images/compas_V4.jpeg"  # Tu logo listo
   min_sdk_android: 21  # Adaptive icons
 
 flutter:
@@ -93,4 +95,5 @@ flutter:
     - assets/wake_words/porcupine_params_es.pv
     - .env
     - assets/images/
-    - assets/images/compas_V3.png
+    - assets/images/compas_V4.jpeg
+    - assets/models/deeplabv3_plus.tflite

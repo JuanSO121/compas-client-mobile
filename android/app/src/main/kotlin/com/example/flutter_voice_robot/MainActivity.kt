@@ -1,6 +1,5 @@
 package com.example.flutter_voice_robot
 
-// ✅ Se deja una sola importación
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -12,7 +11,9 @@ import com.google.android.gms.common.ConnectionResult
 import kotlinx.coroutines.*
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
 
-class MainActivity: FlutterActivity() {
+class MainActivity : FlutterActivity() {
+
+    // ─── google_ai_edge ───────────────────────────────────────────────────
     private val CHANNEL = "google_ai_edge"
     private var llmInference: LlmInference? = null
     private val coroutineScope = CoroutineScope(Dispatchers.Main + Job())
@@ -20,130 +21,117 @@ class MainActivity: FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            when (call.method) {
-                "getAndroidVersion" -> {
-                    result.success(Build.VERSION.SDK_INT)
-                }
+        // ❌ AEC eliminado (menos carga CPU / audio / GC)
 
-                "checkPlayServices" -> {
-                    val available = isGooglePlayServicesAvailable()
-                    result.success(available)
-                }
+        // ─── google_ai_edge ───────────────────────────────────────────────
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
 
-                "getTotalRAM" -> {
-                    val ramGB = getTotalRAMInGB()
-                    result.success(ramGB)
-                }
+                    "getAndroidVersion" -> {
+                        result.success(Build.VERSION.SDK_INT)
+                    }
 
-                "initialize" -> {
-                    coroutineScope.launch {
-                        try {
-                            initializeAIEdge()
-                            result.success(mapOf(
-                                "success" to true,
-                                "modelPath" to "gemini-nano"
-                            ))
-                        } catch (e: Exception) {
-                            result.error("INIT_ERROR", e.message, null)
+                    "checkPlayServices" -> {
+                        result.success(isGooglePlayServicesAvailable())
+                    }
+
+                    "getTotalRAM" -> {
+                        result.success(getTotalRAMInGB())
+                    }
+
+                    "initialize" -> {
+                        coroutineScope.launch {
+                            try {
+                                initializeAIEdge()
+                                result.success(mapOf(
+                                    "success"   to true,
+                                    "modelPath" to "gemini-nano"
+                                ))
+                            } catch (e: Exception) {
+                                result.error("INIT_ERROR", e.message, null)
+                            }
                         }
                     }
-                }
 
-                "generateText" -> {
-                    val prompt = call.argument<String>("prompt")
-                    val maxTokens = call.argument<Int>("maxTokens") ?: 100
-                    val temperature = call.argument<Double>("temperature") ?: 0.7
+                    "generateText" -> {
+                        val prompt      = call.argument<String>("prompt")
+                        val maxTokens   = call.argument<Int>("maxTokens") ?: 100
+                        val temperature = call.argument<Double>("temperature") ?: 0.7
 
-                    if (prompt == null) {
-                        result.error("INVALID_ARGS", "Prompt requerido", null)
-                        return@setMethodCallHandler
-                    }
+                        if (prompt == null) {
+                            result.error("INVALID_ARGS", "Prompt requerido", null)
+                            return@setMethodCallHandler
+                        }
 
-                    coroutineScope.launch {
-                        try {
-                            val generatedText = generateText(prompt, maxTokens, temperature)
-                            result.success(mapOf("text" to generatedText))
-                        } catch (e: Exception) {
-                            result.error("GENERATION_ERROR", e.message, null)
+                        coroutineScope.launch {
+                            try {
+                                result.success(mapOf(
+                                    "text" to generateText(prompt, maxTokens, temperature)
+                                ))
+                            } catch (e: Exception) {
+                                result.error("GENERATION_ERROR", e.message, null)
+                            }
                         }
                     }
-                }
 
-                else -> {
-                    result.notImplemented()
+                    else -> result.notImplemented()
                 }
             }
-        }
     }
 
-    /**
-     * Inicializar Google AI Edge (MediaPipe LLM Inference)
-     */
+    // ─── Lifecycle FIX ───────────────────────────────────────────────────
+
+    override fun onPause() {
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+    }
+
+    override fun onStop() {
+        super.onStop()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+    }
+
+    // ─── AI Edge helpers ──────────────────────────────────────────────────
+
     private suspend fun initializeAIEdge() = withContext(Dispatchers.IO) {
-        try {
-            // Opciones de configuración
-            val options = LlmInference.LlmInferenceOptions.builder()
-                .setModelPath("/data/local/tmp/llm/model.bin") // Ruta del modelo
-                .setMaxTokens(512)
-                .setTemperature(0.7f)
-                .setTopK(40)
-                .setRandomSeed(42)
-                .build()
+        val options = LlmInference.LlmInferenceOptions.builder()
+            .setModelPath("/data/local/tmp/llm/model.bin")
+            .setMaxTokens(512)
+            .setTemperature(0.7f)
+            .setTopK(40)
+            .setRandomSeed(42)
+            .build()
 
-            // Crear instancia
-            llmInference = LlmInference.createFromOptions(applicationContext, options)
-
-        } catch (e: Exception) {
-            throw Exception("Error inicializando AI Edge: ${e.message}")
-        }
+        llmInference = LlmInference.createFromOptions(applicationContext, options)
     }
 
-    /**
-     * Generar texto con el modelo local
-     */
     private suspend fun generateText(
         prompt: String,
         maxTokens: Int,
         temperature: Double
     ): String = withContext(Dispatchers.IO) {
-
-        if (llmInference == null) {
-            throw Exception("Modelo no inicializado")
-        }
-
-        try {
-            // Generar texto de forma síncrona
-            val response = llmInference!!.generateResponse(prompt)
-
-            return@withContext response ?: ""
-
-        } catch (e: Exception) {
-            throw Exception("Error generando texto: ${e.message}")
-        }
+        llmInference?.generateResponse(prompt)
+            ?: throw Exception("Modelo no inicializado")
     }
 
-    /**
-     * Verificar si Google Play Services está disponible
-     */
     private fun isGooglePlayServicesAvailable(): Boolean {
         val apiAvailability = GoogleApiAvailability.getInstance()
-        val resultCode = apiAvailability.isGooglePlayServicesAvailable(this)
-        return resultCode == ConnectionResult.SUCCESS
+        return apiAvailability.isGooglePlayServicesAvailable(this) ==
+                ConnectionResult.SUCCESS
     }
 
-    /**
-     * Obtener RAM total del dispositivo en GB
-     */
     private fun getTotalRAMInGB(): Int {
-        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val memoryInfo = ActivityManager.MemoryInfo()
-        activityManager.getMemoryInfo(memoryInfo)
-
-        val totalRAMBytes = memoryInfo.totalMem
-        val totalRAMGB = (totalRAMBytes / (1024.0 * 1024.0 * 1024.0)).toInt()
-
-        return totalRAMGB
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val mi = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mi)
+        return (mi.totalMem / (1024.0 * 1024.0 * 1024.0)).toInt()
     }
 
     override fun onDestroy() {

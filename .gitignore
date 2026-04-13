@@ -44,5 +44,5 @@ app.*.map.json
 /android/app/release
 .env
 
-/unity/Compas_AR/
+/unity
 /android/unityLibrary/

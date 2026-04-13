@@ -154,12 +154,18 @@ class TokenPair {
 class AuthData {
   final TokenPair tokens;
   final UserData user;
-
+ 
+  // El backend retorna first_login: true en el primer login (verificación automática).
+  // Usamos defaultValue: false para que no rompa si el backend no lo incluye.
+  @JsonKey(name: 'first_login', defaultValue: false)
+  final bool? firstLogin;
+ 
   AuthData({
     required this.tokens,
     required this.user,
+    this.firstLogin,
   });
-
+ 
   factory AuthData.fromJson(Map<String, dynamic> json) =>
       _$AuthDataFromJson(json);
   Map<String, dynamic> toJson() => _$AuthDataToJson(this);
@@ -173,15 +179,18 @@ class UserData {
   final AccessibilityPreferences? accessibility;
   @JsonKey(name: 'last_login')
   final String? lastLogin;
-
+  @JsonKey(name: 'first_login', defaultValue: false)
+  final bool? firstLogin;
+ 
   UserData({
     required this.id,
     required this.email,
     this.profile,
     this.accessibility,
     this.lastLogin,
+    this.firstLogin,
   });
-
+ 
   factory UserData.fromJson(Map<String, dynamic> json) =>
       _$UserDataFromJson(json);
   Map<String, dynamic> toJson() => _$UserDataToJson(this);
