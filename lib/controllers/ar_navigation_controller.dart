@@ -1,29 +1,27 @@
 // lib/controllers/ar_navigation_controller.dart
 //
-// ✅ v9.2 — Delay de inicio de WakeWord hasta que AR salga de heavy-load
+// ✅ v9.3 — Hook de tutorial de bienvenida + intent "enséñame"
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v9.1 → v9.2
+// CAMBIOS v9.2 → v9.3
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  FIX 7 — _startWakeWordWhenReady(): retrasa el inicio del WakeWordService
-//    hasta que el bridge esté en estado ready Y hayan pasado al menos
-//    _wakeWordBootDelay (3s) desde que se marcó isSceneReady.
+//  1. onReadyForTutorial — nuevo callback VoidCallback? que ArNavigationScreen
+//     registra cuando showWelcomeTutorial == true.
+//     Se llama UNA SOLA VEZ al final de _goToReady(), después de que el TTS
+//     de navegación ya está operativo. De esta forma el saludo de bienvenida
+//     usa exactamente el mismo pipeline de audio que las instrucciones AR.
 //
-//    Causa raíz: durante la fase de inicialización de ARCore/Unity la CPU
-//    está saturada (GC >100ms, FeatureExtraction 117ms, fps reducido a 15).
-//    El WakeWordService abría sesión STT en ese momento y:
-//      a) Android cerraba la sesión por timeout (no había CPU para el VAD).
-//      b) error_no_match se disparaba porque FeatureExtraction no terminaba.
-//      c) error_client ocurría porque el recognizer anterior no se liberó.
-//    Resultado: 3 ciclos fallidos antes de detectar "oye compas".
+//  2. _tutorialCallbackFired — flag bool para que _goToReady() no llame
+//     el callback más de una vez aunque sea llamado por retry o reanudación.
 //
-//    Solución: esperar a que isSceneReady == true (bridge listo) y luego
-//    un margen adicional de 3s antes de llamar voiceNav + coordinator.start().
-//    Durante ese período el usuario ve el mensaje "Inicializando voz..." sin
-//    que el STT compita con la CPU de AR.
+//  3. coordinator.onCommandExecuted ampliado:
+//     El intent target "__app:tutorial" dispara onReadyForTutorial si aún
+//     no se reprodujo, o bien habla el contenido directamente.
+//     Esto permite que el usuario diga "Oye COMPAS, enséñame" en cualquier
+//     momento para escuchar el tutorial de nuevo.
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v9.1.
+//  TODO LO DEMÁS ES IDÉNTICO A v9.2.
 
 import 'dart:async';
 
@@ -176,19 +174,33 @@ class ArNavigationController extends ChangeNotifier {
   void Function(String reason)? onShowTrackingSnackBar;
   VoidCallback? onHideTrackingSnackBar;
 
+  // ─── ✅ v9.3 — Callback de tutorial ──────────────────────────────────────
+
+  /// Registrado por ArNavigationScreen cuando showWelcomeTutorial == true.
+  /// Se llama exactamente una vez al entrar en AppReadyState.ready,
+  /// después de que coordinator.speak() ya está operativo.
+  VoidCallback? onReadyForTutorial;
+
+  /// Flag para evitar que onReadyForTutorial se llame más de una vez.
+  bool _tutorialCallbackFired = false;
+
+  /// Contenido del tutorial. Usado tanto por el callback como por el
+  /// intent __app:tutorial (comando de voz "enséñame").
+  static const String tutorialScript =
+      'Puedo guiarte dentro de la biblioteca '
+      'Solo dime: Oye COMPAS, y a dodne queires ir, '
+      'También puedo avisarte si hay un obstáculo en tu camino, '
+      'y repetirte la última instrucción cuando quieras. '
+      'Para pausar la navegación di: Oye COMPAS, para. '
+      '¡Eso es todo! Estoy listo para ayudarte.';
+
   // ─── FIX 7: Delay de inicio de WakeWord ──────────────────────────────────
 
-  /// Tiempo mínimo desde isSceneReady antes de iniciar el STT del WakeWord.
-  /// Permite que ARCore/Unity terminen su fase de heavy-load (GC, shaders, etc.)
-  /// antes de que el STT compita por CPU.
   static const Duration _wakeWordBootDelay = Duration(seconds: 3);
 
-  /// Inicia el WakeWord solo cuando el bridge esté listo y haya pasado el delay.
-  /// Se llama una sola vez desde _goToReady().
   Future<void> _startWakeWordWhenReady() async {
     if (!_wakeWordAvailable) return;
 
-    // Esperar a que el bridge esté en estado ready
     if (!unityBridge.isSceneReady) {
       final bridgeReady = await _waitForBridgeReady(
         timeout: const Duration(seconds: 15),
@@ -198,7 +210,6 @@ class ArNavigationController extends ChangeNotifier {
       }
     }
 
-    // Margen adicional para que la CPU de AR se estabilice
     _logger.i(
       '[WakeWord] Bridge listo — esperando ${_wakeWordBootDelay.inSeconds}s '
           'de margen AR antes de iniciar STT...',
@@ -306,13 +317,20 @@ class ArNavigationController extends ChangeNotifier {
         : 'Sesión cargada. Listo para navegar.')
         : 'No hay sesión guardada. Puedes crear balizas.';
 
-    voiceNav.isReady ? voiceNav.speak(msg) : coordinator.speak(msg);
+    // ✅ v9.3: si hay tutorial, el saludo lo maneja onReadyForTutorial.
+    // Si no hay tutorial, reproducimos el mensaje de sesión normal.
+    if (onReadyForTutorial != null && !_tutorialCallbackFired) {
+      // No hablamos el msg de sesión — el tutorial incluye su propio saludo
+      _tutorialCallbackFired = true;
+      // Lanzar con microtask para no bloquear _goToReady
+      Future.microtask(() => onReadyForTutorial?.call());
+    } else {
+      voiceNav.isReady ? voiceNav.speak(msg) : coordinator.speak(msg);
+    }
 
-    // ✅ v9.2 FIX 7: mostrar estado intermedio y diferir inicio de WakeWord
     if (_wakeWordAvailable) {
       _statusMessage = 'Inicializando voz...';
       notifyListeners();
-      // No bloqueamos _goToReady — el inicio ocurre en background
       _startWakeWordWhenReady();
     } else {
       _statusMessage = 'Presiona el micrófono para hablar';
@@ -320,7 +338,7 @@ class ArNavigationController extends ChangeNotifier {
     }
   }
 
-  // ─── Tracking state con debounce (v9.1 FIX 2) ────────────────────────────
+  // ─── Tracking state con debounce ──────────────────────────────────────────
 
   void onTrackingStateChanged(bool isStable, String state, String reason) {
     _arTrackingStable = isStable;
@@ -374,7 +392,7 @@ class ArNavigationController extends ChangeNotifier {
     };
   }
 
-  // ─── v9.1 FIX 1 — Esperar bridge ready antes de navegar ──────────────────
+  // ─── Esperar bridge ready ─────────────────────────────────────────────────
 
   Future<bool> _waitForBridgeReady({
     Duration timeout = const Duration(seconds: 8),
@@ -440,8 +458,15 @@ class ArNavigationController extends ChangeNotifier {
         });
       };
 
-      // v9.1 FIX 1: navigate_to espera isSceneReady antes de enviar
       coordinator.onCommandExecuted = (intent) async {
+        // ✅ v9.3: intent de tutorial por voz ("Oye COMPAS, enséñame")
+        if (intent.target == '__app:tutorial') {
+          coordinator.speak(tutorialScript);
+          addToHistory(intent);
+          onShowSnackBar?.call('✅ ${intent.suggestedResponse}');
+          return;
+        }
+
         final isNavigation =
             intent.type == IntentType.navigate &&
                 !intent.target.startsWith('__unity:') &&
@@ -558,7 +583,6 @@ class ArNavigationController extends ChangeNotifier {
 
     unityBridge.onTrackingStateChanged = onTrackingStateChanged;
 
-    // FIX 5: solo actualizar segmentación si cambió ≥2%
     unityBridge.onSegmentationRatioReceived = (obs, floor, wall) {
       const threshold = 0.02;
       if ((_segObstacle - obs).abs() < threshold &&
@@ -757,6 +781,7 @@ class ArNavigationController extends ChangeNotifier {
   void dispose() {
     _trackingWarningTimer?.cancel();
     _trackingDebounceTimer?.cancel();
+    onReadyForTutorial = null;
     coordinator.dispose();
     aiModeController.dispose();
     unityBridge.dispose();

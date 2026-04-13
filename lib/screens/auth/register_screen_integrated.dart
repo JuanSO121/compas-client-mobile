@@ -1,8 +1,26 @@
 // lib/screens/auth/register_screen_integrated.dart
+//
+// ── Cambios TTS v1.0 ──────────────────────────────────────────────────────────
+//
+//  • initState: anuncia "Paso 1 de 3: email" al montar.
+//  • _validateAndMoveToStep1/2: anuncia paso nuevo al avanzar.
+//  • _createAccount:
+//      - Éxito  → announceSuccess() y libera AuthTTSService antes de navegar.
+//      - Error  → announceError() con detalle de campo fallido.
+//  • _previousStep: anuncia "Paso anterior".
+//  • _buildActionButton.onTap: anuncia "Verificando" / "Continuando".
+//  • AppBar back button: anuncia la acción.
+//  • Errores de validación inline: todos pasan por announceError().
+//  • _buildPasswordStrengthIndicator: anuncia el nivel de fortaleza cuando
+//    cambia (débil → media → fuerte) para guiar al usuario ciego.
+//  • SemanticsService.announce() se mantiene en paralelo para TalkBack.
+// ──────────────────────────────────────────────────────────────────────────────
+
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import '../../services/auth_service.dart';
+import '../../services/auth_tts_service.dart';
 import '../../utils/password_validator.dart';
 import 'login_screen_integrated.dart';
 
@@ -21,7 +39,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController =
-      TextEditingController();
+  TextEditingController();
   final TextEditingController _firstNameController = TextEditingController();
   final TextEditingController _lastNameController = TextEditingController();
 
@@ -33,18 +51,24 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
 
   final AuthService _authService = AuthService();
 
+  // ✅ TTS
+  final AuthTTSService _tts = AuthTTSService();
+
   bool _isLoading = false;
   String? _errorMessage;
   String _visualImpairmentLevel = 'none';
   bool _screenReaderUser = false;
 
   PasswordValidationResult? _passwordValidation;
+  String? _lastAnnouncedStrength; // ✅ evitar repetir el mismo nivel de fortaleza
 
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
   late AnimationController _shakeController;
   late Animation<double> _shakeAnimation;
   late AnimationController _progressController;
+
+  // ─────────────────────────────────────────────────────────────────────────────
 
   @override
   void initState() {
@@ -69,15 +93,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
         setState(() => _errorMessage = null);
     });
 
-    _passwordController.addListener(() {
-      if (_currentStep == 1) {
-        setState(() {
-          _errorMessage = null;
-          _passwordValidation =
-              PasswordValidator.validate(_passwordController.text);
-        });
-      }
-    });
+    _passwordController.addListener(_onPasswordChanged);
 
     _confirmPasswordController.addListener(() {
       if (_errorMessage != null && _currentStep == 1)
@@ -94,7 +110,12 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
         setState(() => _errorMessage = null);
     });
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _tts.initialize();
+      await Future.delayed(const Duration(milliseconds: 350));
+      await _tts.announceScreen(
+        'Crear cuenta. Paso 1 de 3: ingrese su correo electrónico.',
+      );
       SemanticsService.announce(
         'Crear cuenta. Paso 1 de 3: ingrese su correo electrónico.',
         TextDirection.ltr,
@@ -105,6 +126,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
   @override
   void dispose() {
     _emailController.dispose();
+    _passwordController.removeListener(_onPasswordChanged);
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     _firstNameController.dispose();
@@ -120,6 +142,31 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     super.dispose();
   }
 
+  // ── Password listener ──────────────────────────────────────────────────────
+
+  void _onPasswordChanged() {
+    if (_currentStep != 1) return;
+
+    final text = _passwordController.text;
+    final validation = PasswordValidator.validate(text);
+
+    setState(() {
+      if (_errorMessage != null) _errorMessage = null;
+      _passwordValidation = validation;
+    });
+
+    // ✅ Anunciar cambio de nivel de fortaleza (no repetir el mismo nivel)
+    if (text.isNotEmpty) {
+      final level = validation.strengthLevel;
+      if (level != _lastAnnouncedStrength) {
+        _lastAnnouncedStrength = level;
+        _tts.announceButton('Contraseña: $level');
+      }
+    }
+  }
+
+  // ── Navegación de pasos ────────────────────────────────────────────────────
+
   void _nextStep() {
     if (_currentStep == 0) {
       _validateAndMoveToStep1();
@@ -134,19 +181,23 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     final email = _emailController.text.trim();
 
     if (email.isEmpty) {
-      setState(() => _errorMessage = 'Ingrese su correo electrónico');
+      const msg = 'Ingrese su correo electrónico';
+      setState(() => _errorMessage = msg);
       _emailFocusNode.requestFocus();
       _shakeController.forward(from: 0);
-      SemanticsService.announce(_errorMessage!, TextDirection.ltr);
+      _tts.announceError(msg);
+      SemanticsService.announce(msg, TextDirection.ltr);
       return;
     }
 
     final emailRegex = RegExp(r'^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$');
     if (!emailRegex.hasMatch(email)) {
-      setState(() => _errorMessage = 'Formato de email inválido');
+      const msg = 'Formato de email inválido';
+      setState(() => _errorMessage = msg);
       _emailFocusNode.requestFocus();
       _shakeController.forward(from: 0);
-      SemanticsService.announce(_errorMessage!, TextDirection.ltr);
+      _tts.announceError(msg);
+      SemanticsService.announce(msg, TextDirection.ltr);
       return;
     }
 
@@ -156,10 +207,12 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     });
     _progressController.animateTo(0.5);
     HapticFeedback.lightImpact();
-    SemanticsService.announce(
-      'Paso 2 de 3: cree su contraseña.',
-      TextDirection.ltr,
-    );
+
+    const announcement = 'Paso 2 de 3: cree su contraseña. '
+        'Debe tener mayúsculas, minúsculas, números y símbolos.';
+    _tts.announceScreen(announcement);
+    SemanticsService.announce(announcement, TextDirection.ltr);
+
     Future.delayed(
         const Duration(milliseconds: 300), _passwordFocusNode.requestFocus);
   }
@@ -169,37 +222,39 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     final confirm = _confirmPasswordController.text;
 
     if (password.isEmpty || confirm.isEmpty) {
-      setState(
-          () => _errorMessage = 'Complete ambos campos de contraseña');
+      const msg = 'Complete ambos campos de contraseña';
+      setState(() => _errorMessage = msg);
       (password.isEmpty ? _passwordFocusNode : _confirmPasswordFocusNode)
           .requestFocus();
       _shakeController.forward(from: 0);
-      SemanticsService.announce(_errorMessage!, TextDirection.ltr);
+      _tts.announceError(msg);
+      SemanticsService.announce(msg, TextDirection.ltr);
       return;
     }
 
     final validation = PasswordValidator.validate(password);
     if (!validation.isValid) {
+      final msg =
+          '${validation.message}. ${validation.suggestions.join('. ')}';
       setState(() {
         _errorMessage = validation.message;
         _passwordValidation = validation;
       });
-      SemanticsService.announce(
-        '${validation.message}. ${validation.suggestions.join('. ')}',
-        TextDirection.ltr,
-      );
+      _tts.announceError(msg);
+      SemanticsService.announce(msg, TextDirection.ltr);
       _passwordFocusNode.requestFocus();
       _shakeController.forward(from: 0);
       return;
     }
 
     final matchError =
-        PasswordValidator.validatePasswordMatch(password, confirm);
+    PasswordValidator.validatePasswordMatch(password, confirm);
     if (matchError != null) {
       setState(() => _errorMessage = matchError);
       _confirmPasswordFocusNode.requestFocus();
       _shakeController.forward(from: 0);
-      SemanticsService.announce(_errorMessage!, TextDirection.ltr);
+      _tts.announceError(matchError);
+      SemanticsService.announce(matchError, TextDirection.ltr);
       return;
     }
 
@@ -209,7 +264,12 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     });
     _progressController.animateTo(1.0);
     HapticFeedback.lightImpact();
-    SemanticsService.announce('Paso 3 de 3: ingrese su nombre.', TextDirection.ltr);
+
+    const announcement =
+        'Paso 3 de 3: ingrese su nombre. El apellido es opcional.';
+    _tts.announceScreen(announcement);
+    SemanticsService.announce(announcement, TextDirection.ltr);
+
     Future.delayed(
         const Duration(milliseconds: 300), _firstNameFocusNode.requestFocus);
   }
@@ -219,12 +279,17 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     final lastName = _lastNameController.text.trim();
 
     if (firstName.isEmpty) {
-      setState(() => _errorMessage = 'Ingrese su nombre');
+      const msg = 'Ingrese su nombre';
+      setState(() => _errorMessage = msg);
       _firstNameFocusNode.requestFocus();
       _shakeController.forward(from: 0);
-      SemanticsService.announce(_errorMessage!, TextDirection.ltr);
+      _tts.announceError(msg);
+      SemanticsService.announce(msg, TextDirection.ltr);
       return;
     }
+
+    // ✅ Feedback antes de la petición
+    await _tts.announceButton('Creando su cuenta. Por favor espere.');
 
     setState(() {
       _isLoading = true;
@@ -246,13 +311,20 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
 
       if (response.success) {
         HapticFeedback.heavyImpact();
-        final announcement = response.accessibilityInfo?.announcement ??
-            'Cuenta creada. Revise su email para obtener su código de acceso.';
-        SemanticsService.announce(announcement, TextDirection.ltr);
+
+        const ttsMsg =
+            'Cuenta creada exitosamente. Revise su correo electrónico '
+            'para obtener su código de acceso e inicie sesión.';
+        await _tts.announceSuccess(ttsMsg);
+        SemanticsService.announce(ttsMsg, TextDirection.ltr);
         _showSnackBar('Cuenta creada. Revise su email.');
 
         await Future.delayed(const Duration(milliseconds: 1500));
         if (!mounted) return;
+
+        // ✅ Liberar AuthTTSService — LoginScreen lo re-inicializará si es necesario
+        _tts.dispose();
+
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (_) => const LoginScreenIntegrated()),
@@ -265,10 +337,12 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
 
         final announcement =
             response.accessibilityInfo?.announcement ?? response.message;
+        await _tts.announceError(announcement);
         SemanticsService.announce(announcement, TextDirection.ltr);
         _showSnackBar(_errorMessage!, isError: true);
         _shakeController.forward(from: 0);
 
+        // Ir al paso del campo con error
         if (response.errors != null && response.errors!.isNotEmpty) {
           final firstError = response.errors!.first;
           if (firstError.field == 'email') {
@@ -285,11 +359,13 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
       }
     } catch (e) {
       if (!mounted) return;
+      const msg = 'Error de conexión. Intente nuevamente.';
       setState(() {
-        _errorMessage = 'Error de conexión. Intente nuevamente.';
+        _errorMessage = msg;
         _isLoading = false;
       });
-      _showSnackBar(_errorMessage!, isError: true);
+      await _tts.announceError(msg);
+      _showSnackBar(msg, isError: true);
       _shakeController.forward(from: 0);
     }
   }
@@ -304,6 +380,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
 
   void _previousStep() {
     if (_currentStep == 0) {
+      _tts.announceButton('Volver');
       Navigator.pop(context);
     } else {
       setState(() {
@@ -311,9 +388,10 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
         _errorMessage = null;
       });
       _progressController.animateTo(_currentStep / 2);
-      final stepName = _currentStep == 0 ? 'email' : 'contraseña';
-      SemanticsService.announce(
-          'Paso ${_currentStep + 1}: $stepName.', TextDirection.ltr);
+      final stepName = _currentStep == 0 ? 'correo electrónico' : 'contraseña';
+      final announcement = 'Paso ${_currentStep + 1}: $stepName.';
+      _tts.announceButton(announcement);
+      SemanticsService.announce(announcement, TextDirection.ltr);
     }
   }
 
@@ -343,12 +421,14 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
             : Theme.of(context).colorScheme.secondary,
         behavior: SnackBarBehavior.floating,
         shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         margin: const EdgeInsets.all(16),
         duration: Duration(seconds: isError ? 4 : 2),
       ),
     );
   }
+
+  // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -389,8 +469,8 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
                   child: _currentStep == 0
                       ? _buildEmailStep(theme)
                       : _currentStep == 1
-                          ? _buildPasswordStep(theme)
-                          : _buildNameStep(theme),
+                      ? _buildPasswordStep(theme)
+                      : _buildNameStep(theme),
                 ),
               ),
               Padding(
@@ -417,7 +497,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     );
   }
 
-  // ─── Indicador de progreso ────────────────────────────────────────────────
+  // ─── Indicador de progreso ─────────────────────────────────────────────────
 
   Widget _buildProgressIndicator(ThemeData theme) {
     return Semantics(
@@ -469,7 +549,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     );
   }
 
-  // ─── Paso 1: Email ────────────────────────────────────────────────────────
+  // ─── Paso 1: Email ─────────────────────────────────────────────────────────
 
   Widget _buildEmailStep(ThemeData theme) {
     return Column(
@@ -509,7 +589,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     );
   }
 
-  // ─── Paso 2: Contraseña ───────────────────────────────────────────────────
+  // ─── Paso 2: Contraseña ────────────────────────────────────────────────────
 
   Widget _buildPasswordStep(ThemeData theme) {
     return Column(
@@ -573,7 +653,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     final progress = (validation.strengthScore / 6).clamp(0.0, 1.0);
 
     return Semantics(
-      label: 'Fortaleza: ${validation.strengthLevel}',
+      label: 'Fortaleza de contraseña: ${validation.strengthLevel}',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -586,7 +666,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
                     value: progress,
                     minHeight: 8,
                     backgroundColor:
-                        theme.colorScheme.surfaceContainerHighest,
+                    theme.colorScheme.surfaceContainerHighest,
                     valueColor: AlwaysStoppedAnimation<Color>(color),
                   ),
                 ),
@@ -616,8 +696,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
       child: Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color:
-              theme.colorScheme.surfaceContainerHighest.withOpacity(0.5),
+          color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.5),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
               color: theme.colorScheme.outline.withOpacity(0.2), width: 2),
@@ -639,7 +718,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
             ...List.generate(requirements.length, (index) {
               final req = requirements[index];
               final met =
-                  PasswordValidator.checkRequirement(password, index);
+              PasswordValidator.checkRequirement(password, index);
               return Padding(
                 padding: const EdgeInsets.only(bottom: 6),
                 child: Semantics(
@@ -665,7 +744,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
                               color: met
                                   ? theme.colorScheme.onSurface
                                   : theme.colorScheme.onSurface
-                                      .withOpacity(0.55))),
+                                  .withOpacity(0.55))),
                     ),
                   ]),
                 ),
@@ -692,7 +771,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     return Icons.error_rounded;
   }
 
-  // ─── Paso 3: Nombre ───────────────────────────────────────────────────────
+  // ─── Paso 3: Nombre ────────────────────────────────────────────────────────
 
   Widget _buildNameStep(ThemeData theme) {
     return Column(
@@ -745,7 +824,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     );
   }
 
-  // ─── Widgets compartidos ──────────────────────────────────────────────────
+  // ─── Widgets compartidos ───────────────────────────────────────────────────
 
   Widget _buildTextField({
     required TextEditingController controller,
@@ -762,8 +841,8 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
     final theme = Theme.of(context);
     return AnimatedBuilder(
       animation: _shakeAnimation,
-      builder: (context, child) =>
-          Transform.translate(offset: Offset(_shakeAnimation.value, 0), child: child),
+      builder: (context, child) => Transform.translate(
+          offset: Offset(_shakeAnimation.value, 0), child: child),
       child: Semantics(
         label: label,
         textField: true,
@@ -788,8 +867,7 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
             controller: controller,
             focusNode: focusNode,
             obscureText: obscureText,
-            style:
-                const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
             keyboardType: keyboardType,
             textInputAction: textInputAction,
             textCapitalization: textCapitalization,
@@ -798,7 +876,8 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
               hintStyle: TextStyle(
                   fontSize: 18,
                   color: theme.colorScheme.onSurface.withOpacity(0.3)),
-              prefixIcon: Icon(icon, size: 26, color: theme.colorScheme.primary),
+              prefixIcon:
+              Icon(icon, size: 26, color: theme.colorScheme.primary),
               border: InputBorder.none,
               contentPadding: const EdgeInsets.all(20),
             ),
@@ -822,7 +901,8 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
               color: theme.colorScheme.error.withOpacity(0.3), width: 2),
         ),
         child: Row(children: [
-          Icon(Icons.warning_rounded, size: 20, color: theme.colorScheme.error),
+          Icon(Icons.warning_rounded,
+              size: 20, color: theme.colorScheme.error),
           const SizedBox(width: 8),
           Expanded(
             child: Text(_errorMessage!,
@@ -858,25 +938,25 @@ class _RegisterScreenIntegratedState extends State<RegisterScreenIntegrated>
           height: 72,
           child: isLoading
               ? const Center(
-                  child: SizedBox(
-                    width: 32,
-                    height: 32,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 4,
-                        valueColor:
-                            AlwaysStoppedAnimation<Color>(Colors.white)),
-                  ),
-                )
+            child: SizedBox(
+              width: 32,
+              height: 32,
+              child: CircularProgressIndicator(
+                  strokeWidth: 4,
+                  valueColor:
+                  AlwaysStoppedAnimation<Color>(Colors.white)),
+            ),
+          )
               : Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                  Icon(icon, size: 28, color: Colors.white),
-                  const SizedBox(width: 16),
-                  Text(label,
-                      style: const TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                          letterSpacing: 0.5)),
-                ]),
+            Icon(icon, size: 28, color: Colors.white),
+            const SizedBox(width: 16),
+            Text(label,
+                style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    letterSpacing: 0.5)),
+          ]),
         ),
       ),
     );
