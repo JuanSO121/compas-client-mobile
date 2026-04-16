@@ -1,199 +1,316 @@
-# COMPAS Mobile (Flutter)
+# COMPAS Client Mobile
 
-> Aplicación móvil Flutter para asistencia de navegación en interiores mediante voz e inteligencia artificial, orientada a personas con discapacidad visual. Integra procesamiento de voz híbrido (local y en la nube), autenticación accesible y puente bidireccional con Unity para navegación AR.
+Aplicación móvil en **Flutter** para asistencia de navegación accesible con interacción por voz, integración con backend de autenticación/IA y soporte de navegación AR con Unity.
 
-**Repositorio:** https://github.com/JuanSO121/compas-client-mobile  
-**Autores:** Juan José Sánchez Ocampo · Carlos Eduardo Rangel  
-**Institución:** Universidad de San Buenaventura Cali — Ingeniería de Sistemas e Ingeniería Multimedia, 2026
+> Este repositorio contiene el cliente móvil (Android/iOS/Linux/macOS/Windows/Web) de COMPAS. El flujo principal está optimizado para uso en dispositivos móviles.
 
 ---
 
 ## Tabla de contenido
 
-- [Resumen ejecutivo](#resumen-ejecutivo)
-- [Arquitectura general](#arquitectura-general)
-- [Tecnologías y dependencias](#tecnologías-y-dependencias)
-- [Módulos funcionales](#módulos-funcionales)
-- [Flujo de interacción](#flujo-de-interacción)
-- [Configuración de entorno](#configuración-de-entorno)
-- [Instalación y ejecución](#instalación-y-ejecución)
-- [Integración con Unity y backend](#integración-con-unity-y-backend)
-- [Limitaciones actuales](#limitaciones-actuales)
-- [Repositorios relacionados](#repositorios-relacionados)
+- [Visión general](#visión-general)
+- [Características principales](#características-principales)
+- [Arquitectura técnica](#arquitectura-técnica)
+- [Estructura del proyecto](#estructura-del-proyecto)
+- [Requisitos](#requisitos)
+- [Configuración del entorno](#configuración-del-entorno)
+- [Ejecución](#ejecución)
+- [Pruebas y validación](#pruebas-y-validación)
+- [Integración con backend y Unity](#integración-con-backend-y-unity)
+- [Accesibilidad](#accesibilidad)
+- [Problemas comunes](#problemas-comunes)
+- [Stack tecnológico](#stack-tecnológico)
+- [Licencia](#licencia)
 
 ---
 
-## Resumen ejecutivo
+## Visión general
 
-COMPAS Mobile es la capa de interfaz del sistema COMPAS. Gestiona toda la interacción con el usuario: autenticación accesible por código de seis dígitos, activación por palabra clave ("Oye COMPAS"), transcripción de voz a texto (STT), clasificación de intenciones mediante IA híbrida (local u online vía Groq), síntesis de respuestas auditivas (TTS) y comunicación bidireccional con el módulo Unity de navegación AR.
+**COMPAS** es un asistente de voz orientado a accesibilidad, diseñado para:
 
-La aplicación opera principalmente sobre Android y está diseñada para ser usada sin interacción táctil durante la navegación, priorizando retroalimentación auditiva clara y compatible con lectores de pantalla.
+- reconocer comandos de voz en español,
+- clasificar intenciones de navegación,
+- operar en modo **online/offline/auto**,
+- coordinar instrucciones de navegación con una escena de **Unity AR**,
+- y mantener una experiencia accesible (anuncios semánticos, feedback háptico y mensajes auditivos).
+
+Además, incluye un módulo de autenticación con tokens y gestión de perfil/preferencias de accesibilidad.
+
+---
+
+**Repositorio:** https://github.com/JuanSO121/compas-client-mobile  
+**Autores:** Juan José Sánchez Ocampo · Carlos Eduardo Rangel  
+**Institución:** Universidad de San Buenaventura Cali — Ingeniería de Sistemas e Ingeniería Multimedia, 2026
+
+### 1) Interacción por voz inteligente
+- Detección de comandos mediante `speech_to_text`.
+- Clasificación de intención híbrida:
+  - modelo local TFLite (cuando está disponible),
+  - fallback por reglas/keywords,
+  - soporte de decisión por IA externa.
+- Modo wake word opcional con Picovoice (“Oye COMPAS”).
+
+### 2) Coordinación de navegación
+- `NavigationCoordinator` centraliza estados de escucha, procesamiento, respuesta y ejecución.
+- Evita ejecuciones duplicadas de comandos de navegación.
+- Control de reactivación de STT para prevenir eco de TTS.
+
+### 3) Modos de IA
+- **Auto**: decide online/offline según conectividad y disponibilidad de Groq.
+- **Online**: prioriza inferencia remota (Groq).
+- **Offline**: operación local sin dependencia de internet.
+
+### 4) Módulo AR con Unity
+- Pantalla dedicada de navegación AR.
+- Máquina de estados de inicialización para evitar race conditions entre Flutter y Unity.
+- Canal bidireccional de comandos/respuestas (`navigate_to`, `list_waypoints`, `save_session`, etc.).
+
+### 5) Autenticación y sesión
+- Registro, login, refresh token, logout.
+- Persistencia segura de tokens con `flutter_secure_storage`.
+- Restauración de sesión al iniciar la app (`AuthGate`).
+
+### 6) Reconocimiento de entorno
+- Pantalla de cámara para captura/streaming.
+- Bloqueo por proximidad y anuncios de accesibilidad.
+
+---
+
+## Arquitectura técnica
+
+### Capas principales
+
+- **UI / Presentación** (`lib/screens`, `lib/widgets`)
+  - Pantallas de autenticación.
+  - Pantalla de comandos de voz.
+  - Pantalla de reconocimiento de entorno.
+  - Pantalla AR de navegación.
+
+- **Orquestación de dominio** (`lib/services/AI`)
+  - `NavigationCoordinator`: ciclo de vida de voz y comandos.
+  - `AIModeController`: conectividad + selección de modo IA.
+  - `IntegratedVoiceCommandService`: STT + clasificación de intención.
+  - `ConversationService`, `WakeWordService`, `WaypointContextService`.
+
+- **Integración externa** (`lib/services`)
+  - `ApiClient`: capa HTTP genérica para backend REST.
+  - `AuthService`, `UserService`, `TokenService`.
+  - `UnityBridgeService`: mensajería Flutter ↔ Unity.
+  - `VoiceNavigationService`, `TTSService`, `ProximityService`.
+
+- **Modelos y configuración**
+  - `lib/models`: contratos de API y modelos compartidos.
+  - `lib/config/api_config.dart`: URLs, endpoints, claves y timeouts.
+
+---
 
 ### Funcionalidades implementadas
 
-- Autenticación accesible: registro en tres pasos, login por código de seis dígitos y recuperación por correo.
-- Persistencia de sesión con `flutter_secure_storage` y refresh automático de tokens.
-- Activación por palabra clave "Oye COMPAS" mediante STT continuo.
-- Clasificación de intenciones en cinco categorías: `START_NAVIGATION`, `STOP`, `REPEAT`, `STATUS` y `HELP`.
-- Modo IA híbrido: clasificación online vía Groq cuando hay conexión, clasificador local por patrones de texto sin red.
-- Integración con Unity: cargar sesión, listar balizas, iniciar y detener navegación, recibir eventos de tracking AR y estado TTS.
-- Cola de prioridad de mensajes TTS para evitar saturación durante la navegación activa.
-- Gestión de waypoints por voz: crear, listar, eliminar y limpiar puntos de interés.
+```text
+lib/
+  app/
+  config/
+    api_config.dart
+  models/
+    api_models.dart
+    shared_models.dart
+  screens/
+    auth/
+    ar_navigation_screen.dart
+    environment_recognition_screen.dart
+    voice_navigation_screen.dart
+  services/
+    AI/
+    api_client.dart
+    auth_service.dart
+    token_service.dart
+    tts_service.dart
+    unity_bridge_service.dart
+    user_service.dart
+    voice_navigation_service.dart
+  utils/
+  widgets/
 
----
-
-## Arquitectura general
-
-```
-Entrada: main.dart → AuthGate
-         ↓
-AuthGate → WelcomeScreen (sin sesión) | ArNavigationScreen (con sesión)
-
-Capas:
-1. Presentación (UI Flutter)
-2. Orquestación: NavigationCoordinator, ConversationService, AIModeController
-3. Servicios: STT/TTS, wake word, cliente HTTP, token storage, Unity bridge
-4. Integraciones externas: Backend REST (FastAPI/Vercel), API Groq, Motor Unity
-```
-
-### Patrones utilizados
-
-- Singleton para servicios de voz, IA y Unity bridge.
-- Coordinator pattern para centralizar eventos de voz.
-- Fallback progresivo: online → offline según conectividad disponible.
-- Cola de prioridad TTS: instrucciones críticas interrumpen mensajes de menor prioridad.
-
----
-
-## Tecnologías y dependencias
-
-| Categoría | Tecnología | Uso |
-|-----------|-----------|-----|
-| Framework | Flutter ≥3.27.0, Dart ≥3.8.0 | Base de la aplicación |
-| Voz | `speech_to_text`, `flutter_tts` | STT y TTS locales |
-| IA | Groq (API REST) | Clasificación de intenciones online |
-| Seguridad | `flutter_secure_storage` | Almacenamiento de tokens JWT |
-| Red | `http`, `dio`, `connectivity_plus` | Comunicación con backend y Groq |
-| AR | `flutter_unity_widget` | Puente Flutter ↔ Unity |
-| Cámara | `camera` | Captura de frames para segmentación |
-| Permisos | `permission_handler` | Micrófono, cámara y almacenamiento |
-| Estado | `provider` | Gestión de estado reactivo |
-
----
-
-## Módulos funcionales
-
-### Autenticación (`screens/auth/`)
-
-Flujo de tres pasos para registro (correo, contraseña, nombre) y login por código de seis dígitos enviado al correo. Cada campo ocupa la pantalla completa con anuncios de voz al avanzar entre pasos.
-
-### Coordinador de voz (`services/AI/navigation_coordinator.dart`)
-
-Orquesta el ciclo completo: detección de palabra clave → STT → clasificación de intención → ejecución de comando → respuesta TTS. Implementa reintentos ante comandos no reconocidos (máximo 3) y fallback local sin conexión.
-
-### Clasificador de intenciones (`services/AI/voice_command_classifier.dart`)
-
-Clasifica el texto transcrito en cinco intenciones con umbral de confianza configurable. Con conexión usa la API de Groq; sin conexión usa patrones de texto locales para comandos frecuentes.
-
-### Unity Bridge (`services/unity_bridge_service.dart`)
-
-Envía comandos JSON al módulo Unity y procesa las respuestas recibidas. Implementa cola de comandos con clasificación por prioridad (Critical, Session, Navigation) compatible con el estado del bridge en Unity (Initializing, SessionLoading, Ready).
-
-### TTS Service (`services/tts_service.dart`)
-
-Gestiona la síntesis de voz con cola de prioridad. Las instrucciones de prioridad 3 (obstáculos, giros urgentes) interrumpen las de menor prioridad. Notifica a Unity el estado del TTS (`done`/`cancel`) para liberar el flag `_ttsBusy` del guía de voz.
-
----
-
-## Flujo de interacción
-
-```
-Usuario habla → "Oye COMPAS llévame a la biblioteca"
-     ↓
-STT transcribe el audio
-     ↓
-Wake word detectado → captura comando → "llévame a la biblioteca"
-     ↓
-Clasificador → START_NAVIGATION, destino: "biblioteca"
-     ↓
-UnityBridgeService → navigate_to {"name": "biblioteca"}
-     ↓
-Unity calcula ruta y responde → guide_announcement
-     ↓
-TTS → "Listo, vamos a la biblioteca. 45 pasos recto, luego gira a las 3."
+test/
+  groq_api_test.dart
+  test_server_connection.dart
 ```
 
 ---
 
-## Configuración de entorno
+## Requisitos
 
-Crear archivo `.env` en la raíz del proyecto:
-
-```env
-API_BASE_URL=https://tu-backend.vercel.app
-GROQ_API_KEY=tu_clave_groq
-```
+- Flutter `>= 3.27.0`
+- Dart SDK `>= 3.8.0 < 4.0.0`
+- Android Studio / Xcode (según plataforma objetivo)
+- Backend COMPAS disponible (API REST)
+- (Opcional) cuenta/API key de Groq
+- (Opcional) Access Key de Picovoice para wake word
+- (Opcional) proyecto Unity integrado para navegación AR
 
 ---
 
-## Instalación y ejecución
+## Configuración del entorno
+
+### 1) Instalar dependencias
 
 ```bash
-# Clonar repositorio
-git clone https://github.com/JuanSO121/compas-client-mobile.git
-cd compas-client-mobile
-
-# Instalar dependencias
 flutter pub get
+```
 
-# Ejecutar en dispositivo Android
+### 2) Crear archivo `.env` en la raíz
+
+Ejemplo mínimo:
+
+```env
+# Backend
+BASE_URL=http://192.168.1.5:8080
+BASE_URL_PC=http://127.0.0.1:8080
+
+# IA online
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Wake word (Picovoice)
+PICOVOICE_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+> Si no defines `GROQ_API_KEY` o `PICOVOICE_ACCESS_KEY`, la app sigue funcionando con degradación controlada (por ejemplo, modo offline o modo manual sin wake word).
+
+### 3) Permisos móviles
+
+Asegura permisos de:
+- micrófono,
+- cámara,
+- red,
+- almacenamiento (si aplica a flujos locales).
+
+---
+
+## Ejecución
+
+### Desarrollo local
+
+```bash
 flutter run
 ```
 
-**Requisitos:**
-- Flutter ≥3.27.0
-- Android SDK API 26+
-- Dispositivo Android compatible con ARCore para funcionalidad completa
+### Ejecutar en un dispositivo específico
+
+```bash
+flutter devices
+flutter run -d <device_id>
+```
+
+### Build de release (ejemplo Android)
+
+```bash
+flutter build apk --release
+```
 
 ---
 
-## Integración con Unity y backend
+## Pruebas y validación
 
-### Unity
+### Ejecutar pruebas Flutter
 
-La comunicación con el módulo AR se realiza mediante `flutter_unity_widget`. Flutter envía comandos JSON al GameObject `FlutterBridge` de la escena Unity y recibe respuestas a través del callback `OnUnityResponse`.
+```bash
+flutter test
+```
 
-Comandos principales enviados a Unity:
+### Prueba específica de Groq
 
-| Acción | Descripción |
-|--------|-------------|
-| `navigate_to` | Inicia navegación hacia un waypoint |
-| `stop_navigation` | Detiene la navegación activa |
-| `list_waypoints` | Solicita waypoints disponibles |
-| `create_waypoint` | Crea waypoint en posición actual |
-| `remove_waypoint` | Elimina un waypoint por nombre |
-| `clear_waypoints` | Elimina todos los waypoints |
-| `save_session` | Persiste sesión en disco |
-| `load_session` | Restaura sesión guardada |
-| `tts_status` | Notifica estado del TTS a Unity |
+```bash
+flutter test test/groq_api_test.dart
+```
 
-### Backend (FastAPI/Vercel)
+### Script de conectividad con backend
 
-El backend REST gestiona autenticación JWT, persistencia de sesión y preferencias del usuario. La base de datos es MongoDB Atlas con conexión asíncrona.
+```bash
+dart test/test_server_connection.dart
+```
+
+> Nota: algunas pruebas dependen de internet, claves válidas y backend accesible en red local.
 
 ---
 
-## Limitaciones actuales
+## Integración con backend y Unity
 
-- La funcionalidad AR completa requiere dispositivo físico compatible con ARCore.
-- La clasificación offline cubre solo los comandos más frecuentes; comandos complejos requieren conexión a Groq.
-- El reconocimiento de entorno visual ocurre en Unity; Flutter solo gestiona las alertas auditivas resultantes.
+### Backend (REST)
+
+La app consume endpoints versionados (`/api/v1/...`) para:
+
+- autenticación (`register`, `login`, `refresh`, `logout`),
+- perfil y preferencias,
+- operaciones auxiliares de navegación.
+
+### Unity (AR)
+
+`UnityBridgeService` implementa comandos como:
+
+- `navigate_to`
+- `stop_navigation`
+- `list_waypoints`
+- `create_waypoint`
+- `remove_waypoint`
+- `save_session`
+- `load_session`
+
+Además, procesa respuestas estructuradas desde Unity e indicadores de estado de tracking.
+
+---
+
+## Accesibilidad
+
+El proyecto incluye decisiones explícitas de accesibilidad:
+
+- anuncios con `SemanticsService` para lectores de pantalla,
+- feedback háptico contextual,
+- jerarquías visuales con alto contraste,
+- componentes de interacción con labels/hints accesibles,
+- mensajería auditiva con TTS para confirmaciones e instrucciones.
+
+---
+
+## Problemas comunes
+
+### 1) Wake word no se activa
+- Verifica `PICOVOICE_ACCESS_KEY`.
+- Revisa que los assets `.ppn` y `.pv` estén declarados en `pubspec.yaml`.
+- Confirma permisos de micrófono.
+
+### 2) Modo online no responde
+- Verifica `GROQ_API_KEY`.
+- Confirma conectividad real a internet.
+- Revisa latencia/firewall hacia `api.groq.com`.
+
+### 3) No conecta al backend
+- Revisa `BASE_URL` y puerto.
+- Si usas dispositivo físico, usa IP de red local (no `localhost`).
+- Comprueba que el backend esté corriendo y accesible.
+
+### 4) Unity no recibe comandos
+- Verifica que el `GameObject` y método puente coincidan con la configuración Flutter.
+- Confirma que la escena Unity esté cargada antes de enviar comandos.
+
+---
+
+## Stack tecnológico
+
+- **Framework**: Flutter
+- **Lenguaje**: Dart
+- **STT**: `speech_to_text`
+- **TTS**: `flutter_tts`
+- **Wake word**: `porcupine_flutter`
+- **IA online**: Groq (API compatible OpenAI)
+- **IA offline**: TensorFlow Lite (`tflite_flutter`)
+- **Networking**: `http`, `dio`
+- **Seguridad local**: `flutter_secure_storage`
+- **AR bridge**: `flutter_unity_widget` (fork con soporte Unity 6)
 
 ---
 
 ## Repositorios relacionados
 
-| Módulo | Repositorio |
-|--------|------------|
-| Módulo AR (Unity) | https://github.com/JuanSO121/Compas_AR |
-| Backend (API REST) | https://github.com/JuanSO121/compas-api |
+Actualmente este repositorio no incluye un archivo de licencia explícito.
+
+Si planeas distribución pública o colaboración externa, agrega un `LICENSE` (MIT, Apache-2.0, GPL, etc.) según el modelo legal del proyecto.
