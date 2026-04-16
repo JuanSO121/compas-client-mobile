@@ -1,49 +1,29 @@
 // lib/screens/ar_navigation_screen.dart
 //
-// ✅ v9.1 — Tutorial de bienvenida integrado
+// ✅ v9.4 — Calibración AR + botón Pruebas + tutorial wake-word mejorado
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v9.0 → v9.1
+// CAMBIOS v9.1 → v9.4
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  NUEVOS PARÁMETROS DE CONSTRUCTOR:
-//    • showWelcomeTutorial (bool) — true solo en firstLogin.
-//    • userName (String)          — nombre del usuario para personalizar saludo.
+//  1. ArCalibrationOverlay — nuevo overlay que se muestra durante
+//     AppReadyState.waitingSession (Unity cargado pero sesión no confirmada).
+//     Guía al usuario para mover la cámara lentamente y calibrar el tracking.
+//     Se autocierra con AppReadyState.ready. También puede cerrarse
+//     manualmente al tocar "Comenzar navegación" en el paso final.
+//     Solo se muestra cuando _showCalibrationOverlay == true.
 //
-//  FLUJO DEL TUTORIAL:
-//    El tutorial NO se lanza en initState ni en onUnityCreated.
-//    Se lanza en _ctrl.onGoToReady() → que ya existe en el controller.
-//    Usamos un hook: _ctrl.onReadyForTutorial callback (nuevo en controller).
+//  2. Botón "Pruebas" (bottom-right) — visible solo en AppReadyState.ready.
+//     Navega con push a SystemTestScreen. Reemplaza el antiguo botón de Test
+//     con el ícono de laboratorio que ya existía. No usa replace para que
+//     el usuario pueda volver con el botón de retroceso.
 //
-//    Timing exacto:
-//      1. AR entra en AppReadyState.ready
-//      2. coordinator.speak() ya funciona (TTSService inicializado)
-//      3. _goToReady() llama onReadyForTutorial si está registrado
-//      4. ArNavigationScreen reproduce el saludo de bienvenida
-//      5. Pausa 1.5s → reproduce pregunta del tutorial
-//      6. WakeWord escucha "cuéntame más" → reproduce tutorial completo
-//         (implementado como intent especial __app:tutorial en el coordinator)
+//  3. Tutorial mejorado (_playWelcomeTutorial) — la invitación al tutorial
+//     incluye instrucciones sobre el delay de escucha del wake word:
+//     "Después de decir Oye COMPAS, espera el tono antes de hablar."
+//     El tutorial completo (playTutorialContent) también fue actualizado.
 //
-//    Diseño de la frase de activación:
-//      "Si quieres saber todo lo que puedo hacer, di: Oye COMPAS, enséñame"
-//      Esto reutiliza el WakeWord existente — no requiere nueva keyword.
-//      El coordinator ya detecta intents libres; "enséñame" se mapea en
-//      el prompt del AI como intent tutorial.
-//
-//    Alternativa sin WakeWord (wakeWordAvailable == false):
-//      Se ofrece un botón "¿Qué puedo hacer?" en el overlay de voz.
-//      Al pulsarlo dispara _ctrl.playTutorial() directamente.
-//
-//  CONTENIDO DEL TUTORIAL (reproducido por coordinator.speak()):
-//    "Puedo guiarte a cualquier lugar. Solo dime: Oye COMPAS, llévame al baño,
-//     o a la cafetería, o a cualquier lugar que necesites.
-//     También puedo avisarte si hay un obstáculo en tu camino,
-//     y repetirte la última instrucción cuando quieras.
-//     Para pausar la navegación di: Oye COMPAS, para.
-//     ¡Eso es todo! Estoy lista para ayudarte."
-//
-//  NOTA: el tutorial se reproduce UNA SOLA VEZ. El flag se destruye con
-//  el widget — no se persiste porque firstLogin ya viene del backend.
+//  TODO LO DEMÁS ES IDÉNTICO A v9.1.
 
 import 'package:flutter/material.dart' hide NavigationMode;
 import 'package:flutter/semantics.dart';
@@ -53,6 +33,8 @@ import 'package:flutter_unity_widget/flutter_unity_widget.dart';
 import '../controllers/ar_navigation_controller.dart';
 import '../widgets/ar_overlays.dart';
 import '../widgets/ar_voice_overlay.dart';
+import '../widgets/ar_calibration_overlay.dart';
+import 'system_test_screen.dart';
 
 class ArNavigationScreen extends StatefulWidget {
   /// Si es true, reproduce saludo + tutorial al entrar en estado ready.
@@ -93,6 +75,13 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   /// Evita reproducir el tutorial más de una vez por sesión.
   bool _tutorialPlayed = false;
 
+  // ─── ✅ v9.4: Calibración AR ─────────────────────────────────────────────
+
+  /// Controla si el overlay de calibración se muestra.
+  /// Se activa cuando Unity carga y se desactiva al entrar en ready
+  /// o cuando el usuario toca "Comenzar navegación".
+  bool _showCalibrationOverlay = false;
+
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
   @override
@@ -112,7 +101,37 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
       _ctrl.onReadyForTutorial = _playWelcomeTutorial;
     }
 
+    // ✅ v9.4: cuando el estado cambia, ajustar overlay de calibración
+    _ctrl.addListener(_onControllerChanged);
+
     _ctrl.initializeServices();
+  }
+
+  // ─── Listener del controller ─────────────────────────────────────────────
+
+  AppReadyState? _lastState;
+
+  void _onControllerChanged() {
+    final newState = _ctrl.appState;
+    if (newState == _lastState) return;
+    _lastState = newState;
+
+    switch (newState) {
+      case AppReadyState.waitingSession:
+      // Unity cargó — mostrar calibración si el overlay no se cerró ya
+        if (!_showCalibrationOverlay) {
+          setState(() => _showCalibrationOverlay = true);
+        }
+        break;
+      case AppReadyState.ready:
+      // Sesión confirmada — cerrar overlay de calibración
+        if (_showCalibrationOverlay) {
+          setState(() => _showCalibrationOverlay = false);
+        }
+        break;
+      default:
+        break;
+    }
   }
 
   @override
@@ -124,6 +143,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _ctrl.removeListener(_onControllerChanged);
     _pulseController.dispose();
     _waveController.dispose();
     _testPanelController.dispose();
@@ -162,9 +182,6 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
   /// Se llama desde ArNavigationController.onReadyForTutorial cuando
   /// AppReadyState == ready y el TTSService de AR ya está operativo.
-  ///
-  /// Usa coordinator.speak() para que el audio pase por el mismo pipeline
-  /// que las instrucciones de navegación (respeta WakeWord mutex, eco, etc.)
   Future<void> _playWelcomeTutorial() async {
     if (_tutorialPlayed) return;
     _tutorialPlayed = true;
@@ -178,32 +195,34 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
 
     _ctrl.coordinator.speak(greeting);
 
-    // Pausa para que el saludo termine antes de la pregunta del tutorial.
-    // waitForCompletion no está expuesto en coordinator.speak() así que
-    // usamos un delay estimado generoso (el TTS es ~0.5x rate, ~3.5s por frase).
     await Future.delayed(const Duration(milliseconds: 4000));
     if (!mounted) return;
 
-    // ── Invitación al tutorial ────────────────────────────────────────────
+    // ─── ✅ v9.4: invitación mejorada con instrucción de delay ────────────
     final tutorialInvite = _ctrl.wakeWordAvailable
-        ? 'Si quieres saber todo lo que puedo hacer, di: Oye COMPAS, enséñame.'
+        ? 'Para activarme, di: Oye COMPAS, y espera el tono antes de hablar. '
+        'Si quieres saber todo lo que puedo hacer, di: Oye COMPAS, enséñame.'
         : 'Toca el botón ¿Qué puedo hacer? para saber todo lo que puedo hacer.';
 
     _ctrl.coordinator.speak(tutorialInvite);
   }
 
   /// Reproduce el tutorial completo de funciones.
-  /// Llamado cuando el usuario dice "Oye COMPAS, enséñame"
-  /// o cuando toca el botón manual en el overlay.
+  /// ✅ v9.4: incluye explicación del delay de escucha del wake word.
   void playTutorialContent() {
+    // Idéntico a ArNavigationController.tutorialScript pero con las
+    // correcciones de texto y las instrucciones de delay de wake word.
     const tutorial =
-        'Puedo guiarte a cualquier lugar. '
-        'Solo dime: Oye COMPAS, llévame al baño, '
-        'o a la cafetería, o a donde necesites. '
-        'También puedo avisarte si hay un obstáculo en tu camino, '
-        'y repetirte la última instrucción cuando quieras. '
-        'Para pausar la navegación di: Oye COMPAS, para. '
-        '¡Eso es todo! Estoy lista para ayudarte.';
+        'Te explico cómo funciono. '
+        'Para activarme, di: Oye COMPAS, y luego tu destino. '
+        'Importante: después de decir Oye COMPAS, espera un momento. '
+        'Escucharás un tono suave que indica que el micrófono ya está listo. '
+        'Recién entonces dices a dónde quieres ir. '
+        'Por ejemplo: Oye COMPAS, llévame a la sala de lectura. '
+        'También te aviso si hay un obstáculo en tu camino, '
+        'y puedes pedirme que repita la última instrucción. '
+        'Para detener la navegación di: Oye COMPAS, para. '
+        '¡Eso es todo! Estoy listo para guiarte.';
 
     _ctrl.coordinator.speak(tutorial);
   }
@@ -266,6 +285,15 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         : _testPanelController.reverse();
   }
 
+  // ─── ✅ v9.4: Navegar a SystemTestScreen ─────────────────────────────────
+
+  void _openTestScreen() {
+    HapticFeedback.mediumImpact();
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const SystemTestScreen()),
+    );
+  }
+
   // ─── Build ────────────────────────────────────────────────────────────────
 
   @override
@@ -303,14 +331,28 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 ),
               ),
 
-            // Initializing
+            // ✅ v9.4: Calibración AR — durante waitingSession
+            // Se muestra sobre la imagen de Unity para que el usuario vea
+            // la cámara mientras calibra.
+            if (_ctrl.unityLoaded && _showCalibrationOverlay)
+              Positioned.fill(
+                child: ArCalibrationOverlay(
+                  showVoiceHint: _ctrl.wakeWordAvailable,
+                  onDismiss: () {
+                    setState(() => _showCalibrationOverlay = false);
+                  },
+                ),
+              ),
+
+            // Initializing (antes de Unity)
             if (_ctrl.unityLoaded &&
                 _ctrl.appState == AppReadyState.initializing)
               const ArInitializingOverlay(),
 
-            // WaitingSession
+            // WaitingSession — solo si el overlay de calibración NO está activo
             if (_ctrl.unityLoaded &&
-                _ctrl.appState == AppReadyState.waitingSession)
+                _ctrl.appState == AppReadyState.waitingSession &&
+                !_showCalibrationOverlay)
               const ArWaitingSessionOverlay(),
 
             // WaitingUser
@@ -346,7 +388,7 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
                 ),
               ),
 
-            // Botones de control — solo en ready
+            // Controles — solo en ready
             if (_ctrl.unityLoaded && _ctrl.appState == AppReadyState.ready)
               ..._buildReadyControls(context),
           ],
@@ -369,8 +411,8 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
         ),
       ),
 
-      // ✅ v9.1: Botón tutorial manual — visible solo si NO hay WakeWord
-      //         o si el tutorial aún no se ha reproducido completo.
+      // Botón tutorial manual — visible solo si NO hay WakeWord
+      // o si el tutorial aún no se ha reproducido completo.
       if (!_ctrl.wakeWordAvailable || widget.showWelcomeTutorial)
         Positioned(
           top: top + 8,
@@ -378,7 +420,15 @@ class _ArNavigationScreenState extends State<ArNavigationScreen>
           child: _TutorialButton(onTap: playTutorialContent),
         ),
 
-      // Botón test panel (bottom-left)
+      // ✅ v9.4: Botón "Pruebas" (bottom-right)
+      // Navega a SystemTestScreen con push para poder volver.
+      Positioned(
+        bottom: bottom + 24,
+        right: 16,
+        child: _TestScreenButton(onTap: _openTestScreen),
+      ),
+
+      // Botón test panel interno (bottom-left) — mantenido para debugging
       Positioned(
         bottom: bottom + 24,
         left: 16,
@@ -484,7 +534,60 @@ class _TutorialButton extends StatelessWidget {
   }
 }
 
-// ─── Botón test panel ─────────────────────────────────────────────────────
+// ─── ✅ v9.4: Botón "Pruebas" (navega a SystemTestScreen) ─────────────────
+
+class _TestScreenButton extends StatelessWidget {
+  final VoidCallback onTap;
+  const _TestScreenButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: 'Abrir pantalla de pruebas del sistema',
+      button: true,
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1565C0).withOpacity(0.88),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: const Color(0xFF90CAF9).withOpacity(0.5),
+              width: 1.2,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF1565C0).withOpacity(0.3),
+                blurRadius: 10,
+                spreadRadius: 1,
+              ),
+            ],
+          ),
+          child: const Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.science_rounded,
+                  color: Color(0xFF90CAF9), size: 18),
+              SizedBox(width: 6),
+              Text(
+                'Pruebas',
+                style: TextStyle(
+                  color: Color(0xFF90CAF9),
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.3,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Botón test panel interno ─────────────────────────────────────────────
 
 class _TestButton extends StatelessWidget {
   final bool open;
@@ -527,7 +630,7 @@ class _TestButton extends StatelessWidget {
             ),
             const SizedBox(width: 6),
             Text(
-              open ? 'Cerrar' : 'Test',
+              open ? 'Cerrar' : 'Debug',
               style: TextStyle(
                 color: open ? const Color(0xFFCE93D8) : Colors.white70,
                 fontSize: 13,

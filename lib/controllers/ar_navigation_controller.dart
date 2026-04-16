@@ -187,12 +187,17 @@ class ArNavigationController extends ChangeNotifier {
   /// Contenido del tutorial. Usado tanto por el callback como por el
   /// intent __app:tutorial (comando de voz "enséñame").
   static const String tutorialScript =
-      'Puedo guiarte dentro de la biblioteca '
-      'Solo dime: Oye COMPAS, y a dodne queires ir, '
-      'También puedo avisarte si hay un obstáculo en tu camino, '
-      'y repetirte la última instrucción cuando quieras. '
-      'Para pausar la navegación di: Oye COMPAS, para. '
-      '¡Eso es todo! Estoy listo para ayudarte.';
+      'Te cuento rápidamente cómo usarme. '
+      'Para activarme, solo di: Oye COMPAS. '
+      'Yo te voy a responder: ¿En qué puedo ayudarte? '
+      'y en ese momento puedes decirme a dónde quieres ir. '
+      'Por ejemplo: llévame a la sala de descanso. '
+      'Es importante que esperes un momento después de decir Oye COMPAS, '
+      'te dire que estoy listo y escucho. '
+      'También puedo avisarte si detecto obstáculos en tu camino, '
+      'y puedes pedirme que repita la última indicación cuando lo necesites. '
+      'Si quieres detener la navegación, solo di: Oye COMPAS, detente. '
+      'Y listo cuando quieras, estoy aquí para ayudar.';
 
   // ─── FIX 7: Delay de inicio de WakeWord ──────────────────────────────────
 
@@ -217,7 +222,7 @@ class ArNavigationController extends ChangeNotifier {
     await Future.delayed(_wakeWordBootDelay);
 
     _logger.i('[WakeWord] Iniciando WakeWordService y coordinator...');
-    _statusMessage = 'Di "Oye COMPAS" para navegar';
+    _statusMessage = 'Di "Oye compas" para navegar';
     notifyListeners();
 
     try {
