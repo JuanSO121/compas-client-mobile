@@ -1,5 +1,37 @@
 // lib/services/AI/integrated_voice_command_service.dart
-// ✅ v4.0 — Reinicio automático post-comando + arquitectura limpia.
+// ✅ v4.1 — Reinicio automático post-comando + arquitectura limpia.
+//           v4.1-a: Tiempos STT extendidos para usuarios con discapacidad visual.
+//
+// ============================================================================
+// CAMBIOS v4.0 → v4.1-a  (accesibilidad)
+// ============================================================================
+//
+//  CONTEXTO:
+//    COMPAS es una app para personas ciegas o con baja visión. Estas personas
+//    hablan a un ritmo diferente: hacen pausas naturales más largas mientras
+//    piensan el destino, articulan más despacio y pueden reformular en medio
+//    de la frase. Con _pauseFor = 4500ms el STT cortaba el audio antes de
+//    que terminaran de hablar, lo que generaba comandos incompletos o vacíos.
+//
+//  CAMBIOS:
+//    _pauseFor        : 4500ms → 8000ms
+//      Tiempo que el STT espera silencio antes de cerrar la sesión.
+//      8s da margen para pausas cognitivas sin afectar la experiencia normal.
+//      Alineado con el pauseFor que usaba WakeWordService antes de v4.2.
+//
+//    _listenFor       : 15s → 25s
+//      Tiempo máximo de escucha por sesión de comando.
+//      Un usuario con baja visión que dice "llévame a... espera... a la sala
+//      de lectura del segundo piso" puede tardar más de 15s fácilmente.
+//
+//    _sessionCooldown : 600ms → 400ms
+//      Reducir el cooldown entre sesiones para que la app responda más
+//      rápido cuando el usuario reintenta tras un silencio. No afecta la
+//      estabilidad porque el STT de Android ya libera el canal antes de 400ms
+//      en condiciones normales. En caso de error_busy el _onSpeechError
+//      ya maneja el retraso con su propio delay de 1s.
+//
+//  TODO LO DEMÁS ES IDÉNTICO A v4.0.
 //
 // ============================================================================
 // PROBLEMA RAÍZ (v3.x)
@@ -121,24 +153,37 @@ class IntegratedVoiceCommandService {
     'hey compass',
   ];
 
-  // ─── Configuración STT ─────────────────────────────────────────────────────
+  // ─── Configuración STT (v4.1-a: tiempos extendidos para accesibilidad) ────
 
   /// Tiempo que el STT espera silencio antes de enviar resultado final.
-  /// Android ignora valores > ~5s en muchos dispositivos.
-  static const Duration _pauseFor = Duration(milliseconds: 4500);
+  ///
+  /// v4.0: 4500ms — demasiado corto para usuarios con baja visión que hacen
+  /// pausas cognitivas naturales mientras recuerdan el nombre del destino.
+  ///
+  /// v4.1-a: 8000ms — permite pausas de hasta 8s sin cortar el comando.
+  /// En hardware lento con ARCore activo (GC >100ms) también evita que el
+  /// reconocedor expire antes de procesar el último fragmento de audio.
+  static const Duration _pauseFor = Duration(milliseconds: 8000);
 
   /// Tiempo máximo de escucha por sesión de comando.
-  static const Duration _listenFor = Duration(seconds: 15);
+  ///
+  /// v4.0: 15s — insuficiente para frases largas con pausas de orientación
+  /// ("llévame a... espera... a la sala de lectura del segundo piso").
+  ///
+  /// v4.1-a: 25s — margen cómodo incluso para frases elaboradas.
+  static const Duration _listenFor = Duration(seconds: 25);
 
   static const int _maxConsecutiveErrors = 3;
 
   // ─── Cooldown entre sesiones STT ───────────────────────────────────────────
 
   /// Tiempo mínimo entre el cierre de una sesión STT y la apertura de otra.
-  /// Necesario en Android para que el SpeechRecognizer libere el hardware.
-  /// Más corto que en v1.x porque STTSessionManager ya no impone su propio
-  /// cooldown — este es el único punto de control.
-  static const Duration _sessionCooldown = Duration(milliseconds: 600);
+  ///
+  /// v4.0: 600ms. Reducido a 400ms en v4.1-a para mejorar la reactividad
+  /// cuando el usuario reintenta un comando. El canal de audio de Android
+  /// se libera en <400ms en condiciones normales; el caso error_busy tiene
+  /// su propio delay de 1s en _onSpeechError().
+  static const Duration _sessionCooldown = Duration(milliseconds: 400);
 
   DateTime? _lastSessionClosedAt;
 
@@ -173,7 +218,11 @@ class IntegratedVoiceCommandService {
     }
 
     _isInitialized = true;
-    _log('v4.0 lista');
+    _log(
+      'v4.1-a lista (pauseFor=${_pauseFor.inMilliseconds}ms, '
+      'listenFor=${_listenFor.inSeconds}s, '
+      'cooldown=${_sessionCooldown.inMilliseconds}ms)',
+    );
   }
 
   Future<void> _ensurePermissions() async {
@@ -419,8 +468,9 @@ class IntegratedVoiceCommandService {
     // Cooldown adicional para que Android libere el canal de audio del TTS.
     await Future.delayed(const Duration(milliseconds: 400));
 
-    if (!_wakeWordModeActive)
+    if (!_wakeWordModeActive) {
       return; // pudo haberse desactivado durante la espera
+    }
 
     try {
       await wws.resume();
@@ -522,6 +572,7 @@ class IntegratedVoiceCommandService {
     'session_state': _sessionManager.state.name,
     'wake_word_mode': _wakeWordModeActive,
     'pause_for_ms': _pauseFor.inMilliseconds,
+    'listen_for_s': _listenFor.inSeconds,
     'session_cooldown_ms': _sessionCooldown.inMilliseconds,
     'fsm_stats': _fsm.getStatistics(),
   };

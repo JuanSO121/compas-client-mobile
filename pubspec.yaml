@@ -82,7 +82,7 @@ dev_dependencies:
 flutter_launcher_icons: # ← Nueva sección aquí (nivel flutter:)
   android: true
   ios: true
-  image_path: "assets/images/compas_V4.jpeg"  # Tu logo listo
+  image_path: "assets/images/isologo.png"  # Tu logo listo
   min_sdk_android: 21  # Adaptive icons
 
 flutter:
@@ -95,5 +95,7 @@ flutter:
     - assets/wake_words/porcupine_params_es.pv
     - .env
     - assets/images/
-    - assets/images/compas_V4.jpeg
+    - assets/images/isologo.png
+    - assets/images/V6.png
+    - assets/images/Texto.png
     - assets/models/deeplabv3_plus.tflite

@@ -357,7 +357,7 @@ class UnityBridgeService {
   Completer<void>? _sceneReadyCompleter;
   bool get isSceneReady => _bridgeState == BridgeState.ready;
 
-  static const Duration _sceneReadyTimeout = Duration(seconds: 15);
+  static const Duration _sceneReadyTimeout = Duration(seconds: 30);
   static const Duration _firstPingDelay    = Duration(seconds: 5);
 
   Timer? _pingTimer;

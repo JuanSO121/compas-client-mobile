@@ -1,18 +1,24 @@
 // lib/services/AI/navigation_coordinator.dart
-// ✅ v7.3 — Flutter silencioso al navegar · Sin "Sistema detenido" · TTS coordinado
+//
+// FIX v7.4-b:
+//   Agregado import faltante de VoiceNavigationService
+//   (causaba error en líneas 471 y 522).
+
+import 'dart:async'; // ← Timer, Completer
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'dart:async';
-
-import '../../models/shared_models.dart';
+import 'package:flutter/material.dart' hide NavigationMode;
+import '../../models/shared_models.dart'; // NavigationMode viene de aquí
 import '../../config/api_config.dart';
 import '../tts_service.dart';
 import '../unity_bridge_service.dart';
+import '../voice_navigation_service.dart'; // ← FIX: import faltante
 import 'conversation_service.dart';
 import 'integrated_voice_command_service.dart';
 import 'wake_word_service.dart';
 import 'ai_mode_controller.dart';
+import 'waypoint_context_service.dart';
 
 enum CoordinatorState {
   idle,
@@ -24,7 +30,7 @@ enum CoordinatorState {
 
 class NavigationCoordinator {
   static final NavigationCoordinator _instance =
-      NavigationCoordinator._internal();
+  NavigationCoordinator._internal();
   factory NavigationCoordinator() => _instance;
   NavigationCoordinator._internal();
 
@@ -45,6 +51,7 @@ class NavigationCoordinator {
   final WakeWordService               _wakeWordService     = WakeWordService();
   final TTSService                    _ttsService          = TTSService();
   final AIModeController              _aiModeController    = AIModeController();
+  final WaypointContextService        _waypointContext     = WaypointContextService();
 
   UnityBridgeService? _unityBridge;
 
@@ -61,10 +68,12 @@ class NavigationCoordinator {
   Completer<VoiceStatusInfo?>? _voiceStatusCompleter;
 
   Timer? _commandTimeoutTimer;
+  Timer? _waypointRefreshTimer; // v7.4 — timer para recarga de waypoints
 
-  static const Duration _commandTimeout      = Duration(seconds: 15);
-  static const Duration _ttsEchoDelay        = Duration(milliseconds: 300);
-  static const Duration _voiceStatusTimeout  = Duration(seconds: 3);
+  static const Duration _commandTimeout       = Duration(seconds: 15);
+  static const Duration _ttsEchoDelay         = Duration(milliseconds: 300);
+  static const Duration _voiceStatusTimeout   = Duration(seconds: 3);
+  static const Duration _waypointRefreshDelay = Duration(milliseconds: 800); // v7.4
 
   NavigationIntent? _currentIntent;
   NavigationMode    _mode = NavigationMode.eventBased;
@@ -90,7 +99,7 @@ class NavigationCoordinator {
     }
 
     try {
-      _log('Inicializando NavigationCoordinator v7.3...');
+      _log('Inicializando NavigationCoordinator v7.4...');
 
       await _ttsService.initialize();
       await _aiModeController.initialize();
@@ -103,7 +112,7 @@ class NavigationCoordinator {
       _isInitialized = true;
       _state = CoordinatorState.idle;
 
-      _log('SISTEMA v7.3 INICIALIZADO — '
+      _log('SISTEMA v7.4 INICIALIZADO — '
           'WakeWord: ${_wakeWordAvailable ? "ACTIVO" : "INACTIVO"} — '
           'Modo: ${_aiModeController.getModeDescription()}');
 
@@ -130,15 +139,46 @@ class NavigationCoordinator {
       );
     };
 
-    // ✅ NUEVO — permitir que voiceService espere al TTS
     _voiceService.isTtsSpeaking = () => _ttsService.isSpeaking;
 
-    // ✅ NUEVO — conectar wake word al voice service
     if (_wakeWordAvailable) {
       _voiceService.attachWakeWordService(_wakeWordService);
     }
 
-    _log('UnityBridgeService conectado + TTS sync');
+    bridge.onWaypointsReceived = (waypoints) {
+      _waypointContext.updateFromUnity(waypoints);
+      _log('🗺️ Waypoints actualizados en contexto: ${waypoints.length}');
+    };
+
+    // v7.4 — callback de mutación de waypoints
+    _conversationService.onWaypointMutation = () {
+      _log('🔄 Mutación de waypoint detectada — recargando lista en ${_waypointRefreshDelay.inMilliseconds}ms...');
+      _waypointRefreshTimer?.cancel();
+      _waypointRefreshTimer = Timer(_waypointRefreshDelay, () {
+        if (!_isInitialized || !_isActive) {
+          _log('⛔ Refresh cancelado: coordinator inactivo');
+          return;
+        }
+
+        final bridge = _unityBridge;
+
+        if (bridge != null && bridge.isReady) {
+          _log('📋 Solicitando lista actualizada de waypoints a Unity...');
+          bridge.listWaypoints();
+        } else {
+          _logError('No se pudo recargar waypoints: bridge no listo');
+        }
+      });
+    };
+
+    // v7.4: sincronización inicial
+    Future.delayed(const Duration(milliseconds: 1200), () {
+      if (_unityBridge != null && _unityBridge!.isReady) {
+        _log('🗺️ Solicitando snapshot inicial de waypoints...');
+        _unityBridge!.listWaypoints();
+      }
+    });
+    _log('UnityBridgeService conectado + TTS sync + waypoint mutation callback');
   }
 
   // ─── voice_status ─────────────────────────────────────────────────────────
@@ -180,10 +220,10 @@ class NavigationCoordinator {
     }
 
     final sb = StringBuffer();
-    if (info.destination.isNotEmpty)    sb.write('Vas hacia ${info.destination}. ');
-    if (info.remainingSteps > 0)        sb.write('Quedan ${info.remainingSteps} pasos. ');
+    if (info.destination.isNotEmpty)     sb.write('Vas hacia ${info.destination}. ');
+    if (info.remainingSteps > 0)         sb.write('Quedan ${info.remainingSteps} pasos. ');
     if (info.nextInstruction.isNotEmpty) sb.write('Próxima indicación: ${info.nextInstruction}');
-    else if (info.ttsBusy)              sb.write('La guía de voz está hablando.');
+    else if (info.ttsBusy)               sb.write('La guía de voz está hablando.');
 
     final result = sb.toString().trim();
     return result.isNotEmpty ? result : 'Navegación activa.';
@@ -378,7 +418,6 @@ class NavigationCoordinator {
           final phrase = statusInfo != null
               ? _buildVoiceStatusPhrase(statusInfo)
               : 'No pude obtener el estado.';
-          // Status es conversacional: Flutter habla.
           await _ttsService.speak(phrase, interrupt: false);
           await _ttsService.waitForCompletion();
           onConversationalResponse?.call(phrase);
@@ -389,17 +428,47 @@ class NavigationCoordinator {
         // ── STOP_VOICE ───────────────────────────────────────────────────────
         if (target == '__unity:stop_voice') {
           _unityBridge?.stopVoice();
-          // Confirmación breve por Flutter (Unity ya no habla nada)
-          final confirmMsg = 'Guía de voz detenida.';
+          const confirmMsg = 'Guía de voz detenida.';
           await _ttsService.speak(confirmMsg, interrupt: false);
           await _ttsService.waitForCompletion();
           await _completeAndReturnToIdle(suppressSTT: _navigationActive);
           return;
         }
 
-        // ── Otros prefijos __unity:* (comandos internos) ─────────────────────
+        // v7.4 — Comandos de mutación de waypoints con confirmación TTS
+        if (target == '__unity:clear_waypoints') {
+          onIntentDetected?.call(response.intent!);
+          await Future.delayed(_ttsEchoDelay);
+          if (!_navigationExecuted) {
+            _navigationExecuted = true;
+            onCommandExecuted?.call(response.intent!);
+          }
+          await _completeAndReturnToIdle(suppressSTT: _navigationActive);
+          return;
+        }
+
+        if (target.startsWith('__unity:create_waypoint:') ||
+            target.startsWith('__unity:remove_waypoint:')) {
+          onIntentDetected?.call(response.intent!);
+          await Future.delayed(_ttsEchoDelay);
+          if (!_navigationExecuted) {
+            _navigationExecuted = true;
+            onCommandExecuted?.call(response.intent!);
+          }
+          await _completeAndReturnToIdle(suppressSTT: _navigationActive);
+          return;
+        }
+
+        // ── INTRODUCCIÓN COMPAS ─────────────────────────────────────────────
+        if (target == '__unity:introduce_compas') {
+          final voiceNav = VoiceNavigationService();
+          await voiceNav.playIntroductionSequence();
+          await _completeAndReturnToIdle(suppressSTT: _navigationActive);
+          return;
+        }
+
+        // ── Otros prefijos __unity:* ─────────────────────────────────────────
         if (target.startsWith('__unity:')) {
-          // ✅ v7.3: Flutter NO habla. Unity gestiona su propio feedback.
           onIntentDetected?.call(response.intent!);
           await Future.delayed(_ttsEchoDelay);
           if (!_navigationExecuted) {
@@ -415,7 +484,6 @@ class NavigationCoordinator {
         final resolved  = _resolveWaypointName(target, waypoints);
 
         if (resolved == null) {
-          // No hay match — Flutter habla el error (Unity no sabe qué decir)
           final names = waypoints.isNotEmpty
               ? waypoints.map((w) => w.name).join(', ')
               : 'ninguno cargado aún';
@@ -439,31 +507,25 @@ class NavigationCoordinator {
           suggestedResponse: response.intent!.suggestedResponse,
         );
 
-        // ✅ v7.3: Flutter NO habla aquí.
-        // Unity hablará "Listo, vamos a X." cuando reciba navigate_to.
-        // Solo notificamos la UI y ejecutamos el comando.
+        final voiceNav = VoiceNavigationService(); // singleton
+        await voiceNav.announceNavigationStarting(resolved);
         onIntentDetected?.call(resolvedIntent);
         await Future.delayed(_ttsEchoDelay);
-
         if (!_navigationExecuted) {
           _navigationExecuted = true;
           _navigationActive   = true;
           onCommandExecuted?.call(resolvedIntent);
         }
 
-        // Volvemos a idle/wake-word pero mantenemos suppressSTT=true
-        // porque la navegación sigue activa.
         await _completeAndReturnToIdle(suppressSTT: true);
 
       } else {
-        // ── RESPUESTA CONVERSACIONAL (HELP, UNKNOWN, etc.) ────────────────────
-        // Flutter habla cuando NO hay navegación involucrada.
+        // ── RESPUESTA CONVERSACIONAL ──────────────────────────────────────────
         final bridgeReady = _unityBridge != null &&
             _unityBridge!.isReady &&
             response.message.isNotEmpty;
 
         if (bridgeReady) {
-          // Usar Unity TTS con p=1 para no interrumpir instrucciones activas
           _unityBridge!.speakArbitraryText(
             response.message,
             priority: 1,
@@ -500,7 +562,6 @@ class NavigationCoordinator {
     _log('"Oye COMPAS" detectado');
     HapticFeedback.heavyImpact();
 
-    // ✅ NUEVO — activar modo wake word
     _voiceService.setWakeWordModeActive(true);
 
     await _transitionToListeningCommand();
@@ -528,13 +589,11 @@ class NavigationCoordinator {
       await _ttsService.speak(greeting, interrupt: true);
       await _ttsService.waitForCompletion();
 
-      // 🔥 CRÍTICO: esperar a que el audio REAL deje de sonar
-            while (_ttsService.isSpeaking) {
-              await Future.delayed(const Duration(milliseconds: 50));
-            }
+      while (_ttsService.isSpeaking) {
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
 
-      // buffer extra realista (hardware/audio)
-            await Future.delayed(const Duration(milliseconds: 500));
+      await Future.delayed(const Duration(milliseconds: 500));
 
       _state = CoordinatorState.listeningCommand;
       _partialText = '';
@@ -563,10 +622,10 @@ class NavigationCoordinator {
 
   String _getRandomGreeting() {
     const greetings = [
-  'Dime, te escucho',
-  'Estoy listo, dime',
-  '¿En qué puedo ayudarte exactamente?',
-];
+      'Dime, te escucho',
+      'Estoy listo, dime',
+      '¿En qué puedo ayudarte?',
+    ];
     return greetings[DateTime.now().millisecond % greetings.length];
   }
 
@@ -619,7 +678,6 @@ class NavigationCoordinator {
     _state = CoordinatorState.idle;
 
     if (_wakeWordAvailable && _isActive) {
-      // ✅ Siempre reanudar wake word, independiente de suppressSTT
       try {
         _voiceService.setWakeWordActive(true);
         await _wakeWordService.resume();
@@ -630,7 +688,6 @@ class NavigationCoordinator {
         _logError('Error reanudando wake word: $e');
       }
     } else if (!suppressSTT && _isActive) {
-      // Sin wake word disponible: reactivar STT directo
       try {
         await Future.delayed(const Duration(milliseconds: 600));
         if (_voiceService.sessionManager.canStart()) {
@@ -675,7 +732,7 @@ class NavigationCoordinator {
         await _wakeWordService.start();
         onStatusUpdate?.call('Di "Oye COMPAS"');
         await Future.delayed(const Duration(milliseconds: 500));
-        await _ttsService.speak('Sistema conversacional activado');
+        await _ttsService.speak('Estoy aqui para ti');
         await _ttsService.waitForCompletion();
       } else {
         _voiceService.setWakeWordActive(false);
@@ -702,6 +759,7 @@ class NavigationCoordinator {
       _voiceService.setWakeWordModeActive(false);
 
       _commandTimeoutTimer?.cancel();
+      _waypointRefreshTimer?.cancel(); // v7.4
       _partialText = '';
 
       _voiceStatusCompleter?.complete(null);
@@ -716,9 +774,6 @@ class NavigationCoordinator {
       }
 
       _state = CoordinatorState.idle;
-
-      // ✅ v7.3: eliminado _ttsService.speak('Sistema detenido').
-      //          Era ruido innecesario sin valor para el usuario.
 
     } catch (e) {
       _logError('Error stop: $e');
@@ -761,6 +816,8 @@ class NavigationCoordinator {
       'navigation_active':      _navigationActive,
       'unity_bridge_connected': _unityBridge != null,
       'waypoints_cached':       _unityBridge?.cachedWaypoints.length ?? 0,
+      'waypoints_in_context':   _waypointContext.count,           // v7.4
+      'mutation_callback_set':  _conversationService.onWaypointMutation != null, // v7.4
     },
   };
 
@@ -777,18 +834,28 @@ class NavigationCoordinator {
     _navigationActive   = false;
     _voiceStatusCompleter?.complete(null);
     _voiceStatusCompleter = null;
+    _waypointRefreshTimer?.cancel(); // v7.4
+    _waypointRefreshTimer = null;
     _state             = CoordinatorState.idle;
     _commandTimeoutTimer?.cancel();
   }
 
   void dispose() {
-    stop();
     _commandTimeoutTimer?.cancel();
-    _voiceStatusCompleter?.complete(null);
-    _voiceStatusCompleter = null;
+    _waypointRefreshTimer?.cancel();
+
+    _conversationService.onWaypointMutation = null;
+
     if (_unityBridge != null) {
       _unityBridge!.onVoiceStatusReceived = null;
+      _unityBridge!.onWaypointsReceived   = null;
     }
+
+    stop();
+
+    _voiceStatusCompleter?.complete(null);
+    _voiceStatusCompleter = null;
+
     _voiceService.dispose();
     _wakeWordService.dispose();
     _ttsService.dispose();

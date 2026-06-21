@@ -1,39 +1,41 @@
 // lib/services/AI/wake_word_service.dart
-// ✅ v4.2 — pauseFor extendido · error_no_match recuperable · guard de eco TTS
+// ✅ v4.3 — Fix race condition timer/suppressUntil · health guard · closeSession reset
 //
 // ============================================================================
-//  CAMBIOS v4.1 → v4.2
+//  CAMBIOS v4.2 → v4.3
 // ============================================================================
 //
-//  FIX 1 — pauseFor: 8s → 20s
-//    Con CPU saturada por ARCore/Unity (GC >100ms, FeatureExtraction 117ms)
-//    el reconocedor expira el silencio antes de que el usuario termine de
-//    hablar. Aumentar a 20s da margen suficiente sin coste real de batería
-//    porque el VAD de Android sigue activo y el buffer se drena en cuanto
-//    hay audio. En hardware rápido el comportamiento es idéntico a 8s.
+//  CONTEXTO DEL BUG:
+//    Al decir "oye compa" (parcial sin match), el STT recibe el texto pero
+//    no dispara detección. Inmediatamente después el TTS habla ("Sistema
+//    conversacional activado"), notifyTTSStarted() cierra la sesión, y
+//    notifyTTSEnded() programa un timer de 2500ms para reabrir.
+//    El timer llega cuando _suppressUntil aún no expiró (milisegundos de
+//    diferencia por CPU saturada de ARCore, GC >300ms en logs). Esto genera
+//    un timer anidado de ~0-50ms que cuando llega encuentra _isListening en
+//    estado inconsistente → el micrófono muere silenciosamente.
 //
-//  FIX 2 — error_no_match tratado como recuperable (no permanent)
-//    Android a veces marca error_no_match con permanent:true cuando la CPU
-//    no puede procesar el audio a tiempo (logs: "FeatureExtraction took
-//    117ms"). NO es un error irrecuperable del sistema — simplemente no
-//    reconoció la frase. Solución: ignorar el flag permanent para este
-//    error específico y reiniciar la sesión con _restartDelay normal.
-//    Elimina el ciclo fatal: error_no_match → onError() → stop total.
+//  FIX 1 — notifyTTSEnded(): margen +150ms + limpiar _suppressUntil antes
+//    El timer ahora llega GARANTIZADAMENTE después de que _suppressUntil
+//    expiró. Se limpia _suppressUntil antes de llamar _openSession() para
+//    evitar que la condición de carrera genere un timer anidado.
 //
-//  FIX 3 — Guard de eco TTS (_ttsActive + suppressUntil)
-//    Cuando TTS habla, el STT capta el audio propio y cierra la sesión
-//    prematuramente (log: STT: "sistema" → notListening).
-//    Nuevas APIs:
-//      notifyTTSStarted() — llamar desde VoiceNavigationService._speak()
-//                           antes de _ttsService!.speak()
-//      notifyTTSEnded()   — llamar en el finally de _speak()
-//    Internamente se establece un _suppressUntil = now + 1500ms tras el
-//    final del TTS. Durante ese intervalo _onResult() descarta resultados
-//    para evitar que el eco residual del altavoz se confunda con wake word.
-//    _openSession() también bloquea la apertura si TTS está activo, y la
-//    reencola automáticamente con _ttsSuppressDelay (600ms).
+//  FIX 2 — _openSession(): limpiar _suppressUntil antes del delay anidado
+//    Si por alguna razón el timer llega cuando el guard de eco aún está
+//    activo, se limpia _suppressUntil antes de programar el siguiente delay
+//    para que la re-entrada no vuelva a pasar por este bloque.
 //
-//  TODO LO DEMÁS ES IDÉNTICO A v4.1.
+//  FIX 3 — _closeSession(): resetear _isListening SIEMPRE (antes del guard)
+//    Cuando notifyTTSStarted() llama _closeSession() mientras una sesión
+//    está en proceso de apertura, _isListening puede quedar true. Moverlo
+//    antes del if garantiza el reset en todos los caminos.
+//
+//  FIX 4 — _onHealthTick(): respetar ventana de supresión de eco
+//    El health monitor no debe intervenir mientras hay un timer de eco
+//    pendiente. Añadido guard contra _suppressUntil activo para evitar
+//    que el watchdog compita con el timer de notifyTTSEnded().
+//
+//  TODOS LOS FIXES v4.2 SE MANTIENEN INTACTOS.
 
 import 'dart:async';
 import 'package:flutter/foundation.dart';
@@ -92,21 +94,28 @@ class WakeWordService {
   int       _detectionCount = 0;
   DateTime? _lastDetection;
 
-  // ─── FIX 3: Guard de eco TTS ─────────────────────────────────────────────
-  bool      _ttsActive    = false;          // TTS reproduciendo ahora mismo
-  DateTime? _suppressUntil;                // eco residual suprimido hasta aquí
+  // ─── Guard de eco TTS ────────────────────────────────────────────────────
+  bool      _ttsActive     = false;
+  DateTime? _suppressUntil;
 
-  // Delay para reintentar _openSession() cuando TTS aún está activo
+  // ─── Health monitor ──────────────────────────────────────────────────────
+  Timer? _healthTimer;
+  static const Duration _healthCheckInterval = Duration(seconds: 12);
+  bool _healthMonitorEnabled = false;
+
+  // ─── Timings ─────────────────────────────────────────────────────────────
+  // FIX 1: margen adicional sobre _ttsEchoWindow para que el timer llegue
+  // GARANTIZADAMENTE después de que _suppressUntil expiró, incluso con
+  // CPU saturada por ARCore (GC >300ms observado en logs).
   static const Duration _ttsSuppressDelay = Duration(milliseconds: 600);
-
-  // Ventana de supresión tras el fin del TTS para ignorar eco residual
-  static const Duration _ttsEchoWindow = Duration(milliseconds: 1500);
+  static const Duration _ttsEchoWindow    = Duration(milliseconds: 2500);
+  static const Duration _timerMargin      = Duration(milliseconds: 150);
 
   // ─── Callbacks ──────────────────────────────────────────────────────────
   Function()?       onWakeWordDetected;
   Function(String)? onError;
 
-  // ─── Palabras clave ──────────────────────────────────────────────────────
+  // ─── Keywords ────────────────────────────────────────────────────────────
   static const List<String> _keywords = [
     'oye compas',
     'oye compass',
@@ -120,11 +129,7 @@ class WakeWordService {
   ];
 
   static const Duration _sessionDuration = Duration(hours: 1);
-
-  // ✅ v4.1: 800ms (mantenido)
-  static const Duration _restartDelay = Duration(milliseconds: 800);
-
-  // ✅ v4.1: 1500ms para error_client (mantenido)
+  static const Duration _restartDelay    = Duration(milliseconds: 800);
   static const Duration _errorClientDelay = Duration(milliseconds: 1500);
 
   // ─── initialize ──────────────────────────────────────────────────────────
@@ -137,7 +142,7 @@ class WakeWordService {
     if (_isInitialized) return;
 
     try {
-      _log('Inicializando v4.2 (pauseFor=20s, error_no_match recuperable, guard TTS)...');
+      _log('Inicializando v4.3 (race-condition fix, health guard)...');
 
       _currentKeyword     = config.keyword;
       _currentSensitivity = sensitivity;
@@ -151,7 +156,7 @@ class WakeWordService {
       if (!available) throw Exception('STT no disponible en este dispositivo');
 
       _isInitialized = true;
-      _log('v4.2 listo — keywords: ${_keywords.join(", ")}');
+      _log('v4.3 listo — keywords: ${_keywords.join(", ")}');
     } catch (e) {
       _logError('Error inicializando: $e');
       onError?.call(e.toString());
@@ -159,32 +164,44 @@ class WakeWordService {
     }
   }
 
-  // ─── API de guard TTS (FIX 3) ────────────────────────────────────────────
+  // ─── Health monitor ──────────────────────────────────────────────────────
+
+  void enableHealthMonitor() {
+    _healthMonitorEnabled = true;
+    _log('Health monitor activado (${_healthCheckInterval.inSeconds}s)');
+    _restartHealthTimer();
+  }
+
+  // ─── API de guard TTS ────────────────────────────────────────────────────
 
   /// Llamar desde VoiceNavigationService ANTES de iniciar TTS.
-  /// Cierra la sesión STT activa para evitar que el altavoz contamine el mic.
   Future<void> notifyTTSStarted() async {
-    _ttsActive   = true;
-    _suppressUntil = null; // resetear ventana anterior
+    _ttsActive     = true;
+    _suppressUntil = null;
     _log('TTS activo — suprimiendo STT');
     await _closeSession();
   }
 
   /// Llamar desde VoiceNavigationService en el finally de _speak().
-  /// Activa la ventana de supresión de eco y reencola la apertura de sesión.
+  ///
+  /// FIX 1: el timer se programa con _ttsEchoWindow + _timerMargin (150ms)
+  /// para que llegue GARANTIZADAMENTE después de que _suppressUntil expiró,
+  /// incluso con CPU saturada por ARCore. Se limpia _suppressUntil antes de
+  /// llamar _openSession() para evitar timer anidado por race condition.
   void notifyTTSEnded() {
     _ttsActive     = false;
     _suppressUntil = DateTime.now().add(_ttsEchoWindow);
-    _log('TTS terminó — eco suprimido ${_ttsEchoWindow.inMilliseconds}ms, '
-        'reabriendo STT...');
 
-    if (_isStarted && !_isPaused && !_detected) {
-      Future.delayed(_ttsEchoWindow, () {
-        if (_isStarted && !_isPaused && !_detected && !_isListening) {
-          _openSession();
-        }
-      });
-    }
+    _log('TTS terminó — supresión de eco ${_ttsEchoWindow.inMilliseconds}ms');
+
+    Future.delayed(_ttsEchoWindow + _timerMargin, () async {
+      if (!_ttsActive && _isInitialized && _isStarted && !_isPaused && !_detected) {
+        // FIX 1: limpiar _suppressUntil antes de _openSession() para que
+        // el guard de eco no genere un segundo timer anidado.
+        _suppressUntil = null;
+        await _openSession();
+      }
+    });
   }
 
   // ─── start ───────────────────────────────────────────────────────────────
@@ -238,24 +255,29 @@ class WakeWordService {
     if (_isListening) return;
     if (!_isInitialized || !_isStarted || _isPaused) return;
 
-    // FIX 3: bloquear apertura mientras TTS está activo
+    // Guard: TTS activo
     if (_ttsActive) {
-      _log('TTS activo — posponiendo apertura de sesión ${_ttsSuppressDelay.inMilliseconds}ms');
+      _log('TTS activo — posponiendo apertura ${_ttsSuppressDelay.inMilliseconds}ms');
       Future.delayed(_ttsSuppressDelay, () {
-        if (_isStarted && !_isPaused && !_detected && !_isListening) {
+        if (_isStarted && !_isPaused && !_detected && !_isListening && !_ttsActive) {
           _openSession();
         }
       });
       return;
     }
 
-    // FIX 3: bloquear si aún estamos en la ventana de eco residual
+    // FIX 2: guard de eco residual — limpiar _suppressUntil antes del delay
+    // para que la re-entrada no vuelva a pasar por este bloque.
     final now = DateTime.now();
     if (_suppressUntil != null && now.isBefore(_suppressUntil!)) {
       final remaining = _suppressUntil!.difference(now);
       _log('Eco residual — posponiendo ${remaining.inMilliseconds}ms');
-      Future.delayed(remaining, () {
-        if (_isStarted && !_isPaused && !_detected && !_isListening) {
+
+      // FIX 2: limpiar antes de programar el delay para evitar re-entrada
+      _suppressUntil = null;
+
+      Future.delayed(remaining + const Duration(milliseconds: 100), () {
+        if (_isStarted && !_isPaused && !_detected && !_isListening && !_ttsActive) {
           _openSession();
         }
       });
@@ -268,7 +290,6 @@ class WakeWordService {
       await _stt.listen(
         onResult:       _onResult,
         listenFor:      _sessionDuration,
-        // ✅ FIX 1: 8s → 20s para tolerar CPU saturada por ARCore/Unity
         pauseFor:       const Duration(seconds: 20),
         partialResults: true,
         localeId:       'es_CO',
@@ -277,6 +298,7 @@ class WakeWordService {
       );
 
       _log('Sesión abierta (listenFor=1h, pauseFor=20s)');
+      _restartHealthTimer();
     } catch (e) {
       _isListening = false;
       _logError('Error abriendo sesión: $e');
@@ -284,9 +306,14 @@ class WakeWordService {
     }
   }
 
+  /// FIX 3: resetear _isListening ANTES del guard para garantizar el reset
+  /// en todos los caminos, incluso cuando se llama durante una apertura
+  /// incompleta (ej: notifyTTSStarted() llega mientras _openSession() está
+  /// en curso y _isListening ya fue seteado a true).
   Future<void> _closeSession() async {
-    if (!_isListening) return;
+    // FIX 3: mover el reset ANTES del guard
     _isListening = false;
+
     try {
       await _stt.stop();
       _log('Sesión cerrada');
@@ -300,7 +327,6 @@ class WakeWordService {
   void _onResult(SpeechRecognitionResult result) {
     if (!_isStarted || _isPaused || _detected) return;
 
-    // FIX 3: descartar resultados durante ventana de eco TTS
     if (_ttsActive) return;
     final now = DateTime.now();
     if (_suppressUntil != null && now.isBefore(_suppressUntil!)) return;
@@ -315,7 +341,7 @@ class WakeWordService {
         _log('✅ Detectado: "$kw"');
         _detectionCount++;
         _lastDetection = DateTime.now();
-        _detected = true;
+        _detected      = true;
 
         _closeSession().then((_) {
           onWakeWordDetected?.call();
@@ -342,10 +368,8 @@ class WakeWordService {
   }
 
   void _onSttError(SpeechRecognitionError error) {
-    // error_busy: ignorar
     if (error.errorMsg == 'error_busy') return;
 
-    // error_speech_timeout: reiniciar normalmente
     if (error.errorMsg == 'error_speech_timeout') {
       _isListening = false;
       if (_isStarted && !_isPaused && !_detected) {
@@ -354,7 +378,6 @@ class WakeWordService {
       return;
     }
 
-    // ✅ v4.1 FIX: error_client — condición de carrera recuperable
     if (error.errorMsg == 'error_client') {
       _log('error_client — esperando liberación del recognizer '
           '(${_errorClientDelay.inMilliseconds}ms)...');
@@ -369,9 +392,7 @@ class WakeWordService {
       return;
     }
 
-    // ✅ v4.2 FIX 2: error_no_match — NO es fatal aunque permanent:true
-    // Android lo marca permanent cuando la CPU no procesa el audio a tiempo
-    // (FeatureExtraction >100ms). Simplemente reiniciar la sesión.
+    // v4.2 FIX: error_no_match no es fatal aunque permanent:true
     if (error.errorMsg == 'error_no_match') {
       _log('error_no_match — ignorando flag permanent, reiniciando sesión...');
       _isListening = false;
@@ -381,7 +402,6 @@ class WakeWordService {
       return;
     }
 
-    // Otros errores
     _logError('STT error: ${error.errorMsg} (permanent: ${error.permanent})');
     _isListening = false;
 
@@ -390,7 +410,6 @@ class WakeWordService {
       return;
     }
 
-    // Error recuperable
     if (_isStarted && !_isPaused && !_detected) {
       Future.delayed(const Duration(seconds: 2), () {
         if (_isStarted && !_isPaused && !_detected) _openSession();
@@ -408,6 +427,36 @@ class WakeWordService {
     });
   }
 
+  // ─── Health monitor ──────────────────────────────────────────────────────
+
+  void _restartHealthTimer() {
+    _healthTimer?.cancel();
+    if (!_healthMonitorEnabled) return;
+
+    _healthTimer = Timer.periodic(_healthCheckInterval, (_) => _onHealthTick());
+  }
+
+  Future<void> _onHealthTick() async {
+    if (_ttsActive) return;
+    if (!_isInitialized) return;
+    if (_stt.isListening) return;
+    if (!_isStarted || _isPaused || _detected) return;
+
+    // FIX 4: no intervenir si hay un timer de eco pendiente — el
+    // watchdog no debe competir con el timer de notifyTTSEnded().
+    final now = DateTime.now();
+    if (_suppressUntil != null && now.isBefore(_suppressUntil!)) {
+      _log('Health: eco pendiente — skip');
+      return;
+    }
+
+    _log('⚠️ Health: STT inactivo sin razón — reiniciando sesión');
+
+    await _closeSession();
+    await Future.delayed(const Duration(milliseconds: 600));
+    await _openSession();
+  }
+
   // ─── setSensitivity — no-op ──────────────────────────────────────────────
 
   Future<void> setSensitivity(double sensitivity, String accessKey) async {
@@ -417,23 +466,24 @@ class WakeWordService {
   // ─── getStatistics ───────────────────────────────────────────────────────
 
   Map<String, dynamic> getStatistics() => {
-    'is_initialized':          _isInitialized,
-    'is_started':              _isStarted,
-    'is_listening':            _isListening,
-    'is_paused':               _isPaused,
-    'detected':                _detected,
-    'tts_active':              _ttsActive,
-    'suppress_until':          _suppressUntil?.toIso8601String(),
-    'keyword':                 _currentKeyword,
-    'sensitivity':             _currentSensitivity,
-    'detection_count':         _detectionCount,
-    'last_detection':          _lastDetection?.toIso8601String(),
-    'engine':                  'speech_to_text_v4.2_long_session',
-    'restart_delay_ms':        _restartDelay.inMilliseconds,
-    'error_client_delay_ms':   _errorClientDelay.inMilliseconds,
-    'tts_suppress_delay_ms':   _ttsSuppressDelay.inMilliseconds,
-    'tts_echo_window_ms':      _ttsEchoWindow.inMilliseconds,
-    'pause_for_seconds':       20,
+    'is_initialized':        _isInitialized,
+    'is_started':            _isStarted,
+    'is_listening':          _isListening,
+    'is_paused':             _isPaused,
+    'detected':              _detected,
+    'tts_active':            _ttsActive,
+    'suppress_until':        _suppressUntil?.toIso8601String(),
+    'keyword':               _currentKeyword,
+    'sensitivity':           _currentSensitivity,
+    'detection_count':       _detectionCount,
+    'last_detection':        _lastDetection?.toIso8601String(),
+    'engine':                'speech_to_text_v4.3_race_fix',
+    'restart_delay_ms':      _restartDelay.inMilliseconds,
+    'error_client_delay_ms': _errorClientDelay.inMilliseconds,
+    'tts_suppress_delay_ms': _ttsSuppressDelay.inMilliseconds,
+    'tts_echo_window_ms':    _ttsEchoWindow.inMilliseconds,
+    'timer_margin_ms':       _timerMargin.inMilliseconds,
+    'pause_for_seconds':     20,
   };
 
   void resetStatistics() {
@@ -453,6 +503,7 @@ class WakeWordService {
   // ─── dispose ─────────────────────────────────────────────────────────────
 
   Future<void> dispose() async {
+    _healthTimer?.cancel();
     await stop();
     _isInitialized = false;
   }

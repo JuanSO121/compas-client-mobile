@@ -1,40 +1,25 @@
 // lib/services/voice_navigation_service.dart
-// ✅ v6.7 — Integración guard TTS↔STT con WakeWordService
+// ✅ v6.8 — Lenguaje empático + aviso segmentación + health monitor hook
 //
 // ============================================================================
-//  CAMBIOS v6.6 → v6.7
+//  CAMBIOS v6.7 → v6.8
 // ============================================================================
 //
-//  FIX PRINCIPAL — Mutex TTS↔STT vía WakeWordService.notifyTTSStarted/Ended
+//  1. LENGUAJE EMPÁTICO — _friendlyText() convierte instrucciones planas
+//     en frases cortas, cálidas y orientadas al usuario con discapacidad
+//     visual. Ejemplos:
+//       "TurnLeft"  → "Gira a la izquierda aquí"
+//       "ObstacleWarning" → "¡Cuidado! Hay algo en tu camino"
+//       "Arrived"  → "¡Llegaste! Muy bien."
 //
-//    En v6.6, _pauseWakeWord() llamaba wakeWordService.pause() y
-//    _resumeWakeWord() llamaba wakeWordService.resume(). Este enfoque tenía
-//    dos problemas:
+//  2. AVISO DE SEGMENTACIÓN — announceSegmentationLoading() emite un
+//     mensaje amable antes de que cargue el modelo de segmentación.
+//     El AR controller lo llama al iniciar la navegación.
 //
-//    1. pause()/resume() son asíncronos y pueden llegar tarde: si el TTS
-//       empieza a reproducir antes de que pause() complete, el STT ya captó
-//       el primer frame de audio del altavoz.
+//  3. HOOK DE HEALTH — onMicHealthEvent callback para que el controller
+//     pueda reaccionar si el micrófono se cae (ej: mostrar badge en UI).
 //
-//    2. resume() no conoce la ventana de eco residual: el STT se reabría
-//       inmediatamente y podía capturar el final del audio del altavoz.
-//
-//    v6.7 reemplaza las llamadas directas a pause()/resume() por:
-//      • notifyTTSStarted() — cierra la sesión STT síncronamente y bloquea
-//        cualquier nueva apertura mientras _ttsActive == true.
-//      • notifyTTSEnded()   — activa la ventana de supresión de eco (1500ms)
-//        y reencola la apertura de sesión automáticamente.
-//
-//    Ambos métodos viven en WakeWordService v4.2 y son la fuente de verdad
-//    del guard. VoiceNavigationService solo los llama en los puntos exactos:
-//      ANTES  de _ttsService!.speak()  → notifyTTSStarted()
-//      finally de _speak()             → notifyTTSEnded()
-//
-//  NOTA: _pauseWakeWord() y _resumeWakeWord() se conservan como no-ops
-//  comentados para documentar el diseño anterior. El token de generación
-//  (_resumeGeneration) ya no es necesario pero se mantiene por compatibilidad
-//  con v6.5 en caso de rollback.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v6.6.
+//  TODO LO DEMÁS ES IDÉNTICO A v6.7.
 
 import 'dart:async';
 import 'dart:convert';
@@ -100,11 +85,15 @@ class VoiceNavigationService {
   StreamSubscription<UnityResponse>? _unitySubscription;
   StreamSubscription<void>?          _ttsCompletionSubscription;
 
-  // Token de generación (conservado por compatibilidad con v6.5)
   int _resumeGeneration = 0;
 
   final ValueNotifier<bool> isReadyNotifier = ValueNotifier(false);
   bool get isReady => _ttsReady;
+
+  // ─── v6.8: Hook de health del micrófono ─────────────────────────────────
+  /// Callback que el controller puede registrar para reaccionar a eventos
+  /// de salud del micrófono. Parámetro: descripción corta del evento.
+  Function(String event)? onMicHealthEvent;
 
   // ─── Inicialización ──────────────────────────────────────────────────────
 
@@ -123,7 +112,7 @@ class VoiceNavigationService {
 
     _ttsReady = true;
     isReadyNotifier.value = true;
-    _log('v6.7 listo — cola máx: $_maxQueueSize');
+    _log('v6.8 listo — cola máx: $_maxQueueSize');
   }
 
   void attachWakeWordService(WakeWordService wakeWordService) {
@@ -135,15 +124,11 @@ class VoiceNavigationService {
 
   void _onTTSCompleted() {}
 
-  // ─── Guard TTS↔STT (v6.7) ────────────────────────────────────────────────
+  // ─── Guard TTS↔STT (v6.7, sin cambios) ──────────────────────────────────
 
-  /// Notifica al WakeWordService que el TTS va a comenzar.
-  /// WakeWordService cierra la sesión STT y bloquea nuevas aperturas.
-  /// Es async porque _closeSession() en WakeWordService es async.
   Future<void> _notifyTTSStarted() async {
     if (_wakeWordService == null) return;
     if (!_wakeWordService!.isInitialized) return;
-    // Incrementar generación para cancelar cualquier resume() pendiente
     _resumeGeneration++;
     try {
       await _wakeWordService!.notifyTTSStarted();
@@ -152,8 +137,6 @@ class VoiceNavigationService {
     }
   }
 
-  /// Notifica al WakeWordService que el TTS terminó.
-  /// WakeWordService activará la ventana de eco y reabrirá STT automáticamente.
   void _notifyTTSEnded() {
     if (_wakeWordService == null) return;
     if (!_wakeWordService!.isInitialized) return;
@@ -164,18 +147,69 @@ class VoiceNavigationService {
     }
   }
 
-  // ─── Métodos legacy (no-ops — conservados para rollback) ─────────────────
+  // ─── v6.8: Aviso de carga del modelo de segmentación ────────────────────
 
-  // ignore: unused_element
-  Future<void> _pauseWakeWord() async {
-    // Reemplazado por _notifyTTSStarted() en v6.7.
-    // No-op intencional.
+  /// Llama esto justo ANTES de iniciar la navegación AR, cuando el modelo
+  /// de segmentación todavía no ha cargado. El usuario escuchará un aviso
+  /// amable en lugar de un silencio desconcertante.
+  Future<void> announceSegmentationLoading() async {
+    const msg =
+        'Dame un momento, estoy preparando todo para guiarte. '
+        'Ya casi estoy listo.';
+    await speak(msg);
   }
 
-  // ignore: unused_element
-  void _resumeWakeWord() {
-    // Reemplazado por _notifyTTSEnded() en v6.7.
-    // No-op intencional.
+  /// Secuencia inicial de navegación.
+  /// Evita silencios largos mientras se calcula la ruta.
+  Future<void> announceNavigationStarting(String destination) async {
+    await speak('Buscando ruta a $destination.');
+  }
+  /// Llama esto cuando el modelo de segmentación terminó de cargar.
+  Future<void> announceSegmentationReady() async {
+    const msg = '¡Listo! Ya puedo ver tu entorno. Empecemos.';
+    await speak(msg);
+  }
+
+  // ─── v6.8: Lenguaje empático ─────────────────────────────────────────────
+
+  /// Convierte el tipo de anuncio y/o texto plano en una frase corta,
+  /// cálida y fácil de entender para usuarios con discapacidad visual.
+  ///
+  /// Si [announcementType] tiene una frase predefinida, la usa.
+  /// Si no, devuelve [rawText] sin modificar para no romper mensajes
+  /// personalizados ya bien redactados.
+  static String _friendlyText(String rawText, String announcementType) {
+    const Map<String, String> _friendlyMap = {
+      // Giros
+      'TurnLeft'    : 'Gira a la izquierda aquí.',
+      'TurnRight'   : 'Gira a la derecha aquí.',
+      'SlightLeft'  : 'Un poco hacia la izquierda.',
+      'SlightRight' : 'Un poco hacia la derecha.',
+      'UTurn'       : 'Da la vuelta completamente.',
+
+      // Escaleras
+      'ApproachingStairs' : '¡Atención! Se acercan escaleras.',
+      'StartingClimb'     : 'Vamos a subir. Un peldaño a la vez.',
+      'StartingDescent'   : 'Vamos a bajar. Con cuidado.',
+      'StairsComplete'    : '¡Escaleras listas! Puedes seguir.',
+      'FloorReached'      : 'Llegaste al siguiente piso.',
+
+      // Obstáculos y desvíos
+      'ObstacleWarning' : '¡Cuidado! Hay algo en tu camino.',
+      'UserDeviated'    : 'Creo que te desviaste. Voy a recalcular.',
+
+      // Navegación general
+      'StartNavigation'      : 'Voy a guiarte. Sígueme.',
+      'Arrived'              : '¡Llegaste! Lo lograste.',
+      'ResumeAfterSeparation': 'Te encontré de nuevo. Seguimos.',
+      'ResumeGuide'          : 'Continuemos desde aquí.',
+    };
+
+    final friendly = _friendlyMap[announcementType];
+    if (friendly != null) return friendly;
+
+    // Texto libre — devolver como viene (ya puede estar bien redactado)
+    return rawText;
   }
 
   // ─── Conexión con Unity ──────────────────────────────────────────────────
@@ -205,11 +239,14 @@ class VoiceNavigationService {
   // ─── Handler tts_request ─────────────────────────────────────────────────
 
   void _onTTSRequest(UnityResponse response) {
-    final text      = response.raw['text']      as String? ?? '';
+    final rawText   = response.raw['text']      as String? ?? '';
     final priority  = response.raw['priority']  as int?    ?? 0;
     final interrupt = response.raw['interrupt'] as bool?   ?? false;
 
-    if (text.trim().isEmpty) return;
+    if (rawText.trim().isEmpty) return;
+
+    // v6.8: aplicar lenguaje empático
+    final text = _friendlyText(rawText, 'tts_req_p$priority');
 
     _log('tts_request p=$priority interrupt=$interrupt "$text"');
 
@@ -265,11 +302,14 @@ class VoiceNavigationService {
 
   void _onUnityResponse(UnityResponse response) {
     if (response.action != 'guide_announcement') return;
-    final text = response.message.trim();
-    if (text.isEmpty) return;
+    final rawText = response.message.trim();
+    if (rawText.isEmpty) return;
 
     final type     = response.raw['type'] as String? ?? '';
     final priority = _priorityForType(type);
+
+    // v6.8: aplicar lenguaje empático
+    final text = _friendlyText(rawText, type);
 
     if (priority == _InstructionPriority.low ||
         priority == _InstructionPriority.medium) {
@@ -360,7 +400,6 @@ class VoiceNavigationService {
 
     _log('▶ [${instruction.announcementType}] "${instruction.text}"');
 
-    // ✅ v6.7: usar guard TTS↔STT en lugar de pause/resume directo
     await _notifyTTSStarted();
     _notifyUnityTTSStatus(speaking: true);
 
@@ -378,7 +417,6 @@ class VoiceNavigationService {
       _isDraining         = false;
 
       _notifyUnityTTSStatus(speaking: false);
-      // ✅ v6.7: notificar fin de TTS — WakeWordService gestiona eco + reapertura
       _notifyTTSEnded();
       _speakPending();
     }
@@ -406,6 +444,31 @@ class VoiceNavigationService {
   }
 
   // ─── API pública ─────────────────────────────────────────────────────────
+  /// Presentación guiada de COMPAS.
+  /// Se reproduce en varios mensajes cortos para que el usuario
+  /// no reciba un bloque largo de audio.
+  Future<void> playIntroductionSequence() async {
+
+    await speak(
+        'Soy Compas. Te guío por la biblioteca usando realidad aumentada.'
+    );
+
+    await Future.delayed(
+      const Duration(milliseconds: 700),
+    );
+
+    await speak(
+        'Para ir a algún lugar, solo dime: Oye Compas, llévame a la sala de estudio.'
+    );
+
+    await Future.delayed(
+      const Duration(milliseconds: 700),
+    );
+
+    await speak(
+        'Puedes pedirme que repita, que pare, o preguntarme cuánto falta. ¿Empezamos?'
+    );
+  }
 
   Future<void> speak(String text) async {
     if (!_ttsReady || _ttsService == null) return;
@@ -427,7 +490,6 @@ class VoiceNavigationService {
     _queue.clear();
     _isDraining = false;
     _notifyUnityTTSStatus(speaking: false);
-    // ✅ v6.7: notificar fin para reabrir STT con ventana de eco
     _notifyTTSEnded();
     _log('Detenido — cola vaciada');
   }

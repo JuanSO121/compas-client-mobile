@@ -1,46 +1,15 @@
 // lib/services/AI/conversation_service.dart
-// ✅ v6 — Fix navegación: falso match LIST, sugerencias pendientes, prompt reforzado
+// ✅ v7.2 — Fix sintaxis · "Destinos" · Frases empáticas · Sin tecnicismos
 //
 // ============================================================================
-//  CAMBIOS v5 → v6
+//  CAMBIOS v7.1 → v7.2
 // ============================================================================
 //
-//  BUG CORREGIDO — Falso match _UnityAction.list sobre respuestas informativas:
+//  BUG CRÍTICO corregido:
+//    Línea ~919: faltaba ';' al final del return del case _UnityAction.save.
+//    El compilador lanzaba: Expected ';' after this.
 //
-//    PROBLEMA (v5):
-//      _extractAction() tenía 'destinos disponibles' en listBot.
-//      Cuando GROQ respondía "Los destinos disponibles son: ..."
-//      (sin confirmar navegación), se disparaba _UnityAction.list
-//      en lugar de _UnityAction.none → Unity recibía list_waypoints
-//      en vez de ejecutar la navegación solicitada.
-//
-//    FIX 1 — listBot depurado:
-//      Se eliminó 'destinos disponibles' de listBot. Ahora solo coincide
-//      con la frase de acción exacta del system prompt:
-//      "consultando los destinos disponibles."
-//
-//  NUEVO — Manejo de sugerencias pendientes (_pendingSuggestion):
-//
-//    PROBLEMA (v5):
-//      Cuando GROQ no encontraba el destino exacto y respondía con una
-//      sugerencia ("¿Quieres ir a Habitación 2° Piso?"), el sistema
-//      descartaba la sugerencia. Si el usuario decía "sí", no había
-//      contexto para saber a dónde navegar.
-//
-//    FIX 2 — _extractSuggestion() + _pendingSuggestion:
-//      Si GROQ sugiere un destino sin confirmarlo, se guarda en
-//      _pendingSuggestion. Si el usuario responde afirmativamente
-//      ("sí", "dale", "ok", etc.) en el turno siguiente, se dispara
-//      _UnityAction.navigate con ese destino automáticamente.
-//
-//  NUEVO — System prompt reforzado con regla "un solo candidato":
-//
-//    FIX 3 — GROQ debe confirmar directamente si hay un único candidato:
-//      Si el usuario pide un lugar y hay exactamente un destino similar,
-//      GROQ ya no debe preguntar — debe responder "Navegando a [Nombre]."
-//      directamente para que _extractAction() detecte la acción.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v5.
+//  Sin otros cambios funcionales.
 
 import 'dart:async';
 import 'package:logger/logger.dart';
@@ -83,10 +52,18 @@ enum _UnityAction {
   list,
   create,
   remove,
+  clear,
   save,
   load,
+  introduce,
   none,
 }
+
+const _waypointMutationActions = {
+  _UnityAction.create,
+  _UnityAction.remove,
+  _UnityAction.clear,
+};
 
 // ─── Servicio principal ───────────────────────────────────────────────────────
 
@@ -95,17 +72,18 @@ class ConversationService {
   factory ConversationService() => _instance;
   ConversationService._internal();
 
-  final Logger                _logger           = Logger();
-  final GroqService           _groqService      = GroqService();
-  final AIModeController      _aiModeController = AIModeController();
-  final WaypointContextService _waypointContext = WaypointContextService();
+  final Logger                 _logger           = Logger();
+  final GroqService            _groqService      = GroqService();
+  final AIModeController       _aiModeController = AIModeController();
+  final WaypointContextService _waypointContext  = WaypointContextService();
 
   final List<ChatMessage> _conversationHistory = [];
   static const int _maxHistory = 20;
   bool _isInitialized = false;
 
-  // ✅ v6 FIX 2 — Destino sugerido pendiente de confirmación del usuario
   String? _pendingSuggestion;
+
+  Function()? onWaypointMutation;
 
   // ─── Inicialización ──────────────────────────────────────────────────────
 
@@ -115,9 +93,9 @@ class ConversationService {
       await _aiModeController.initialize();
       if (_aiModeController.canUseGroq()) {
         await _groqService.initialize();
-        _logger.i('✅ ConversationService online (Groq)');
+        _logger.i('✅ ConversationService v7.2 online (Groq)');
       } else {
-        _logger.i('✅ ConversationService offline');
+        _logger.i('✅ ConversationService v7.2 offline');
       }
       _isInitialized = true;
     } catch (e) {
@@ -167,6 +145,12 @@ class ConversationService {
         final intent = _buildIntent(action, resolvedTarget);
         if (intent != null) {
           _logger.i('💬🎯 Intent: $action → raw="$rawTarget" → resolved="$resolvedTarget"');
+
+          if (_waypointMutationActions.contains(action)) {
+            _logger.d('[Mutation] Recargando destinos por: $action');
+            onWaypointMutation?.call();
+          }
+
           return ChatbotResponse(
             type:       ResponseType.conversationWithIntent,
             message:    response.content,
@@ -176,12 +160,11 @@ class ConversationService {
         }
       }
 
-      // ✅ v6 FIX 2 — Si GROQ no confirmó acción, buscar sugerencia implícita
       if (action == _UnityAction.none) {
         final suggestion = _extractSuggestion(response.content);
         if (suggestion != null && suggestion.isNotEmpty) {
           _pendingSuggestion = _resolveTarget(suggestion);
-          _logger.d('[Suggest] Destino sugerido guardado: "$_pendingSuggestion"');
+          _logger.d('[Suggest] Destino sugerido: "$_pendingSuggestion"');
         }
       }
 
@@ -203,7 +186,7 @@ class ConversationService {
     if (rawTarget.isEmpty) return rawTarget;
 
     if (!_waypointContext.hasWaypoints) {
-      _logger.d('[Resolve] Sin destinos registrados, usando raw: "$rawTarget"');
+      _logger.d('[Resolve] Sin destinos, usando raw: "$rawTarget"');
       return rawTarget;
     }
 
@@ -226,15 +209,40 @@ class ConversationService {
   String _buildSystemPrompt() {
     final waypointContext = _waypointContext.getContextForPrompt();
 
-    return '''Eres COMPAS, asistente de navegación para interiores. Guías al usuario dentro del edificio de forma amable y directa.
+    return '''Eres COMPAS, asistente de navegación en la Biblioteca de la Universidad de San Buenaventura Cali. Guías al usuario de forma amable, breve y directa. El usuario te habla por voz. Muchos usuarios tienen discapacidad visual, así que cada palabra cuenta.
 
 PERSONALIDAD:
-- Español natural y cercano
-- Respuestas breves: 1-2 oraciones
-- Sin listas con viñetas en respuestas habladas
+- Español natural y cercano, como el asistente de Google
+- Máximo 1-2 oraciones por respuesta
+- Nunca uses viñetas en respuestas que se escuchan
+- Llama a los lugares guardados "destinos", nunca "balizas" ni "waypoints"
+- Nunca dejes al usuario sin respuesta ni en silencio sin explicación
 
 CAPACIDADES:
-Puedes llevar al usuario a un lugar, detener la navegación, repetir la última instrucción, informar el estado de la navegación, silenciar la guía de voz, mostrar los lugares disponibles, guardar o cargar una sesión.
+Puedes llevar al usuario a cualquier destino disponible, detener la navegación, repetir la última indicación, informar el estado de la ruta, silenciar la guía de voz, mostrar los destinos disponibles, guardar o cargar una sesión, guardar un nuevo destino en la posición actual del usuario, eliminar destinos guardados y explicarle al usuario cómo funciona la aplicación cuando lo pida.
+
+══════════════════════════════════════════════════════════════════
+
+PRESENTACIÓN DEL ASISTENTE:
+
+Si el usuario dice:
+- "preséntate"
+- "presentate"
+- "cuéntame de ti"
+- "cuentame de ti"
+- "qué puedes hacer"
+- "que puedes hacer"
+- "cómo funcionas"
+- "como funcionas"
+
+Responde EXACTAMENTE:
+
+"Claro. Déjame presentarme."
+
+NO expliques todo en un solo mensaje.
+La aplicación reproducirá la presentación por partes.
+
+══════════════════════════════════════════════════════════════════
 
 $waypointContext
 
@@ -242,12 +250,12 @@ $waypointContext
 REGLA IMPORTANTE — CONFIRMAR DESTINO:
 
 Cuando el usuario pida ir a algún lugar:
-1. Verifica si existe en LUGARES DISPONIBLES.
+1. Verifica si existe en DESTINOS DISPONIBLES.
 2. Si existe → confirma con el nombre EXACTO de la lista.
 3. Si hay varios similares → pregunta cuál antes de ir.
 4. Si no existe → díselo y menciona los disponibles.
 
-Tu confirmación debe usar el nombre EXACTO de la lista, sin parafrasear.
+Tu confirmación debe usar el nombre EXACTO de la lista.
 
 ✅ CORRECTO:
   Lista: "Habitación 1", "Baño", "Sala Principal"
@@ -258,64 +266,64 @@ Tu confirmación debe usar el nombre EXACTO de la lista, sin parafrasear.
   Tú: "Navegando a Baño."
 
   Usuario: "habitaciones" (hay Habitación 1 y Habitación 2)
-  Tú: "Hay dos habitaciones disponibles: Habitación 1 y Habitación 2. ¿A cuál vamos?"
+  Tú: "Hay dos opciones: Habitación 1 y Habitación 2. ¿A cuál vamos?"
 
   Usuario: "llévame a la cocina" (no existe)
-  Tú: "No tengo registrado ese lugar. Los disponibles son: Habitación 1, Baño, Sala Principal."
+  Tú: "Ese lugar no lo tengo guardado. Los que tengo son: Habitación 1, Baño, Sala Principal."
 
-❌ NUNCA hagas esto:
+❌ NUNCA:
   "No sé a qué habitación te refieres." ← si solo hay una, ve ahí
   "Voy hacia el destino que mencionaste." ← sin nombre concreto
+  "baliza", "waypoint" ← el usuario no entiende esos términos
+  "No puedo ayudarte con eso." ← siempre ofrece una alternativa
 
 ══════════════════════════════════════════════════════════════════
 REGLA CRÍTICA — UN SOLO CANDIDATO:
 
-Si el usuario pide un lugar y existe EXACTAMENTE UN destino similar
-o que corresponda aproximadamente a lo pedido, NO preguntes —
-confirma DIRECTAMENTE con la frase de navegación.
+Si hay EXACTAMENTE UN destino que coincide con lo pedido,
+ve directo sin preguntar.
 
-❌ MAL (genera ambigüedad y rompe la detección de acciones):
-  "¿Quieres ir a la Habitación 2° Piso?"
-
-✅ BIEN (acción directa, detectable por el sistema):
-  "Navegando a Habitación 2° Piso."
+❌ MAL: "¿Quieres ir a la Habitación 2° Piso?"
+✅ BIEN: "Navegando a Habitación 2° Piso."
 
 Solo pregunta si hay DOS O MÁS candidatos igualmente válidos.
 
 ══════════════════════════════════════════════════════════════════
 
-FRASES DE CONFIRMACIÓN (usa estas exactas):
+FRASES DE CONFIRMACIÓN (usa estas exactas — el sistema las detecta):
 
-• Ir a un lugar:        "Navegando a [NombreExacto]."
-• Detener navegación:   "Deteniendo la navegación."
-• Silenciar voz:        "Silenciando la guía de voz."
-• Repetir instrucción:  "Repitiendo la última instrucción."
-• Estado navegación:    "Consultando el estado de la navegación."
-• Ver lugares:          "Consultando los destinos disponibles."
-• Guardar sesión:       "Guardando la sesión."
-• Cargar sesión:        "Cargando la sesión."
-• Crear lugar:          "Guardando el lugar como [Nombre]."
-• Eliminar lugar:       "Eliminando el lugar [Nombre]."
+• Ir a un destino:            "Navegando a [NombreExacto]."
+• Detener navegación:         "Deteniendo la navegación."
+• Silenciar voz:              "Silenciando la guía de voz."
+• Repetir indicación:         "Repitiendo la última indicación."
+• Estado de ruta:             "Consultando el estado de la navegación."
+• Ver destinos disponibles:   "Consultando los destinos disponibles."
+• Guardar sesión:             "Guardando la sesión."
+• Cargar sesión:              "Cargando la sesión."
+• Guardar destino:            "Guardando el lugar como [Nombre]."
+• Eliminar destino:           "Eliminando el lugar [Nombre]."
+• Eliminar todos:             "Eliminando todos los destinos."
+• Presentación:               "Claro. Déjame presentarme."
 
 EJEMPLOS:
 
-• "llévame al baño"            → "¡Claro! Navegando a Baño."
-• "para la navegación"         → "Entendido. Deteniendo la navegación."
+• "llévame al baño"            → "Claro. Navegando a Baño."
+• "para"                       → "Listo. Deteniendo la navegación."
 • "silencia la guía"           → "Silenciando la guía de voz."
-• "repite eso"                 → "Repitiendo la última instrucción."
-• "¿qué me dijiste?"           → "Repitiendo la última instrucción."
+• "repite eso"                 → "Repitiendo la última indicación."
 • "¿cuánto falta?"             → "Consultando el estado de la navegación."
-• "¿a dónde voy?"              → "Consultando el estado de la navegación."
-• "¿qué lugares hay?"          → "Consultando los destinos disponibles."
-• "guarda esto como recepción" → "Guardando el lugar como Recepción."
+• "¿qué destinos hay?"         → "Consultando los destinos disponibles."
+• "guarda aquí como Recepción" → "Guardando el lugar como Recepción."
+• "borra el destino Baño"      → "Eliminando el lugar Baño."
+• "elimina todos"              → "Eliminando todos los destinos."
+• "preséntate"                 → "Claro. Déjame presentarme."
 • "hola"                       → "¡Hola! ¿A dónde quieres ir?"
-• "¿qué puedes hacer?"         → "Puedo llevarte a cualquier lugar del edificio, repetir instrucciones y más. ¿A dónde vamos?"
 
 RECUERDA:
-- Usa siempre los nombres exactos de la lista para confirmar
-- Si no hay lugares registrados, díselo al usuario
-- Respuestas cortas y directas siempre
-- Si solo hay un lugar que coincide con lo pedido, ve directamente sin preguntar''';
+- Si solo hay un destino que coincide, ve directo sin preguntar
+- Respuestas cortas y claras siempre
+- Si no hay destinos registrados, díselo con amabilidad y ofrece ayuda
+- Nunca dejes al usuario sin una respuesta útil''';
   }
 
   // ─── Extracción de acción ────────────────────────────────────────────────
@@ -324,9 +332,7 @@ RECUERDA:
     final bot  = botResponse.toLowerCase();
     final user = userMessage.toLowerCase();
 
-    // ✅ v6 FIX 2 — Verificar confirmación de sugerencia pendiente PRIMERO
-    // Si el usuario confirma ("sí", "dale", etc.) y hay una sugerencia guardada,
-    // navegamos directamente sin necesidad de que GROQ repita el destino.
+    // Confirmación de sugerencia pendiente
     final confirmPhrases = [
       'sí', 'si', 'claro', 'ok', 'dale', 'bueno', 'perfecto',
       'adelante', 'vamos', 'de acuerdo', 'está bien', 'esta bien',
@@ -336,17 +342,14 @@ RECUERDA:
       if (_matchesAny(user, confirmPhrases)) {
         final dest = _pendingSuggestion!;
         _pendingSuggestion = null;
-        _logger.i('[Suggest] ✅ Confirmación recibida → navegando a "$dest"');
+        _logger.i('[Suggest] ✅ Confirmado → navegando a "$dest"');
         return (_UnityAction.navigate, dest);
       }
-      // Si el usuario no confirmó, limpiar sugerencia (cambió de tema)
-      if (!_matchesAny(user, confirmPhrases)) {
-        _logger.d('[Suggest] Sugerencia descartada — usuario cambió de tema');
-        _pendingSuggestion = null;
-      }
+      _logger.d('[Suggest] Sugerencia descartada');
+      _pendingSuggestion = null;
     }
 
-    // ── STOP_VOICE (antes que STOP para evitar captura prematura) ────────
+    // ── STOP_VOICE ──────────────────────────────────────────────────────────
     final stopVoiceBot = [
       'silenciando la guía de voz',
       'silencio la guía',
@@ -361,17 +364,26 @@ RECUERDA:
       return (_UnityAction.stopVoice, '');
     }
 
-    // ── STOP (detener navegación completa) ────────────────────────────────
-    final stopBot  = ['deteniendo la navegación', 'cancelo la navegación',
-      'navegación detenida', 'listo, me detengo'];
-    final stopUser = ['para', 'detente', 'cancela', 'alto', 'stop', 'frena',
-      'detener navegación', 'cancelar ruta'];
+    // ── STOP ────────────────────────────────────────────────────────────────
+    final stopBot  = [
+      'deteniendo la navegación', 'cancelo la navegación',
+      'navegación detenida', 'listo, me detengo',
+    ];
+    final stopUser = [
+      'para', 'detente', 'cancela', 'alto', 'stop', 'frena',
+      'detener navegación', 'cancelar ruta',
+    ];
     if (_matchesAny(bot, stopBot) || _matchesAny(user, stopUser)) {
       return (_UnityAction.stop, '');
     }
 
-    // ── REPEAT ────────────────────────────────────────────────────────────
-    final repeatBot  = ['repitiendo la última instrucción', 'repito la instrucción'];
+    // ── REPEAT ──────────────────────────────────────────────────────────────
+    final repeatBot  = [
+      'repitiendo la última indicación',
+      'repitiendo la última instrucción',
+      'repito la instrucción',
+      'repito la indicación',
+    ];
     final repeatUser = [
       'repite', 'repítelo', 'repetir', 'otra vez', 'de nuevo',
       'qué dijiste', 'qué me dijiste', 'no escuché', 'no oí',
@@ -381,7 +393,7 @@ RECUERDA:
       return (_UnityAction.repeat, '');
     }
 
-    // ── STATUS ────────────────────────────────────────────────────────────
+    // ── STATUS ──────────────────────────────────────────────────────────────
     final statusBot  = [
       'consultando el estado de la navegación',
       'consulto el estado',
@@ -390,61 +402,91 @@ RECUERDA:
       'cuánto falta', 'cuanto falta', 'qué tan lejos', 'a dónde voy',
       'cuántos pasos', 'cuantos pasos', 'estado de la navegación',
       'cómo voy', 'como voy', 'qué está pasando',
+      'próxima indicación', 'proxima indicacion',
       'próxima instrucción', 'proxima instruccion',
     ];
     if (_matchesAny(bot, statusBot) || _matchesAny(user, statusUser)) {
       return (_UnityAction.status, '');
     }
 
-    // ── LIST ──────────────────────────────────────────────────────────────
-    // ✅ v6 FIX 1 — Se eliminó 'destinos disponibles' de listBot.
-    // Esa cadena aparece en respuestas INFORMATIVAS de GROQ ("Los destinos
-    // disponibles son: ...") y causaba un falso positivo que disparaba
-    // list_waypoints en Unity en lugar de procesar la navegación.
-    // Solo se mantienen frases de ACCIÓN explícita del system prompt.
+    // ── LIST ────────────────────────────────────────────────────────────────
     final listBot  = [
-      'consultando los destinos disponibles',   // frase exacta de confirmación
+      'consultando los destinos disponibles',
       'consulto los destinos disponibles',
     ];
-    final listUser = ['qué lugares', 'cuáles lugares', 'qué destinos',
-      'cuáles destinos', 'qué hay', 'qué puntos',
-      'muéstrame los destinos', 'qué balizas', 'cuáles balizas'];
+    final listUser = [
+      'qué destinos', 'cuáles destinos', 'qué lugares', 'qué hay',
+      'qué puntos', 'muéstrame los destinos', 'qué lugares hay',
+      'cuáles lugares hay', 'destinos disponibles',
+      // legacy por si el usuario dice "balizas"
+      'qué balizas', 'cuáles balizas',
+    ];
     if (_matchesAny(bot, listBot) || _matchesAny(user, listUser)) {
       return (_UnityAction.list, '');
     }
 
-    // ── SAVE ──────────────────────────────────────────────────────────────
-    final savePhrases = ['guardando la sesión', 'guardo la sesión', 'sesión guardada'];
+    // ── SAVE ────────────────────────────────────────────────────────────────
+    final savePhrases = ['guardando la sesión', 'guardo la sesión'];
     final saveUser    = ['guarda la sesión', 'guardar sesión', 'guarda los cambios'];
     if (_matchesAny(bot, savePhrases) || _matchesAny(user, saveUser)) {
       return (_UnityAction.save, '');
     }
 
-    // ── LOAD ──────────────────────────────────────────────────────────────
-    final loadPhrases = ['cargando la sesión', 'cargo la sesión', 'sesión cargada'];
+    // ── LOAD ────────────────────────────────────────────────────────────────
+    final loadPhrases = ['cargando la sesión', 'cargo la sesión'];
     final loadUser    = ['carga la sesión', 'cargar sesión', 'restaura la sesión'];
     if (_matchesAny(bot, loadPhrases) || _matchesAny(user, loadUser)) {
       return (_UnityAction.load, '');
     }
 
-    // ── REMOVE ────────────────────────────────────────────────────────────
+    // ── CLEAR ───────────────────────────────────────────────────────────────
+    final clearBot = [
+      'eliminando todos los destinos',
+      'eliminando todas las balizas',
+      'borrando todos los destinos',
+      'elimino todos los destinos',
+    ];
+    final clearUser = [
+      'borra todo', 'borrar todo', 'elimina todo', 'eliminar todo',
+      'limpiar destinos', 'borrar todos', 'eliminar todos',
+      'borra todos los destinos', 'elimina todos los destinos',
+      'limpiar balizas', 'borrar todas las balizas', 'limpiar waypoints',
+    ];
+    if (_matchesAny(bot, clearBot) || _matchesAny(user, clearUser)) {
+      return (_UnityAction.clear, '');
+    }
+
+    // ── REMOVE ──────────────────────────────────────────────────────────────
     final removeMatch = _extractAfterKeyword(bot, [
-      'eliminando el lugar ', 'eliminando la baliza ',
-      'borrando el lugar ',   'elimino el lugar ',
+      'eliminando el lugar ',
+      'eliminando la baliza ',
+      'borrando el lugar ',
+      'elimino el lugar ',
     ]);
     if (removeMatch != null) return (_UnityAction.remove, removeMatch);
 
-    // ── CREATE ────────────────────────────────────────────────────────────
+    // ── CREATE ──────────────────────────────────────────────────────────────
     final createMatch = _extractAfterKeyword(bot, [
-      'guardando el lugar como ', 'llamada ', 'llamado ',
-      'con el nombre ', 'con nombre ',
+      'guardando el lugar como ',
+      'guardo el lugar como ',
+      'guardando la baliza como ',
     ]);
-    if (createMatch != null &&
-        _matchesAny(bot, ['guardando el lugar', 'creando', 'marcando', 'nuevo punto'])) {
+    if (createMatch != null && createMatch.isNotEmpty) {
       return (_UnityAction.create, createMatch);
     }
 
-    // ── NAVIGATE ─────────────────────────────────────────────────────────
+    final createUserMatch = _extractAfterKeyword(user, [
+      'marca aquí como ', 'marca esto como ', 'marca aqui como ',
+      'guarda aquí como ', 'guarda aqui como ', 'guarda esto como ',
+      'crear destino ', 'nuevo destino ',
+      'crear baliza ', 'crear waypoint ', 'nuevo punto ',
+      'añade baliza ', 'nueva baliza ',
+    ]);
+    if (createUserMatch != null && createUserMatch.isNotEmpty) {
+      return (_UnityAction.create, createUserMatch);
+    }
+
+    // ── NAVIGATE ────────────────────────────────────────────────────────────
     final navPhrases = [
       'navegando a ',
       'voy a navegar hacia ',
@@ -466,6 +508,22 @@ RECUERDA:
     final dest = _extractNavigateTarget(bot, botResponse, user, userMessage, navPhrases);
     if (dest != null && dest.isNotEmpty) {
       return (_UnityAction.navigate, dest);
+    }
+
+    // ── INTRODUCE ───────────────────────────────────────────────────────────
+    final introduceUser = [
+      'preséntate',
+      'presentate',
+      'cuéntame de ti',
+      'cuentame de ti',
+      'qué puedes hacer',
+      'que puedes hacer',
+      'cómo funcionas',
+      'como funcionas',
+    ];
+
+    if (_matchesAny(user, introduceUser)) {
+      return (_UnityAction.introduce, '');
     }
 
     return (_UnityAction.none, '');
@@ -525,9 +583,6 @@ RECUERDA:
 
   // ─── Extracción de sugerencia implícita ──────────────────────────────────
 
-  /// ✅ v6 FIX 2 — Detecta cuando GROQ sugiere un destino sin confirmarlo.
-  /// Busca patrones de pregunta con un destino concreto en la respuesta.
-  /// Retorna el nombre del destino sugerido o null si no hay sugerencia.
   String? _extractSuggestion(String botResponse) {
     final bot = botResponse.toLowerCase();
     final suggestionPhrases = [
@@ -549,7 +604,7 @@ RECUERDA:
         final afterOriginal = botResponse.substring(idx + phrase.length).trim();
         final cleaned = _cleanDestination(afterOriginal);
         if (cleaned.isNotEmpty && cleaned.length <= 60) {
-          _logger.d('[Suggest] Sugerencia detectada: "$cleaned"');
+          _logger.d('[Suggest] Detectado: "$cleaned"');
           return cleaned;
         }
       }
@@ -562,7 +617,7 @@ RECUERDA:
   Future<ChatbotResponse> _chatOffline(String userMessage) async {
     final user = userMessage.toLowerCase().trim();
 
-    // ✅ v6 FIX 2 — Verificar confirmación de sugerencia pendiente también offline
+    // Confirmación de sugerencia pendiente
     final confirmPhrases = [
       'sí', 'si', 'claro', 'ok', 'dale', 'bueno', 'perfecto',
       'adelante', 'vamos', 'de acuerdo', 'está bien', 'esta bien',
@@ -582,7 +637,7 @@ RECUERDA:
       _pendingSuggestion = null;
     }
 
-    // silenciar voz (antes de stop)
+    // Silenciar voz
     if (_matchesAny(user, ['silencia', 'cállate', 'callate', 'para de hablar',
       'deja de hablar', 'sin voz', 'modo mudo'])) {
       return ChatbotResponse(
@@ -607,7 +662,7 @@ RECUERDA:
       'de nuevo', 'qué dijiste', 'no escuché', 'no oí'])) {
       return ChatbotResponse(
         type: ResponseType.offlineCommand,
-        message: 'Repitiendo la última instrucción.',
+        message: 'Repitiendo la última indicación.',
         intent: _buildIntent(_UnityAction.repeat, ''),
         confidence: 0.9,
       );
@@ -615,7 +670,7 @@ RECUERDA:
 
     if (_matchesAny(user, ['cuánto falta', 'cuanto falta', 'qué tan lejos',
       'a dónde voy', 'cuántos pasos', 'cómo voy', 'como voy',
-      'estado de la navegación', 'próxima instrucción'])) {
+      'estado de la navegación', 'próxima indicación'])) {
       return ChatbotResponse(
         type: ResponseType.offlineCommand,
         message: 'Consultando el estado de la navegación.',
@@ -624,6 +679,65 @@ RECUERDA:
       );
     }
 
+    // Clear
+    if (_matchesAny(user, ['borra todo', 'borrar todo', 'elimina todo',
+      'eliminar todo', 'limpiar destinos', 'borrar todos',
+      'eliminar todos', 'limpiar balizas', 'borrar waypoints'])) {
+      _notifyMutationIfNeeded(_UnityAction.clear);
+      return ChatbotResponse(
+        type: ResponseType.offlineCommand,
+        message: 'Eliminando todos los destinos.',
+        intent: _buildIntent(_UnityAction.clear, ''),
+        confidence: 0.9,
+      );
+    }
+
+    // Remove
+    final removeOfflinePhrases = [
+      'borra el destino ', 'elimina el destino ',
+      'borra la baliza ', 'elimina la baliza ',
+      'elimina el lugar ', 'borra el lugar ',
+    ];
+    for (final phrase in removeOfflinePhrases) {
+      final idx = user.indexOf(phrase);
+      if (idx >= 0) {
+        final name = _cleanDestination(userMessage.substring(idx + phrase.length));
+        if (name.isNotEmpty) {
+          _notifyMutationIfNeeded(_UnityAction.remove);
+          return ChatbotResponse(
+            type: ResponseType.offlineCommand,
+            message: 'Eliminando el lugar $name.',
+            intent: _buildIntent(_UnityAction.remove, name),
+            confidence: 0.85,
+          );
+        }
+      }
+    }
+
+    // Create
+    final createOfflinePhrases = [
+      'marca aquí como ', 'marca esto como ', 'marca aqui como ',
+      'guarda aquí como ', 'guarda aqui como ', 'guarda esto como ',
+      'crear destino ', 'nuevo destino ',
+      'crear baliza ', 'nueva baliza ',
+    ];
+    for (final phrase in createOfflinePhrases) {
+      final idx = user.indexOf(phrase);
+      if (idx >= 0) {
+        final name = _cleanDestination(userMessage.substring(idx + phrase.length));
+        if (name.isNotEmpty) {
+          _notifyMutationIfNeeded(_UnityAction.create);
+          return ChatbotResponse(
+            type: ResponseType.offlineCommand,
+            message: 'Guardando el lugar como $name.',
+            intent: _buildIntent(_UnityAction.create, name),
+            confidence: 0.85,
+          );
+        }
+      }
+    }
+
+    // Navigate
     final navPhrases = [
       'llévame a ', 'llevame a ', 'ir a ', 'navega a ',
       'guíame a ', 'guiame a ',
@@ -645,7 +759,8 @@ RECUERDA:
       }
     }
 
-    if (_matchesAny(user, ['qué lugares', 'qué destinos', 'qué hay', 'qué balizas'])) {
+    if (_matchesAny(user, ['qué destinos', 'qué lugares', 'qué hay',
+      'destinos disponibles', 'qué balizas'])) {
       return ChatbotResponse(
         type: ResponseType.offlineCommand,
         message: 'Consultando los destinos disponibles.',
@@ -678,24 +793,30 @@ RECUERDA:
     );
   }
 
+  // Fallback offline empático
   String _offlineFallback(String user) {
-    if (user.contains('hola') || user.contains('hey')) {
-      return 'Hola. Estoy sin conexión, pero puedo llevarte a un lugar si me dices el nombre exacto.';
+    if (user.contains('hola') || user.contains('hey') || user.contains('buenas')) {
+      return 'Hola, estoy con señal limitada. Pero puedo llevarte a un lugar si me dices el nombre.';
     }
     if (user.contains('cómo estás') || user.contains('como estas')) {
-      return 'Bien, aunque sin internet. Dime a dónde quieres ir.';
+      return 'Aquí estoy, aunque sin internet hoy. ¿A dónde quieres ir?';
     }
     if (user.contains('qué puedes') || user.contains('que puedes')) {
       if (_waypointContext.hasWaypoints) {
         final names = _waypointContext.navigableWaypoints
             .map((w) => w.name)
             .join(', ');
-        return 'Sin internet proceso comandos básicos. Lugares disponibles: $names.';
+        return 'Sin internet puedo guiarte a estos lugares: $names.';
       }
-      return 'Sin internet puedo: llevar a un lugar, repetir instrucción, '
-          'consultar estado o silenciar la voz. Dime lo que necesitas.';
+      return 'Sin internet puedo llevarte a cualquier lugar guardado y repetir indicaciones. ¿A dónde vamos?';
     }
-    return 'Sin conexión solo entiendo comandos directos. Ejemplo: "llévame al baño".';
+    if (user.contains('biblioteca') || user.contains('pisos') || user.contains('qué hay')) {
+      return 'La biblioteca tiene 3 pisos con cubículos, sala de computadores y coworking. ¿A dónde quieres ir?';
+    }
+    if (user.contains('universidad') || user.contains('san buen') || user.contains('usb')) {
+      return 'Estás en la Universidad de San Buenaventura Cali, al sur de la ciudad. ¿Te llevo a algún lugar?';
+    }
+    return 'Estoy con señal limitada, pero puedo guiarte. Dime a dónde quieres ir.';
   }
 
   // ─── Construcción de intents ──────────────────────────────────────────────
@@ -732,7 +853,7 @@ RECUERDA:
           type: IntentType.navigate,
           target: '__unity:repeat_instruction',
           priority: 7,
-          suggestedResponse: 'Repitiendo instrucción',
+          suggestedResponse: 'Repitiendo indicación',
         );
 
       case _UnityAction.status:
@@ -769,12 +890,29 @@ RECUERDA:
           suggestedResponse: 'Eliminando lugar "$target"',
         );
 
+      case _UnityAction.clear:
+        return NavigationIntent(
+          type: IntentType.navigate,
+          target: '__unity:clear_waypoints',
+          priority: 6,
+          suggestedResponse: 'Eliminando todos los lugares',
+        );
+
+    // ─── FIX: punto y coma que faltaba ───────────────────────────────────
       case _UnityAction.save:
         return NavigationIntent(
           type: IntentType.navigate,
           target: '__unity:save_session',
           priority: 5,
           suggestedResponse: 'Guardando sesión',
+        );  // ← ';' que faltaba en v7.1
+
+      case _UnityAction.introduce:
+        return NavigationIntent(
+          type: IntentType.navigate,
+          target: '__unity:introduce_compas',
+          priority: 4,
+          suggestedResponse: 'Presentando COMPAS',
         );
 
       case _UnityAction.load:
@@ -790,7 +928,16 @@ RECUERDA:
     }
   }
 
-  // ─── Utilidades ───────────────────────────────────────────────────────────
+  // ─── Helper mutación ─────────────────────────────────────────────────────
+
+  void _notifyMutationIfNeeded(_UnityAction action) {
+    if (_waypointMutationActions.contains(action)) {
+      _logger.d('[Mutation] Recargando destinos por: $action (offline)');
+      onWaypointMutation?.call();
+    }
+  }
+
+  // ─── Utilidades ──────────────────────────────────────────────────────────
 
   bool _matchesAny(String text, List<String> patterns) =>
       patterns.any((p) => text.contains(p));
@@ -845,7 +992,7 @@ RECUERDA:
 
   void clearHistory() {
     _conversationHistory.clear();
-    _pendingSuggestion = null;  // ✅ v6: limpiar sugerencia al resetear historial
+    _pendingSuggestion = null;
     _logger.d('Historial limpiado');
   }
 
@@ -853,14 +1000,15 @@ RECUERDA:
       List.unmodifiable(_conversationHistory);
 
   Map<String, dynamic> getStatistics() => {
-    'is_initialized':            _isInitialized,
-    'conversation_length':       _conversationHistory.length,
-    'can_use_groq':              _aiModeController.canUseGroq(),
-    'has_internet':              _aiModeController.hasInternet,
-    'ai_mode':                   _aiModeController.currentMode.name,
-    'destinations_in_context':   _waypointContext.count,
-    'destinations_last_update':  _waypointContext.lastUpdate?.toIso8601String(),
-    'pending_suggestion':        _pendingSuggestion,  // ✅ v6: nuevo campo de diagnóstico
+    'is_initialized':           _isInitialized,
+    'conversation_length':      _conversationHistory.length,
+    'can_use_groq':             _aiModeController.canUseGroq(),
+    'has_internet':             _aiModeController.hasInternet,
+    'ai_mode':                  _aiModeController.currentMode.name,
+    'destinations_in_context':  _waypointContext.count,
+    'destinations_last_update': _waypointContext.lastUpdate?.toIso8601String(),
+    'pending_suggestion':       _pendingSuggestion,
+    'has_mutation_callback':    onWaypointMutation != null,
   };
 
   bool get isInitialized => _isInitialized;
@@ -869,6 +1017,7 @@ RECUERDA:
   void dispose() {
     _conversationHistory.clear();
     _pendingSuggestion = null;
+    onWaypointMutation = null;
     _groqService.dispose();
   }
 }

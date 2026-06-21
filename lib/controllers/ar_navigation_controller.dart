@@ -1,27 +1,25 @@
 // lib/controllers/ar_navigation_controller.dart
 //
-// ✅ v9.3 — Hook de tutorial de bienvenida + intent "enséñame"
+// ✅ v9.8 — Tutorial largo bloqueante en scene_ready · micrófono diferido
 //
 // ════════════════════════════════════════════════════════════════════════════
-// CAMBIOS v9.2 → v9.3
+// COMPORTAMIENTO
 // ════════════════════════════════════════════════════════════════════════════
 //
-//  1. onReadyForTutorial — nuevo callback VoidCallback? que ArNavigationScreen
-//     registra cuando showWelcomeTutorial == true.
-//     Se llama UNA SOLA VEZ al final de _goToReady(), después de que el TTS
-//     de navegación ya está operativo. De esta forma el saludo de bienvenida
-//     usa exactamente el mismo pipeline de audio que las instrucciones AR.
+//  Primera vez (showWelcomeTutorial == true):
+//    1. scene_ready llega → se lanza _playTutorialBlockingAsync()
+//    2. TTS habla el tutorial completo (tutorialScriptCompleto)
+//    3. Se espera waitForCompletion() + 800ms de buffer anti-eco de hardware
+//    4. Solo entonces _tutorialCompleter se completa
+//    5. _startWakeWordWhenReady() estaba bloqueado en ese Completer → se desbloquea
+//    6. El micrófono (WakeWord / STT) se activa
 //
-//  2. _tutorialCallbackFired — flag bool para que _goToReady() no llame
-//     el callback más de una vez aunque sea llamado por retry o reanudación.
+//  Segunda vez en adelante (showWelcomeTutorial == false):
+//    _tutorialCompleter se completa inmediatamente → sin demora.
 //
-//  3. coordinator.onCommandExecuted ampliado:
-//     El intent target "__app:tutorial" dispara onReadyForTutorial si aún
-//     no se reprodujo, o bien habla el contenido directamente.
-//     Esto permite que el usuario diga "Oye COMPAS, enséñame" en cualquier
-//     momento para escuchar el tutorial de nuevo.
-//
-//  TODO LO DEMÁS ES IDÉNTICO A v9.2.
+//  La bandera SharedPreferences ("compas_tutorial_done") se escribe al inicio
+//  de _playTutorialBlockingAsync(), antes de hablar, para que un crash durante
+//  el tutorial no lo repita indefinidamente.
 
 import 'dart:async';
 
@@ -31,6 +29,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart' as flutter_widgets;
 import 'package:flutter_unity_widget/flutter_unity_widget.dart';
 import 'package:logger/logger.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/shared_models.dart';
 import '../services/AI/ai_mode_controller.dart';
@@ -39,17 +38,13 @@ import '../services/AI/waypoint_context_service.dart';
 import '../services/unity_bridge_service.dart';
 import '../services/voice_navigation_service.dart';
 
-// ─── Etapas de inicialización ─────────────────────────────────────────────
+// ─── Clave SharedPreferences ──────────────────────────────────────────────
+const String kTutorialDoneKey = 'compas_tutorial_done';
 
-enum AppReadyState {
-  initializing,
-  waitingSession,
-  waitingUser,
-  ready,
-}
+// ─── Etapas de inicialización ─────────────────────────────────────────────
+enum AppReadyState { initializing, waitingSession, waitingUser, ready }
 
 // ─── Modelo interno de historial ──────────────────────────────────────────
-
 class CommandItem {
   final NavigationIntent intent;
   final DateTime time;
@@ -57,10 +52,9 @@ class CommandItem {
 }
 
 // ─── Controller ───────────────────────────────────────────────────────────
-
 class ArNavigationController extends ChangeNotifier {
-  // ─── Servicios ──────────────────────────────────────────────────────────
 
+  // ─── Servicios ────────────────────────────────────────────────────────────
   final NavigationCoordinator coordinator = NavigationCoordinator();
   final AIModeController aiModeController = AIModeController();
   final UnityBridgeService unityBridge = UnityBridgeService();
@@ -68,16 +62,26 @@ class ArNavigationController extends ChangeNotifier {
   final WaypointContextService waypointContext = WaypointContextService();
   final Logger _logger = Logger();
 
-  // ─── Estado de inicialización ────────────────────────────────────────────
+  // ─── Tutorial — Completer que bloquea el micrófono ────────────────────────
+  //
+  // Se inicializa en initializeServices().
+  // Si showWelcomeTutorial == false → se completa inmediatamente.
+  // Si showWelcomeTutorial == true  → se completa al final del tutorial TTS.
+  late final Completer<void> _tutorialCompleter;
 
+  bool _showWelcomeTutorial = false;
+
+  /// Llamado desde ArNavigationScreen ANTES de initializeServices().
+  set showWelcomeTutorial(bool value) => _showWelcomeTutorial = value;
+
+  // ─── Estado de inicialización ─────────────────────────────────────────────
   AppReadyState _appState = AppReadyState.initializing;
   bool _flutterServicesReady = false;
   bool _sceneReadyReceived = false;
 
   AppReadyState get appState => _appState;
 
-  // ─── Estado de voz ───────────────────────────────────────────────────────
-
+  // ─── Estado de voz ────────────────────────────────────────────────────────
   bool _isInitialized = false;
   bool _isActive = false;
   String _statusMessage = 'Inicializando...';
@@ -94,8 +98,7 @@ class ArNavigationController extends ChangeNotifier {
   NavigationIntent? get currentIntent => _currentIntent;
   bool get wakeWordAvailable => _wakeWordAvailable;
 
-  // ─── Estado Unity ────────────────────────────────────────────────────────
-
+  // ─── Estado Unity ─────────────────────────────────────────────────────────
   bool _unityLoaded = false;
   bool _showVoiceOverlay = true;
 
@@ -107,8 +110,7 @@ class ArNavigationController extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ─── Estado de tracking AR ───────────────────────────────────────────────
-
+  // ─── Tracking AR ──────────────────────────────────────────────────────────
   bool _arTrackingStable = true;
   String _arTrackingState = '';
   String _arTrackingReason = '';
@@ -121,8 +123,7 @@ class ArNavigationController extends ChangeNotifier {
   String get arTrackingState => _arTrackingState;
   String get arTrackingReason => _arTrackingReason;
 
-  // ─── Datos de sesión ─────────────────────────────────────────────────────
-
+  // ─── Datos de sesión ──────────────────────────────────────────────────────
   bool _sessionLoaded = false;
   int _sessionWaypointCount = 0;
   bool _sessionHasNavMesh = false;
@@ -131,8 +132,7 @@ class ArNavigationController extends ChangeNotifier {
   int get sessionWaypointCount => _sessionWaypointCount;
   bool get sessionHasNavMesh => _sessionHasNavMesh;
 
-  // ─── Panel de testing ────────────────────────────────────────────────────
-
+  // ─── Panel de testing ─────────────────────────────────────────────────────
   bool _showTestPanel = false;
   int _waypointCounter = 1;
 
@@ -145,8 +145,7 @@ class ArNavigationController extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ─── Segmentación ────────────────────────────────────────────────────────
-
+  // ─── Segmentación ─────────────────────────────────────────────────────────
   double _segObstacle = 0;
   double _segFloor = 0;
   double _segWall = 0;
@@ -163,66 +162,116 @@ class ArNavigationController extends ChangeNotifier {
 
   static const double obstacleAlertThreshold = 0.12;
 
-  // ─── Historial de comandos ───────────────────────────────────────────────
-
+  // ─── Historial ────────────────────────────────────────────────────────────
   final List<CommandItem> history = [];
   static const int _maxHistory = 5;
 
   // ─── Callbacks para el Screen ─────────────────────────────────────────────
-
   void Function(String msg, {bool isError})? onShowSnackBar;
   void Function(String reason)? onShowTrackingSnackBar;
   VoidCallback? onHideTrackingSnackBar;
 
-  // ─── ✅ v9.3 — Callback de tutorial ──────────────────────────────────────
-
-  /// Registrado por ArNavigationScreen cuando showWelcomeTutorial == true.
-  /// Se llama exactamente una vez al entrar en AppReadyState.ready,
-  /// después de que coordinator.speak() ya está operativo.
+  // ─── Callback de tutorial manual (botón "¿Cómo funciono?") ───────────────
   VoidCallback? onReadyForTutorial;
-
-  /// Flag para evitar que onReadyForTutorial se llame más de una vez.
   bool _tutorialCallbackFired = false;
 
-  /// Contenido del tutorial. Usado tanto por el callback como por el
-  /// intent __app:tutorial (comando de voz "enséñame").
-  static const String tutorialScript =
-      'Te cuento rápidamente cómo usarme. '
-      'Para activarme, solo di: Oye COMPAS. '
-      'Yo te voy a responder: ¿En qué puedo ayudarte? '
-      'y en ese momento puedes decirme a dónde quieres ir. '
-      'Por ejemplo: llévame a la sala de descanso. '
-      'Es importante que esperes un momento después de decir Oye COMPAS, '
-      'te dire que estoy listo y escucho. '
-      'También puedo avisarte si detecto obstáculos en tu camino, '
-      'y puedes pedirme que repita la última indicación cuando lo necesites. '
-      'Si quieres detener la navegación, solo di: Oye COMPAS, detente. '
-      'Y listo cuando quieras, estoy aquí para ayudar.';
+  // ─── Scripts de tutorial ──────────────────────────────────────────────────
+  static const String tutorialScriptCompleto =
+      'Hola. Soy Compas, tu asistente de navegación interior. '
+      'Voy a explicarte cómo usarme. '
+      'Para activarme, di: oye Compas. '
+      'Espera el tono. Ese tono te avisa que el micrófono está listo. '
+      'Solo entonces dime a dónde quieres ir. '
+      'Por ejemplo: llévame a la recepción. '
+      'Te guío usando direcciones de reloj. '
+      'Al frente son las doce. A tu derecha son las tres. '
+      'A tu izquierda son las nueve. Atrás tuyo son las seis. '
+      'Si te digo: gira hacia las tres, debes girar a tu derecha. '
+      'Algo importante al iniciar. '
+      'En cuanto me pidas ir a un lugar, mantén el celular quieto '
+      'y apuntando al frente, hasta que escuches mi primera indicación. '
+      'También te aviso si hay un obstáculo cerca. '
+      'Puedes pedirme que repita la última indicación cuando lo necesites. '
+      'Y para detener la navegación, di: oye Compas, para. '
+      'Estoy listo. Dime a dónde vamos.';
 
-  // ─── FIX 7: Delay de inicio de WakeWord ──────────────────────────────────
+  /// Alias usado por el intent "__app:tutorial"
+  static const String tutorialScript = tutorialScriptCompleto;
 
+  // ─── Delay de boot del WakeWord ───────────────────────────────────────────
   static const Duration _wakeWordBootDelay = Duration(seconds: 3);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TUTORIAL BLOQUEANTE (primera vez)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Reproduce el tutorial completo y bloquea el micrófono hasta que termine.
+  /// Solo se llama cuando _showWelcomeTutorial == true.
+  Future<void> _playTutorialBlockingAsync() async {
+    _logger.i('[Tutorial] ▶️ Iniciando tutorial de primera vez...');
+
+    try {
+      // 1. Marcar como visto ANTES de hablar para evitar repetición en crash
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(kTutorialDoneKey, true);
+      _logger.i('[Tutorial] ✅ Bandera "$kTutorialDoneKey" guardada.');
+
+      // 2. Actualizar UI
+      _statusMessage = 'Escucha las instrucciones...';
+      notifyListeners();
+
+      // 3. Hablar el tutorial completo
+      coordinator.speak(tutorialScriptCompleto);
+
+      // 4. Esperar a que el TTS termine realmente
+      await coordinator.ttsService.waitForCompletion();
+
+      // 5. Buffer anti-eco: tiempo para que el hardware de audio vacíe
+      //    su cola interna antes de abrir el micrófono.
+      //    800ms es suficiente incluso en dispositivos lentos.
+      await Future.delayed(const Duration(milliseconds: 800));
+
+      _logger.i('[Tutorial] ✅ Tutorial completo — desbloqueando micrófono.');
+    } catch (e) {
+      // Si algo falla, desbloquear igualmente para no dejar la app colgada.
+      _logger.e('[Tutorial] ❌ Error durante tutorial: $e — desbloqueando mic.');
+    } finally {
+      if (!_tutorialCompleter.isCompleted) {
+        _tutorialCompleter.complete();
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WAKE WORD — diferido hasta fin de tutorial
+  // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> _startWakeWordWhenReady() async {
     if (!_wakeWordAvailable) return;
 
+    // Bloquear aquí hasta que el tutorial termine (o sea noop si ya completó)
+    _logger.i('[WakeWord] ⏳ Esperando fin de tutorial (si aplica)...');
+    await _tutorialCompleter.future;
+    _logger.i('[WakeWord] ✅ Tutorial OK — continuando con arranque de WakeWord.');
+
+    // Esperar a que el bridge de Unity esté listo
     if (!unityBridge.isSceneReady) {
       final bridgeReady = await _waitForBridgeReady(
         timeout: const Duration(seconds: 15),
       );
       if (!bridgeReady) {
-        _logger.w('[WakeWord] Bridge no listo — iniciando WakeWord sin esperar.');
+        _logger.w('[WakeWord] Bridge no listo — iniciando sin esperar.');
       }
     }
 
     _logger.i(
       '[WakeWord] Bridge listo — esperando ${_wakeWordBootDelay.inSeconds}s '
-          'de margen AR antes de iniciar STT...',
+          'de margen AR antes de activar STT...',
     );
     await Future.delayed(_wakeWordBootDelay);
 
     _logger.i('[WakeWord] Iniciando WakeWordService y coordinator...');
-    _statusMessage = 'Di "Oye compas" para navegar';
+    _statusMessage = 'Di "oye Compas" para navegar';
     notifyListeners();
 
     try {
@@ -236,16 +285,24 @@ class ArNavigationController extends ChangeNotifier {
     }
   }
 
-  // ─── Máquina de estados — Fase 1: scene_ready ────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MÁQUINA DE ESTADOS
+  // ═══════════════════════════════════════════════════════════════════════════
 
   void onSceneReady() {
     _sceneReadyReceived = true;
     if (!_flutterServicesReady) {
-      _logger.i(
-        '[AppState] scene_ready llegó antes que Flutter — esperando servicios.',
-      );
+      _logger.i('[AppState] scene_ready antes que Flutter — esperando servicios.');
       return;
     }
+
+    // Si es primera vez: arrancar tutorial ahora que Unity está listo.
+    // Corre en paralelo; el micrófono se bloquea internamente.
+    if (_showWelcomeTutorial && !_tutorialCompleter.isCompleted) {
+      _logger.i('[AppState] scene_ready + primera vez → lanzando tutorial.');
+      _playTutorialBlockingAsync(); // sin await — no bloquea la UI
+    }
+
     _advanceToWaitingSession();
   }
 
@@ -263,8 +320,6 @@ class ArNavigationController extends ChangeNotifier {
     SemanticsService.announce('Cargando sesión AR', TextDirection.ltr);
   }
 
-  // ─── Máquina de estados — Fase 2: session_loaded ─────────────────────────
-
   void onSessionLoaded(SessionLoadedInfo info) {
     _sessionLoaded = info.loaded;
     _sessionWaypointCount = info.waypointCount;
@@ -279,26 +334,55 @@ class ArNavigationController extends ChangeNotifier {
     if (_appState == AppReadyState.initializing) _advanceToWaitingSession();
 
     if (_appState != AppReadyState.waitingSession) {
-      _logger.i(
-        '[AppState] session_loaded en estado $_appState — solo actualizando datos.',
-      );
+      _logger.i('[AppState] session_loaded en estado $_appState — solo actualizando.');
       return;
     }
 
     if (info.loaded) {
-      _logger.i(
-        '[AppState] waitingSession → ready (${info.waypointCount} balizas)',
-      );
+      _logger.i('[AppState] waitingSession → ready (${info.waypointCount} balizas)');
       _goToReady(info: info);
     } else {
       _logger.i('[AppState] waitingSession → waitingUser');
       _appState = AppReadyState.waitingUser;
       _statusMessage = '¿Listo para navegar?';
       notifyListeners();
-      coordinator.speak(
-        'Bienvenido. Di "Estoy listo" cuando quieras comenzar.',
-      );
+      _enterWaitingUser();
     }
+  }
+
+  Future<void> _enterWaitingUser() async {
+    const welcomeMsg = 'Bienvenido. Di: estoy listo, cuando quieras comenzar.';
+
+    if (_wakeWordAvailable) {
+      try {
+        if (!_isActive) {
+          await coordinator.start(mode: _currentMode);
+          _isActive = true;
+          notifyListeners();
+        }
+      } catch (e) {
+        _logger.e('[waitingUser] Error iniciando coordinator: $e');
+      }
+      coordinator.speak(welcomeMsg);
+      _statusMessage = 'Di "oye Compas" para comenzar';
+    } else {
+      coordinator.speak(welcomeMsg);
+      _statusMessage = '¿Listo para navegar?';
+
+      await Future.delayed(const Duration(milliseconds: 3500));
+      if (_appState == AppReadyState.waitingUser && !_isActive) {
+        try {
+          await coordinator.start(mode: _currentMode);
+          _isActive = true;
+          _statusMessage = 'Escuchando...';
+          notifyListeners();
+        } catch (e) {
+          _logger.e('[waitingUser] Error iniciando coordinator sin WakeWord: $e');
+        }
+      }
+    }
+
+    notifyListeners();
   }
 
   void onUserReady() {
@@ -320,31 +404,34 @@ class ArNavigationController extends ChangeNotifier {
         ? (waypointCount > 0
         ? 'Sesión cargada. $waypointCount ${waypointCount == 1 ? "baliza disponible" : "balizas disponibles"}.'
         : 'Sesión cargada. Listo para navegar.')
-        : 'No hay sesión guardada. Puedes crear balizas.';
+        : 'Listo para navegar.';
 
-    // ✅ v9.3: si hay tutorial, el saludo lo maneja onReadyForTutorial.
-    // Si no hay tutorial, reproducimos el mensaje de sesión normal.
-    if (onReadyForTutorial != null && !_tutorialCallbackFired) {
-      // No hablamos el msg de sesión — el tutorial incluye su propio saludo
-      _tutorialCallbackFired = true;
-      // Lanzar con microtask para no bloquear _goToReady
-      Future.microtask(() => onReadyForTutorial?.call());
-    } else {
-      voiceNav.isReady ? voiceNav.speak(msg) : coordinator.speak(msg);
+    // Si hay tutorial activo, no hablar el msg de sesión para no solaparse.
+    if (!_showWelcomeTutorial) {
+      if (onReadyForTutorial != null && !_tutorialCallbackFired) {
+        _tutorialCallbackFired = true;
+        Future.microtask(() => onReadyForTutorial?.call());
+      } else {
+        voiceNav.isReady ? voiceNav.speak(msg) : coordinator.speak(msg);
+      }
     }
 
     if (_wakeWordAvailable) {
-      _statusMessage = 'Inicializando voz...';
-      notifyListeners();
-      _startWakeWordWhenReady();
+      if (!_isActive) {
+        _statusMessage = 'Inicializando voz...';
+        notifyListeners();
+        _startWakeWordWhenReady();
+      } else {
+        _statusMessage = 'Di "oye Compas" para navegar';
+        notifyListeners();
+      }
     } else {
       _statusMessage = 'Presiona el micrófono para hablar';
       notifyListeners();
     }
   }
 
-  // ─── Tracking state con debounce ──────────────────────────────────────────
-
+  // ─── Tracking con debounce ────────────────────────────────────────────────
   void onTrackingStateChanged(bool isStable, String state, String reason) {
     _arTrackingStable = isStable;
     _arTrackingState = state;
@@ -364,17 +451,13 @@ class ArNavigationController extends ChangeNotifier {
         if (_arTrackingStable) return;
         _lastReportedTrackingStable = false;
         notifyListeners();
-        final msg = _arTrackingReason.isNotEmpty
-            ? _arTrackingReason
-            : _arTrackingState;
+        final msg = _arTrackingReason.isNotEmpty ? _arTrackingReason : _arTrackingState;
         onShowTrackingSnackBar?.call(msg);
         _trackingWarningTimer?.cancel();
         _trackingWarningTimer = Timer(const Duration(seconds: 6), () {
           if (!_arTrackingStable) {
             onShowTrackingSnackBar?.call(
-              _arTrackingReason.isNotEmpty
-                  ? _arTrackingReason
-                  : _arTrackingState,
+              _arTrackingReason.isNotEmpty ? _arTrackingReason : _arTrackingState,
             );
           }
         });
@@ -384,12 +467,10 @@ class ArNavigationController extends ChangeNotifier {
 
   String trackingReasonToMessage(String reason) {
     return switch (reason) {
-      'ExcessiveMotion' =>
-      'Movimiento muy rápido — mueve el dispositivo más despacio.',
-      'InsufficientFeatures' =>
-      'Superficie sin textura — apunta a una zona con detalles.',
-      'InsufficientLight' => 'Poca luz — busca una zona más iluminada.',
-      'Relocalizing' => 'Relocalizando — mantén el dispositivo quieto.',
+      'ExcessiveMotion'      => 'Movimiento muy rápido — mueve el dispositivo más despacio.',
+      'InsufficientFeatures' => 'Superficie sin textura — apunta a una zona con detalles.',
+      'InsufficientLight'    => 'Poca luz — busca una zona más iluminada.',
+      'Relocalizing'         => 'Relocalizando — mantén el dispositivo quieto.',
       'Initializing' || 'SessionInitializing' =>
       'Iniciando tracking AR — mueve lentamente el dispositivo.',
       'Unsupported' => 'Tracking AR no disponible en este dispositivo.',
@@ -398,15 +479,10 @@ class ArNavigationController extends ChangeNotifier {
   }
 
   // ─── Esperar bridge ready ─────────────────────────────────────────────────
-
-  Future<bool> _waitForBridgeReady({
-    Duration timeout = const Duration(seconds: 8),
-  }) async {
+  Future<bool> _waitForBridgeReady({Duration timeout = const Duration(seconds: 8)}) async {
     if (unityBridge.isSceneReady) return true;
 
-    _logger.i(
-      '[Nav] Bridge no listo — esperando (max ${timeout.inSeconds}s)...',
-    );
+    _logger.i('[Nav] Bridge no listo — esperando (max ${timeout.inSeconds}s)...');
 
     final completer = Completer<bool>();
     Timer? timer;
@@ -432,9 +508,21 @@ class ArNavigationController extends ChangeNotifier {
     return result;
   }
 
-  // ─── Inicialización de servicios ─────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // INICIALIZACIÓN DE SERVICIOS
+  // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> initializeServices() async {
+    // Inicializar el Completer ANTES de todo.
+    // Si no hay tutorial → completar ya para que el mic no espere.
+    _tutorialCompleter = Completer<void>();
+    if (!_showWelcomeTutorial) {
+      _tutorialCompleter.complete();
+      _logger.i('[Tutorial] Sin tutorial de primera vez — mic no bloqueado.');
+    } else {
+      _logger.i('[Tutorial] Primera vez — mic bloqueado hasta fin de tutorial.');
+    }
+
     try {
       _statusMessage = 'Inicializando servicios...';
       notifyListeners();
@@ -464,11 +552,10 @@ class ArNavigationController extends ChangeNotifier {
       };
 
       coordinator.onCommandExecuted = (intent) async {
-        // ✅ v9.3: intent de tutorial por voz ("Oye COMPAS, enséñame")
         if (intent.target == '__app:tutorial') {
-          coordinator.speak(tutorialScript);
+          coordinator.speak(tutorialScriptCompleto);
           addToHistory(intent);
-          onShowSnackBar?.call('✅ ${intent.suggestedResponse}');
+          onShowSnackBar?.call('Tutorial activado');
           return;
         }
 
@@ -480,16 +567,10 @@ class ArNavigationController extends ChangeNotifier {
         if (isNavigation) {
           final ready = await _waitForBridgeReady();
           if (!ready) {
-            _logger.w(
-              '[Nav] navigate_to cancelado — bridge no listo tras timeout',
-            );
-            onShowSnackBar?.call(
-              '⏳ AR calibrando — intenta en un momento.',
-              isError: true,
-            );
-            coordinator.speak(
-              'El sistema AR está calibrando. Intenta de nuevo en un momento.',
-            );
+            _logger.w('[Nav] navigate_to cancelado — bridge no listo');
+            const errorMsg = 'El sistema AR está calibrando. Intenta de nuevo en un momento.';
+            coordinator.speak(errorMsg);
+            onShowSnackBar?.call('⏳ AR calibrando — intenta en un momento.', isError: true);
             return;
           }
         }
@@ -499,13 +580,11 @@ class ArNavigationController extends ChangeNotifier {
         onShowSnackBar?.call('✅ ${intent.suggestedResponse}');
         HapticFeedback.lightImpact();
 
-        if (intent.type == IntentType.navigate &&
-            !intent.target.startsWith('__unity:')) {
+        if (intent.type == IntentType.navigate && !intent.target.startsWith('__unity:')) {
           voiceNav.resetDeduplication();
         }
         if (intent.type == IntentType.stop) voiceNav.stop();
-        if (intent.target == '__app:user_ready' &&
-            _appState == AppReadyState.waitingUser) {
+        if (intent.target == '__app:user_ready' && _appState == AppReadyState.waitingUser) {
           onUserReady();
         }
       };
@@ -536,10 +615,15 @@ class ArNavigationController extends ChangeNotifier {
       _logger.e('[Controller] Error inicializando servicios: $e');
       _statusMessage = 'Error: $e';
       _isInitialized = false;
+
+      // Desbloquear mic para no dejar la app colgada
+      if (!_tutorialCompleter.isCompleted) _tutorialCompleter.complete();
+
       notifyListeners();
     }
   }
 
+  // ─── Unity callbacks ──────────────────────────────────────────────────────
   void onUnityCreated(UnityWidgetController controller) {
     unityBridge.setController(controller);
     voiceNav.setUnityController(controller);
@@ -565,14 +649,23 @@ class ArNavigationController extends ChangeNotifier {
     unityBridge.onResponse = (response) {
       if (!response.ok) {
         _logger.w('[Bridge] ❌ ${response.action}: ${response.message}');
+
+        const actionsThatMatter = {
+          'navigate', 'nav_status', 'load_session',
+          'save_session', 'create_waypoint', 'remove_waypoint',
+        };
+        if (actionsThatMatter.contains(response.action)) {
+          coordinator.speak('No pude completar el comando. ${response.message}');
+        }
+
         onShowSnackBar?.call('⚠️ ${response.message}', isError: true);
         return;
       }
+
       _logger.i('[Bridge] ✅ ${response.action}: ${response.message}');
+
       if (response.action == 'navigation_arrived') {
-        voiceNav.isReady
-            ? voiceNav.speak(response.message)
-            : coordinator.speak(response.message);
+        // Unity ya habló el mensaje de llegada — Flutter solo feedback visual/háptico
         coordinator.resetNavigation();
         onShowSnackBar?.call('📍 ${response.message}');
         HapticFeedback.heavyImpact();
@@ -580,9 +673,7 @@ class ArNavigationController extends ChangeNotifier {
     };
 
     unityBridge.onWaypointsReceived = (waypoints) {
-      _logger.i(
-        '[Bridge] 📍 ${waypoints.length} waypoint(s) recibidos de Unity',
-      );
+      _logger.i('[Bridge] 📍 ${waypoints.length} waypoint(s) recibidos de Unity');
       waypointContext.updateFromUnity(waypoints);
     };
 
@@ -592,9 +683,7 @@ class ArNavigationController extends ChangeNotifier {
       const threshold = 0.02;
       if ((_segObstacle - obs).abs() < threshold &&
           (_segFloor - floor).abs() < threshold &&
-          (_segWall - wall).abs() < threshold) {
-        return;
-      }
+          (_segWall - wall).abs() < threshold) return;
       _segObstacle = obs;
       _segFloor = floor;
       _segWall = wall;
@@ -632,8 +721,7 @@ class ArNavigationController extends ChangeNotifier {
     };
   }
 
-  // ─── Controles de voz ────────────────────────────────────────────────────
-
+  // ─── Controles de voz ─────────────────────────────────────────────────────
   Future<void> toggleVoice() async {
     if (!_isInitialized) return;
     try {
@@ -644,9 +732,7 @@ class ArNavigationController extends ChangeNotifier {
       } else {
         await coordinator.start(mode: _currentMode);
         _isActive = true;
-        _statusMessage = _wakeWordAvailable
-            ? 'Esperando "Oye COMPAS"...'
-            : 'Escuchando...';
+        _statusMessage = _wakeWordAvailable ? 'Esperando "oye Compas"...' : 'Escuchando...';
       }
       notifyListeners();
       HapticFeedback.mediumImpact();
@@ -655,8 +741,7 @@ class ArNavigationController extends ChangeNotifier {
     }
   }
 
-  // ─── Lifecycle ───────────────────────────────────────────────────────────
-
+  // ─── Lifecycle ────────────────────────────────────────────────────────────
   void handleAppLifecycle(flutter_widgets.AppLifecycleState state) {
     if (!_wakeWordAvailable || !_isInitialized) return;
     switch (state) {
@@ -666,9 +751,7 @@ class ArNavigationController extends ChangeNotifier {
         break;
       case flutter_widgets.AppLifecycleState.resumed:
         Future.delayed(const Duration(milliseconds: 800), () {
-          if (_isActive && _wakeWordAvailable) {
-            coordinator.wakeWordService.resume();
-          }
+          if (_isActive && _wakeWordAvailable) coordinator.wakeWordService.resume();
         });
         break;
       default:
@@ -676,8 +759,7 @@ class ArNavigationController extends ChangeNotifier {
     }
   }
 
-  // ─── Historial ───────────────────────────────────────────────────────────
-
+  // ─── Historial ────────────────────────────────────────────────────────────
   void addToHistory(NavigationIntent intent) {
     history.insert(0, CommandItem(intent: intent, time: DateTime.now()));
     if (history.length > _maxHistory) history.removeLast();
@@ -685,7 +767,6 @@ class ArNavigationController extends ChangeNotifier {
   }
 
   // ─── Acciones del panel de testing ───────────────────────────────────────
-
   void fireTestIntent(NavigationIntent intent) {
     unityBridge.handleIntent(intent);
     addToHistory(intent);
@@ -704,14 +785,12 @@ class ArNavigationController extends ChangeNotifier {
       onShowSnackBar?.call('⚠️ Escribe un nombre', isError: true);
       return;
     }
-    fireTestIntent(
-      NavigationIntent(
-        type: IntentType.navigate,
-        target: '__unity:create_waypoint:$name',
-        priority: 6,
-        suggestedResponse: 'Creando baliza "$name"',
-      ),
-    );
+    fireTestIntent(NavigationIntent(
+      type: IntentType.navigate,
+      target: '__unity:create_waypoint:$name',
+      priority: 6,
+      suggestedResponse: 'Creando baliza "$name"',
+    ));
     Future.delayed(const Duration(milliseconds: 400), () {
       unityBridge.saveSession();
       _logger.i('[Test] Auto-guardado tras crear baliza "$name"');
@@ -729,35 +808,28 @@ class ArNavigationController extends ChangeNotifier {
       onShowSnackBar?.call('⏳ Esperando que AR esté lista...');
       final ready = await _waitForBridgeReady();
       if (!ready) {
-        onShowSnackBar?.call(
-          '⚠️ AR no disponible — intenta más tarde',
-          isError: true,
-        );
+        onShowSnackBar?.call('⚠️ AR no disponible — intenta más tarde', isError: true);
         return;
       }
     }
     voiceNav.resetDeduplication();
-    fireTestIntent(
-      NavigationIntent(
-        type: IntentType.navigate,
-        target: target,
-        priority: 8,
-        suggestedResponse: 'Navegando a $target',
-      ),
-    );
+    fireTestIntent(NavigationIntent(
+      type: IntentType.navigate,
+      target: target,
+      priority: 8,
+      suggestedResponse: 'Navegando a $target',
+    ));
   }
 
   void testStop() {
     voiceNav.stop();
     coordinator.resetNavigation();
-    fireTestIntent(
-      NavigationIntent(
-        type: IntentType.stop,
-        target: '',
-        priority: 10,
-        suggestedResponse: 'Navegación detenida',
-      ),
-    );
+    fireTestIntent(NavigationIntent(
+      type: IntentType.stop,
+      target: '',
+      priority: 10,
+      suggestedResponse: 'Navegación detenida',
+    ));
   }
 
   void testToggleSegMask() {
@@ -766,27 +838,26 @@ class ArNavigationController extends ChangeNotifier {
       return;
     }
     if (!_segmentationActive) {
-      onShowSnackBar?.call(
-        'ℹ️ La máscara solo está disponible durante navegación',
-      );
+      onShowSnackBar?.call('ℹ️ La máscara solo está disponible durante navegación');
       return;
     }
     unityBridge.toggleSegMask();
     _segMaskVisible = !_segMaskVisible;
     notifyListeners();
-    onShowSnackBar?.call(
-      _segMaskVisible ? '🎭 Máscara activada' : '🎭 Máscara desactivada',
-    );
+    onShowSnackBar?.call(_segMaskVisible ? '🎭 Máscara activada' : '🎭 Máscara desactivada');
     HapticFeedback.lightImpact();
   }
 
-  // ─── Dispose ─────────────────────────────────────────────────────────────
-
+  // ─── Dispose ──────────────────────────────────────────────────────────────
   @override
   void dispose() {
     _trackingWarningTimer?.cancel();
     _trackingDebounceTimer?.cancel();
     onReadyForTutorial = null;
+
+    // Completar el Completer si aún está pendiente para no dejar Futures colgados
+    if (!_tutorialCompleter.isCompleted) _tutorialCompleter.complete();
+
     coordinator.dispose();
     aiModeController.dispose();
     unityBridge.dispose();

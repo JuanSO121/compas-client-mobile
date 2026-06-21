@@ -1,8 +1,27 @@
 // lib/screens/auth/request_new_code_screen.dart
+//
+// ── v2.1 — Pausa AuthVoiceNavigationService mientras esta pantalla está activa
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  CAMBIO v2.0 → v2.1:
+//    • Se importa AuthVoiceNavigationService.
+//    • initState() llama _voiceNav.pauseListening() para que el wake word
+//      no interfiera mientras el usuario escribe su email aquí.
+//    • dispose() llama _voiceNav.resumeListening() para que al volver a
+//      LoginScreen el asistente de voz retome automáticamente.
+//    • Sin cambios funcionales: la pantalla sigue siendo solo teclado,
+//      no tiene flujo de dictado propio (el email de recuperación es
+//      un caso edge; el dictado se puede añadir en v2.2 si se solicita).
+//
+//  TODO lo demás es idéntico a v2.0.
+// ─────────────────────────────────────────────────────────────────────────────
+
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import '../../services/auth_service.dart';
+import '../../services/auth_tts_service.dart';
+import '../../services/auth_voice_navigation_service.dart';
 
 class RequestNewCodeScreen extends StatefulWidget {
   const RequestNewCodeScreen({super.key});
@@ -14,62 +33,96 @@ class RequestNewCodeScreen extends StatefulWidget {
 class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
     with SingleTickerProviderStateMixin {
   final TextEditingController _emailController = TextEditingController();
-  final TextEditingController _passwordController = TextEditingController();
   final FocusNode _emailFocusNode = FocusNode();
-  final FocusNode _passwordFocusNode = FocusNode();
 
   final AuthService _authService = AuthService();
+  final AuthTTSService _tts = AuthTTSService();
+
+  // v2.1: pausar la escucha del wake word mientras estamos aquí
+  final AuthVoiceNavigationService _voiceNav = AuthVoiceNavigationService();
 
   bool _isLoading = false;
   bool _success = false;
   String? _errorMessage;
-  bool _obscurePassword = true;
 
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
 
+  // ─────────────────────────────────────────────────────────────────────────
+
   @override
   void initState() {
     super.initState();
+
     _fadeController = AnimationController(
         duration: const Duration(milliseconds: 300), vsync: this);
     _fadeAnimation =
         CurvedAnimation(parent: _fadeController, curve: Curves.easeInOut);
     _fadeController.forward();
 
-    _emailController.addListener(
-        () { if (_errorMessage != null) setState(() => _errorMessage = null); });
-    _passwordController.addListener(
-        () { if (_errorMessage != null) setState(() => _errorMessage = null); });
+    _emailController.addListener(() {
+      if (_errorMessage != null) setState(() => _errorMessage = null);
+    });
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      // v2.1: silenciar el asistente de voz para evitar falsos positivos
+      // mientras el usuario escribe su email de recuperación.
+      _voiceNav.pauseListening();
+
+      await _tts.initialize();
+      await Future.delayed(const Duration(milliseconds: 350));
+      await _tts.announceScreen(
+        'Solicitar nuevo código de acceso. '
+            'Ingrese su correo electrónico y le enviaremos un nuevo código.',
+      );
       SemanticsService.announce(
-        'Solicitar nuevo código. Ingrese su email y contraseña para verificar su identidad.',
+        'Solicitar nuevo código. Ingrese su correo electrónico.',
         TextDirection.ltr,
       );
+      if (mounted) _emailFocusNode.requestFocus();
     });
   }
 
   @override
   void dispose() {
     _emailController.dispose();
-    _passwordController.dispose();
     _emailFocusNode.dispose();
-    _passwordFocusNode.dispose();
     _fadeController.dispose();
+    _tts.dispose();
+
+    // v2.1: reanudar la escucha al salir para que LoginScreen la retome
+    _voiceNav.resumeListening();
+
     super.dispose();
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // LÓGICA
+  // ─────────────────────────────────────────────────────────────────────────
+
   void _requestNewCode() async {
     final email = _emailController.text.trim();
-    final password = _passwordController.text;
 
-    if (email.isEmpty || password.isEmpty) {
-      setState(() => _errorMessage = 'Complete el email y la contraseña');
-      SemanticsService.announce(_errorMessage!, TextDirection.ltr);
-      (email.isEmpty ? _emailFocusNode : _passwordFocusNode).requestFocus();
+    if (email.isEmpty) {
+      const msg = 'Ingrese su correo electrónico';
+      setState(() => _errorMessage = msg);
+      _tts.announceError(msg);
+      SemanticsService.announce(msg, TextDirection.ltr);
+      _emailFocusNode.requestFocus();
       return;
     }
+
+    final emailRegex = RegExp(r'^[\w\-\.]+@([\w\-]+\.)+[\w\-]{2,4}$');
+    if (!emailRegex.hasMatch(email)) {
+      const msg = 'Formato de email inválido';
+      setState(() => _errorMessage = msg);
+      _tts.announceError(msg);
+      SemanticsService.announce(msg, TextDirection.ltr);
+      _emailFocusNode.requestFocus();
+      return;
+    }
+
+    await _tts.announceButton('Enviando código. Por favor espere.');
 
     setState(() {
       _isLoading = true;
@@ -77,10 +130,7 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
     });
 
     try {
-      final response = await _authService.requestNewCode(
-        email: email,
-        password: password,
-      );
+      final response = await _authService.requestNewCode(email: email);
 
       if (!mounted) return;
 
@@ -90,28 +140,36 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
           _success = true;
           _isLoading = false;
         });
-        SemanticsService.announce(
-          'Código enviado. Revise su email e ingrese con el nuevo código.',
-          TextDirection.ltr,
-        );
+        const successMsg =
+            'Si el email está registrado, recibirá su nuevo código en unos momentos. '
+            'Revise su bandeja de entrada y la carpeta de spam.';
+        await _tts.announceSuccess(successMsg);
+        SemanticsService.announce(successMsg, TextDirection.ltr);
       } else {
         setState(() {
           _errorMessage = response.message;
           _isLoading = false;
         });
-        SemanticsService.announce(
-            response.accessibilityInfo?.announcement ?? response.message,
-            TextDirection.ltr);
-        _passwordFocusNode.requestFocus();
+        final announcement =
+            response.accessibilityInfo?.announcement ?? response.message;
+        await _tts.announceError(announcement);
+        SemanticsService.announce(announcement, TextDirection.ltr);
+        _emailFocusNode.requestFocus();
       }
     } catch (e) {
       if (!mounted) return;
+      const msg = 'Error de conexión. Intente nuevamente.';
       setState(() {
-        _errorMessage = 'Error de conexión. Intente nuevamente.';
+        _errorMessage = msg;
         _isLoading = false;
       });
+      await _tts.announceError(msg);
     }
   }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // BUILD
+  // ─────────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -127,7 +185,10 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
           button: true,
           child: IconButton(
             icon: const Icon(Icons.arrow_back_rounded, size: 28),
-            onPressed: () => Navigator.pop(context),
+            onPressed: () {
+              _tts.announceButton('Volver');
+              Navigator.pop(context);
+            },
           ),
         ),
         title: Semantics(
@@ -148,7 +209,7 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
     );
   }
 
-  // ── Vista de éxito ───────────────────────────────────────────────────────
+  // ── Vista de éxito ────────────────────────────────────────────────────────
 
   Widget _buildSuccessView(ThemeData theme) {
     return Column(
@@ -169,17 +230,21 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
         const SizedBox(height: 32),
         Semantics(
           header: true,
-          child: Text('¡Código enviado!',
-              style: theme.textTheme.titleLarge
-                  ?.copyWith(fontSize: 28, fontWeight: FontWeight.bold),
-              textAlign: TextAlign.center),
+          child: Text(
+            '¡Código enviado!',
+            style: theme.textTheme.titleLarge
+                ?.copyWith(fontSize: 28, fontWeight: FontWeight.bold),
+            textAlign: TextAlign.center,
+          ),
         ),
         const SizedBox(height: 16),
         Text(
-          'Revise su email. El nuevo código reemplaza al anterior.',
+          'Si el email está registrado, recibirá su nuevo código en unos momentos.\n'
+              'Revise también la carpeta de spam.\n\n'
+              'El código anterior ya no funciona — use el nuevo.',
           style: theme.textTheme.bodyLarge?.copyWith(
               fontSize: 16,
-              height: 1.5,
+              height: 1.6,
               color: theme.colorScheme.onSurface.withOpacity(0.7)),
           textAlign: TextAlign.center,
         ),
@@ -191,7 +256,10 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
             color: theme.colorScheme.primary,
             borderRadius: BorderRadius.circular(20),
             child: InkWell(
-              onTap: () => Navigator.pop(context),
+              onTap: () {
+                _tts.announceButton('Ingresar código.');
+                Navigator.pop(context);
+              },
               borderRadius: BorderRadius.circular(20),
               child: const SizedBox(
                 width: double.infinity,
@@ -218,7 +286,7 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
     );
   }
 
-  // ── Formulario ───────────────────────────────────────────────────────────
+  // ── Formulario ────────────────────────────────────────────────────────────
 
   Widget _buildFormView(ThemeData theme) {
     return Column(
@@ -233,7 +301,7 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
             decoration: BoxDecoration(
                 color: theme.colorScheme.primary.withOpacity(0.1),
                 shape: BoxShape.circle),
-            child: Icon(Icons.refresh_rounded,
+            child: Icon(Icons.email_rounded,
                 size: 44, color: theme.colorScheme.primary),
           ),
         ),
@@ -242,40 +310,98 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
 
         Semantics(
           header: true,
-          child: Text('¿Olvidó su código?',
-              style: theme.textTheme.titleLarge
-                  ?.copyWith(fontSize: 26, fontWeight: FontWeight.bold),
-              textAlign: TextAlign.center),
+          child: Text(
+            '¿Olvidó su código?',
+            style: theme.textTheme.titleLarge
+                ?.copyWith(fontSize: 26, fontWeight: FontWeight.bold),
+            textAlign: TextAlign.center,
+          ),
         ),
 
         const SizedBox(height: 12),
 
         Text(
-          'Verifique su identidad y le enviaremos un nuevo código.\nEl anterior dejará de funcionar.',
+          'Ingrese su correo electrónico y le enviaremos un nuevo código.\n'
+              'El código anterior dejará de funcionar.',
           style: theme.textTheme.bodyLarge?.copyWith(
               fontSize: 15,
               color: theme.colorScheme.onSurface.withOpacity(0.6),
-              height: 1.5),
+              height: 1.6),
           textAlign: TextAlign.center,
         ),
 
         const SizedBox(height: 40),
 
-        _buildTextField(
-          theme: theme,
-          controller: _emailController,
-          focusNode: _emailFocusNode,
+        Semantics(
           label: 'Correo electrónico',
-          hint: 'ejemplo@correo.com',
-          icon: Icons.email_rounded,
-          keyboardType: TextInputType.emailAddress,
-          textInputAction: TextInputAction.next,
-          onSubmitted: (_) => _passwordFocusNode.requestFocus(),
+          textField: true,
+          child: Container(
+            decoration: BoxDecoration(
+              color: theme.cardColor,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: _errorMessage != null
+                    ? theme.colorScheme.error
+                    : theme.colorScheme.primary.withOpacity(0.3),
+                width: 3,
+              ),
+              boxShadow: [
+                BoxShadow(
+                    color: Colors.black.withOpacity(0.05),
+                    blurRadius: 12,
+                    offset: const Offset(0, 4)),
+              ],
+            ),
+            child: TextField(
+              controller: _emailController,
+              focusNode: _emailFocusNode,
+              style:
+              const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+              keyboardType: TextInputType.emailAddress,
+              textInputAction: TextInputAction.done,
+              decoration: InputDecoration(
+                hintText: 'ejemplo@correo.com',
+                hintStyle: TextStyle(
+                    fontSize: 18,
+                    color: theme.colorScheme.onSurface.withOpacity(0.3)),
+                prefixIcon: Icon(Icons.email_rounded,
+                    size: 26, color: theme.colorScheme.primary),
+                border: InputBorder.none,
+                contentPadding: const EdgeInsets.all(20),
+              ),
+              onSubmitted: (_) => _requestNewCode(),
+            ),
+          ),
         ),
 
-        const SizedBox(height: 20),
-
-        _buildPasswordField(theme),
+        const SizedBox(height: 16),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.primary.withOpacity(0.07),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+                color: theme.colorScheme.primary.withOpacity(0.2), width: 1.5),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(Icons.info_outline_rounded,
+                  size: 18, color: theme.colorScheme.primary),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'No necesita contraseña. Solo su correo electrónico registrado.',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: theme.colorScheme.primary,
+                    height: 1.4,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
 
         if (_errorMessage != null) ...[
           const SizedBox(height: 16),
@@ -284,7 +410,7 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
             label: 'Error: $_errorMessage',
             child: Container(
               padding:
-                  const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
                 color: theme.colorScheme.error.withOpacity(0.1),
                 borderRadius: BorderRadius.circular(12),
@@ -326,29 +452,29 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
                 height: 72,
                 child: _isLoading
                     ? const Center(
-                        child: SizedBox(
-                          width: 32,
-                          height: 32,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 4,
-                              valueColor: AlwaysStoppedAnimation<Color>(
-                                  Colors.white)),
-                        ),
-                      )
+                  child: SizedBox(
+                    width: 32,
+                    height: 32,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 4,
+                        valueColor: AlwaysStoppedAnimation<Color>(
+                            Colors.white)),
+                  ),
+                )
                     : const Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.send_rounded,
-                              size: 28, color: Colors.white),
-                          SizedBox(width: 16),
-                          Text('Enviar nuevo código',
-                              style: TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.white,
-                                  letterSpacing: 0.5)),
-                        ],
-                      ),
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.send_rounded,
+                        size: 28, color: Colors.white),
+                    SizedBox(width: 16),
+                    Text('Enviar nuevo código',
+                        style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                            letterSpacing: 0.5)),
+                  ],
+                ),
               ),
             ),
           ),
@@ -356,108 +482,6 @@ class _RequestNewCodeScreenState extends State<RequestNewCodeScreen>
 
         const SizedBox(height: 24),
       ],
-    );
-  }
-
-  Widget _buildTextField({
-    required ThemeData theme,
-    required TextEditingController controller,
-    required FocusNode focusNode,
-    required String label,
-    required String hint,
-    required IconData icon,
-    TextInputType? keyboardType,
-    TextInputAction? textInputAction,
-    void Function(String)? onSubmitted,
-  }) {
-    return Semantics(
-      label: label,
-      textField: true,
-      child: Container(
-        decoration: BoxDecoration(
-          color: theme.cardColor,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: _errorMessage != null
-                ? theme.colorScheme.error
-                : theme.colorScheme.primary.withOpacity(0.3),
-            width: 3,
-          ),
-        ),
-        child: TextField(
-          controller: controller,
-          focusNode: focusNode,
-          style:
-              const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-          keyboardType: keyboardType,
-          textInputAction: textInputAction,
-          decoration: InputDecoration(
-            hintText: hint,
-            hintStyle: TextStyle(
-                fontSize: 18,
-                color: theme.colorScheme.onSurface.withOpacity(0.3)),
-            prefixIcon:
-                Icon(icon, size: 26, color: theme.colorScheme.primary),
-            border: InputBorder.none,
-            contentPadding: const EdgeInsets.all(20),
-          ),
-          onSubmitted: onSubmitted,
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPasswordField(ThemeData theme) {
-    return Semantics(
-      label: 'Contraseña',
-      textField: true,
-      child: Container(
-        decoration: BoxDecoration(
-          color: theme.cardColor,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: _errorMessage != null
-                ? theme.colorScheme.error
-                : theme.colorScheme.primary.withOpacity(0.3),
-            width: 3,
-          ),
-        ),
-        child: TextField(
-          controller: _passwordController,
-          focusNode: _passwordFocusNode,
-          obscureText: _obscurePassword,
-          style:
-              const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-          textInputAction: TextInputAction.done,
-          decoration: InputDecoration(
-            hintText: 'Tu contraseña',
-            hintStyle: TextStyle(
-                fontSize: 18,
-                color: theme.colorScheme.onSurface.withOpacity(0.3)),
-            prefixIcon: Icon(Icons.lock_rounded,
-                size: 26, color: theme.colorScheme.primary),
-            suffixIcon: Semantics(
-              label: _obscurePassword
-                  ? 'Mostrar contraseña'
-                  : 'Ocultar contraseña',
-              button: true,
-              child: IconButton(
-                icon: Icon(
-                  _obscurePassword
-                      ? Icons.visibility_off_rounded
-                      : Icons.visibility_rounded,
-                  color: theme.colorScheme.onSurface.withOpacity(0.5),
-                ),
-                onPressed: () =>
-                    setState(() => _obscurePassword = !_obscurePassword),
-              ),
-            ),
-            border: InputBorder.none,
-            contentPadding: const EdgeInsets.all(20),
-          ),
-          onSubmitted: (_) => _requestNewCode(),
-        ),
-      ),
     );
   }
 }
